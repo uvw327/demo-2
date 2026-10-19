@@ -1,0 +1,4 @@
+# cube.obj 引用的材质库（占位）。本文写给 obj 导入器消除找不到 mtllib 的报错；
+# 实际渲染用 surface.gdshader 的 material_override，这个 mtl 不参与运行时。
+newmtl Material
+Kd 0.8 0.8 0.8

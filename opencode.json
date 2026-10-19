@@ -1,0 +1,40 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "godot-ai": {
+      "command": [
+        "D:\\data\\hot\\uv_data\\python\\cpython-3.14-windows-x86_64-none/pythonw.exe",
+        "-c",
+        "import subprocess,sys; raise SystemExit(subprocess.call(sys.argv[1:], stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr, creationflags=0x08000000))",
+        "D:\\tools\\portable\\cli\\uvx.exe",
+        "--isolated",
+        "--no-config",
+        "--no-env-file",
+        "--no-sources",
+        "--no-build",
+        "--index-strategy",
+        "first-index",
+        "--keyring-provider",
+        "disabled",
+        "--index",
+        "https://pypi.org/simple",
+        "--default-index",
+        "https://pypi.org/simple",
+        "--find-links",
+        "https://pypi.org/simple/godot-ai/",
+        "--link-mode",
+        "copy",
+        "--from",
+        "godot-ai==4.3.0",
+        "godot-ai",
+        "attach",
+        "--port",
+        "8000",
+        "--ws-port",
+        "9500"
+      ],
+      "type": "local",
+      "enabled": true
+    }
+  }
+}
