@@ -856,13 +856,14 @@ func deselect() -> void:
 
 # 生成选中高亮环：
 # 沿贴片边界做两个同向内收的环——外沿（亮边）与内沿（透明端）
-# 连成一条细环带，整体沿径向抬一点点避免与地表 z-fighting。
+# 连成一条细环带，几何半径与地表完全一致（不抬升），
+# 由 shader 的 vertex 深度偏移避免 z-fighting——零视差错位。
 # 顶点色 a = 径向参数（外沿 0 / 内沿 1），shader 里 pow(1−a) 做向内衰减。
 # 环宽随贴片半径而定 → 拉远拉近观感一致；环内收 → 光不会溢到相邻地块。
 func _rebuild_selection_ring() -> void:
 	const EDGE_INSET := 0.05  # 外沿自贴片边界向内收（贴片半径的比例）
 	const GLOW_LENGTH := 0.44 # 光晕向内延伸到的比例（决定晕带厚度）
-	const LIFT := 1.004       # 环带相对星球半径的抬升系数
+	const LIFT := 1.0         # 环带与地表共面（=1.0），深度避让交给 shader 的视线偏移
 	const MIN_BAND_PX := 4.0  # 屏幕像素兜底：整球远观时晕带至少约这么宽（屏上）
 	const BAND_MAX_RATIO := 0.55  # 晕带最厚不超过贴片半径的比例，不吞地块
 	var poly: PackedVector3Array = _tile_polys[_selected_tile]

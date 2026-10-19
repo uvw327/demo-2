@@ -15,7 +15,7 @@ signal view_tapped(screen_position: Vector2)
 
 const MIN_DIST := 1.15  # 最近限制：贴近到离地约 1/7 半径，能看清贴片细节但不穿模
 const MAX_DIST := 10.0 # 最远限制：再远就看不清了
-const DRAG_SENS := 0.01        # 拖动灵敏度：弧度/像素
+const DRAG_SENS := 0.005        # 拖动灵敏度：弧度/像素（此前 0.01 偏灵敏，轻拖就晃过头）
 const WHEEL_ZOOM := 0.1        # 单格滚轮的缩放幅度（factor = 1±WHEEL_ZOOM）
 const CLICK_MAX_DRAG_PX := 10.0 # 按下→抬起累计位移小于它才算“点”
 const CLICK_MAX_TIME := 0.45    # 点按最长按住时长（秒）
