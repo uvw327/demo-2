@@ -62,34 +62,40 @@ func _build_ui() -> void:
 	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
 	root.add_child(bg)
 
-	# 居中容器
-	var center := CenterContainer.new()
-	center.set_anchors_preset(Control.PRESET_FULL_RECT)
-	root.add_child(center)
+	# 内容外边距：左右各留 100、上下 44，宽屏上内容不会被拉满；
+	# 窄屏（如 4:3 横屏平板）时 VBox 的子项宽度自动收缩，不写死宽就不会溢出。
+	var margin := MarginContainer.new()
+	margin.set_anchors_preset(Control.PRESET_FULL_RECT)
+	for m in ["margin_left", "margin_right"]:
+		margin.add_theme_constant_override(m, 100)
+	for m in ["margin_top", "margin_bottom"]:
+		margin.add_theme_constant_override(m, 44)
+	root.add_child(margin)
 
+	# 根面板：垂直居中，子项宽度默认铺满 MarginContainer 内部（桌面端即 1280-200=1080）
 	var panel := VBoxContainer.new()
-	panel.custom_minimum_size = Vector2(560, 0)
-	panel.add_theme_constant_override("separation", 10)
-	center.add_child(panel)
+	panel.alignment = BoxContainer.ALIGNMENT_CENTER
+	panel.add_theme_constant_override("separation", 24)
+	margin.add_child(panel)
 
 	# 标题
 	var title := Label.new()
 	title.text = "创建世界"
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	title.add_theme_font_size_override("font_size", 30)
+	title.add_theme_font_size_override("font_size", 52)
 	title.add_theme_color_override("font_color", TEXT)
 	panel.add_child(title)
 
 	# 表单（生成时整体隐藏）
 	_form_box = VBoxContainer.new()
-	_form_box.add_theme_constant_override("separation", 8)
+	_form_box.add_theme_constant_override("separation", 24)
 	panel.add_child(_form_box)
 
 	# 两列表单：左标签右控件
 	var grid := GridContainer.new()
 	grid.columns = 2
-	grid.add_theme_constant_override("h_separation", 14)
-	grid.add_theme_constant_override("v_separation", 10)
+	grid.add_theme_constant_override("h_separation", 28)
+	grid.add_theme_constant_override("v_separation", 24)
 	_form_box.add_child(grid)
 
 	# 种子：SpinBox（自带上下小箭头）+ “随机”按钮
@@ -103,12 +109,15 @@ func _build_ui() -> void:
 	_seed_box.max_value = 99999
 	_seed_box.step = 1
 	_seed_box.value = 4242
-	_seed_box.custom_minimum_size = Vector2(340, 36)
-	_seed_box.add_theme_font_size_override("font_size", 16)
+	_seed_box.custom_minimum_size = Vector2(320, 76)
+	# 吃掉行内剩余宽度：种子输入框变长，“随机”按钮靠到行尾
+	_seed_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_seed_box.add_theme_font_size_override("font_size", 30)
+	_seed_box.get_line_edit().add_theme_font_size_override("font_size", 30)
 	_seed_box.get_line_edit().add_theme_stylebox_override("normal", _flat_style(FIELD_BG))
 	_seed_box.get_line_edit().add_theme_color_override("font_color", TEXT)
 	seed_row.add_child(_seed_box)
-	var random_btn := _make_button("随机", Vector2(90, 36), 16)
+	var random_btn := _make_button("随机", Vector2(220, 76), 30)
 	random_btn.pressed.connect(func(): _seed_box.value = randi() % 100000)
 	seed_row.add_child(random_btn)
 
@@ -123,21 +132,23 @@ func _build_ui() -> void:
 	_rainfall = rainfall_opt
 	_temperature = temperature_opt
 
-	# 生成世界按钮
-	var gen_btn := _make_button("生成世界", Vector2(560, 44), 20)
+	# 生成世界按钮：宽度铺满，高度触屏友好
+	var gen_btn := _make_button("生成世界", Vector2(0, 96), 40)
+	gen_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	gen_btn.pressed.connect(_on_generate_pressed)
 	_form_box.add_child(gen_btn)
 
-	# 进度条（初始隐藏）
+	# 进度条（初始隐藏）：宽度铺满
 	_progress = ProgressBar.new()
-	_progress.custom_minimum_size = Vector2(560, 34)
+	_progress.custom_minimum_size = Vector2(0, 60)
+	_progress.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_progress.min_value = 0.0
 	_progress.max_value = 100.0
 	_progress.show_percentage = true
 	_progress.visible = false
 	_progress.add_theme_stylebox_override("background", _flat_style(FIELD_BG))
 	_progress.add_theme_stylebox_override("fill", _flat_style(Color("5b7aa6")))
-	_progress.add_theme_font_size_override("font_size", 14)
+	_progress.add_theme_font_size_override("font_size", 26)
 	panel.add_child(_progress)
 
 
@@ -157,7 +168,7 @@ func _on_generate_pressed() -> void:
 func _make_label(text: String) -> Label:
 	var l := Label.new()
 	l.text = text
-	l.add_theme_font_size_override("font_size", 18)
+	l.add_theme_font_size_override("font_size", 30)
 	l.add_theme_color_override("font_color", TEXT)
 	return l
 
@@ -182,8 +193,10 @@ func _make_option(items: Array, default_index: int) -> OptionButton:
 		opt.add_item(item[0])
 		opt.set_item_metadata(opt.item_count - 1, item[1])
 	opt.select(default_index)
-	opt.custom_minimum_size = Vector2(440, 36)
-	opt.add_theme_font_size_override("font_size", 16)
+	opt.custom_minimum_size = Vector2(240, 76)
+	# 吃掉网格行内剩余宽度，控件列与标签列拉开
+	opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	opt.add_theme_font_size_override("font_size", 30)
 	opt.add_theme_color_override("font_color", TEXT)
 	for state in ["normal", "hover", "pressed"]:
 		var style := _flat_style(FIELD_BG if state == "normal" else (BTN_HOVER if state == "hover" else BTN_PRESSED))
@@ -196,11 +209,12 @@ func _make_option(items: Array, default_index: int) -> OptionButton:
 	return opt
 
 
-# 共享主题：default_font 用烘焙字形，菜单子树全部继承（含 SpinBox 的 LineEdit、进度条文字）
+# 共享主题：default_font 用烘焙字形，default_font_size 28——
+# 下拉列表 PopupMenu 挂回本主题后同样以 28 号渲染，触屏可读
 func _make_font_theme() -> Theme:
 	var theme := Theme.new()
 	theme.default_font = UI_FONT
-	theme.default_font_size = 16
+	theme.default_font_size = 28
 	return theme
 
 
@@ -209,9 +223,9 @@ func _add_field_row(grid: GridContainer, label_text: String, control: Control) -
 	grid.add_child(control)
 
 
-# 圆角矩形风格（4px 圆角，统一所有深灰控件观感）
+# 圆角矩形风格（8px 圆角，统一所有深灰控件观感）
 func _flat_style(color: Color) -> StyleBoxFlat:
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = color
-	sb.set_corner_radius_all(4)
+	sb.set_corner_radius_all(8)
 	return sb
