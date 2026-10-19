@@ -17,18 +17,22 @@ config/icon="res://icon.svg"
 
 [autoload]
 
+MiniGameSDK="*uid://bfx3t6wuymbrq"
 _mcp_game_helper="*res://addons/godot_ai/runtime/game_helper.gd"
 
 [display]
 
-window/size/viewport_width=1920
-window/size/viewport_height=1080
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/size/mode=3
+window/size/resizable=false
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
+window/vsync/vsync_mode=0
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/godot_ai/plugin.cfg", "res://addons/gut/plugin.cfg")
+enabled=PackedStringArray("res://addons/font_baker/plugin.cfg", "res://addons/godot_ai/plugin.cfg", "res://addons/godot_mini_game/plugin.cfg", "res://addons/gut/plugin.cfg")
 
 [physics]
 

@@ -1,0 +1,10 @@
+; Godot Mini Game export configuration example
+; Copy to `.minigame/export.cfg` to persist dock settings.
+
+[export]
+platform=""
+appid=""
+orientation=""
+preset=""
+output_dir=""
+timeout_seconds=600.0

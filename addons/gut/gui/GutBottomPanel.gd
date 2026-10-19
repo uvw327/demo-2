@@ -80,7 +80,16 @@ func _ready():
 	_ctrls.results.bar.connect('draw', _on_results_bar_draw.bind(_ctrls.results.bar))
 	hide_settings(!_ctrls.settings_button.button_pressed)
 
-	_gut_config.load_options(GutEditorGlobals.editor_run_gut_config_path)
+	# 配置真源：项目根目录的 res://.gutconfig.json（与命令行 gut_cmdln.gd 共用同一份，
+	# 目录/前后缀等测试语义配置在这里统一维护，不再藏在 user:// 下）。
+	# 面板专属的外观设置（字体/颜色/透明度等）仍保存在 user:// 的编辑器配置里。
+	# load_options 是按“文件里出现的键”合并的，所以 .gutconfig.json 没写的外观键
+	# 不会丢；反之在面板 UI 里改的 dirs 等只写到编辑器配置，重启后又被本文件拉回
+	# ——请一律改 .gutconfig.json。
+	var cfg_path: String = GutEditorGlobals.editor_run_gut_config_path
+	if FileAccess.file_exists("res://.gutconfig.json"):
+		cfg_path = "res://.gutconfig.json"
+	_gut_config.load_options(cfg_path)
 	_gut_config_gui.set_options(_gut_config.options)
 
 	_ctrls.shortcuts_button.icon = get_theme_icon('Shortcut', 'EditorIcons')

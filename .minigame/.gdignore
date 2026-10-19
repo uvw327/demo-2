@@ -1,0 +1,1 @@
+Keep Godot's importer and exporter away from the plugin's persistent export config.

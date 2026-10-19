@@ -13,6 +13,12 @@ const BTN_HOVER := Color("4a4a4a")
 const BTN_PRESSED := Color("2a2a2a")
 const TEXT := Color(0.94, 0.94, 0.94)
 
+# 自定义字形：font_baker 烘焙的字体子集（只含游戏实际用到的字形，无字体数据），
+# 字符清单由 tools/extract_chinese.js 汇总到 assets/chinese.txt。
+const UI_FONT := preload("res://assets/font/glyphs.tres")
+
+var _ui_theme: Theme  # 共享主题：把 UI_FONT 作为 default_font 传给整棵菜单 UI
+
 var _seed_box: SpinBox
 var _coverage: OptionButton
 var _rainfall: OptionButton
@@ -46,6 +52,8 @@ func _build_ui() -> void:
 	var root := Control.new()
 	root.set_anchors_preset(Control.PRESET_FULL_RECT)
 	root.mouse_filter = Control.MOUSE_FILTER_STOP
+	_ui_theme = _make_font_theme()
+	root.theme = _ui_theme
 	add_child(root)
 
 	# 整屏深灰底（对应参考图的背景色）
@@ -181,7 +189,19 @@ func _make_option(items: Array, default_index: int) -> OptionButton:
 		var style := _flat_style(FIELD_BG if state == "normal" else (BTN_HOVER if state == "hover" else BTN_PRESSED))
 		opt.add_theme_stylebox_override(state, style)
 	opt.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	# 下拉列表 PopupMenu 挂在视口根部，不随 root 继承主题，单独指回去
+	var popup := opt.get_popup()
+	if popup != null:
+		popup.theme = _ui_theme
 	return opt
+
+
+# 共享主题：default_font 用烘焙字形，菜单子树全部继承（含 SpinBox 的 LineEdit、进度条文字）
+func _make_font_theme() -> Theme:
+	var theme := Theme.new()
+	theme.default_font = UI_FONT
+	theme.default_font_size = 16
+	return theme
 
 
 func _add_field_row(grid: GridContainer, label_text: String, control: Control) -> void:
