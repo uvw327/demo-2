@@ -21,7 +21,7 @@ func _run() -> void:
 
 	# —— 真跑生成（分帧流水线在 headless 主循环里也会逐帧推进）——
 	planet._on_generate_requested({
-		"seed": 4242, "coverage": 0.5, "rainfall": 1, "temperature": 1,
+		"seed": 4242, "coverage": 0.3, "rainfall": 1, "temperature": 1,
 	})
 	var tries := 0
 	while tries < 60000 and (planet._mesh_instance == null or planet._menu != null):

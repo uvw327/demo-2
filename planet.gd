@@ -33,14 +33,17 @@ const LEVEL := 7
 const SUBDIV := 1 << LEVEL # 每条棱的等分数 f
 const PLANET_RADIUS := 1.0
 
-# 每“帧”处理这么多贴片再让出一帧给 UI 刷新（分帧生成，进度条才能动）
-const TILES_PER_FRAME := 1200
+# 每“帧”处理这么多贴片再让出一帧给 UI 刷新（分帧生成，进度条才能动）。
+# 性能权衡：帧数 × 帧间隔是生成耗时的硬地板（60Hz 每帧 16.7ms），
+# 预算切太碎会让“等帧”时间远超计算本身——这里是生成速度的第一参数。
+const TILES_PER_FRAME := 12000
 # —— 生成管线其他重活的帧预算：每个重活每帧只吃这么多，吃完就让帧 ——
-# 没有它们，“点生成世界”后的准备工作会让画面僵住几秒没反馈
-const ADJ_TRIS_PER_FRAME := 90000    # 邻接面表：每帧处理的三角形数
-const SCORE_TILES_PER_FRAME := 40000 # 大陆噪声打分：每帧采样的贴片数
-const FLOOD_POPS_PER_FRAME := 6000   # 选区漫灌：每帧并入大陆的贴片数
-const BFS_POPS_PER_FRAME := 15000    # 洞区清洗 BFS：每帧弹出的贴片数
+# 生成是全屏进度条阻塞态，预算可以大方些：单帧计算 ~30-80ms 的“小卡顿”
+# 在进度条动画里完全无感，换来总帧数从 200+ 砍到 ~35。
+const ADJ_TRIS_PER_FRAME := 180000   # 邻接面表：每帧处理的三角形数
+const SCORE_TILES_PER_FRAME := 60000 # 大陆噪声打分：每帧采样的贴片数
+const FLOOD_POPS_PER_FRAME := 30000  # 选区漫灌：每帧并入大陆的贴片数
+const BFS_POPS_PER_FRAME := 100000   # 洞区清洗 BFS：每帧弹出的贴片数
 const CENTROID_SLICE_TILES := 40000  # 大陆质心累计：每帧累加的贴片数
 
 # ---- 生物群系纯色（RGB 0..1）----
@@ -110,6 +113,7 @@ var _inland_water: PackedByteArray = PackedByteArray()
 var _menu: CanvasLayer           # “创建世界”菜单 UI
 var _rain_shift := 0.0           # 本次生成的湿度整体偏移
 var _temp_shift := 0.0           # 本次生成的温度整体偏移
+var _prog_calls := 0             # 性能打点：_progress 调用次数（≈分帧 await 帧数）
 # 大陆质心方向（单位向量）：以它为中心的半球承载的可交互面积最大，
 # 星球生成完把镜头对准它——玩家看到的正是“陆地最多的那一面”。
 var _region_center := Vector3.UP
@@ -214,37 +218,39 @@ func _init_noise(seed_value: int) -> void:
 # —— 气候模型：连续温度场取代“纬度硬切带” ——
 # temperature = cos(纬度) + 噪声扰动 − 海拔制冷 + 菜单温度档偏移
 # 同一个温度场海陆共用：海洋冷到阈值就是海冰，陆地冷到阈值就是冰原。
-func _climate(center: Vector3) -> Dictionary:
+# 性能说明：不返回 Dictionary——逐贴片调用时每次分配字典+字符串键哈希
+# 是显著热点；改为把结果写进调用方复用的 out 数组（[elev, temp, humidity]）。
+func _climate_fill(center: Vector3, out: Array) -> void:
 	# 地心纬度：贴片中心方向与赤道面的夹角，单位度
 	var lat := rad_to_deg(asin(clampf(center.y, -1.0, 1.0)))
 	var lat_factor := cos(deg_to_rad(lat))          # 纬度基底：赤道 1 → 极点 0（平滑）
 	var elev := _elev_noise.get_noise_3dv(center)   # 海拔（将来“山脉抬升”直接复用它）
-	var temperature := clampf(
+	out[0] = elev
+	out[1] = clampf(
 		lat_factor
 		+ _temp_noise.get_noise_3dv(center) * TEMP_NOISE_AMP # 暖流/大陆性扰动：边界起伏的来源
 		- maxf(elev, 0.0) * ELEV_COOL                        # 海拔越高越冷（只冷陆地，海洋不扣）
 		+ _temp_shift,                                       # 菜单“总体温度”：整场平移
 		0.0, 1.0)
-	var humidity := clampf(
+	out[2] = clampf(
 		0.5 + 0.5 * _humid_noise.get_noise_3dv(center) + _rain_shift, # 菜单“总体降雨”：整场平移
 		0.0, 1.0)
-	return {"elev": elev, "temperature": temperature, "humidity": humidity}
 
 
 # —— 生物群系纯色（颜色只描述“长什么样”，地形数据另算）——
-func _biome_color_from_climate(c: Dictionary) -> Color:
+func _biome_color(elev: float, temp: float, humid: float) -> Color:
 	# 1) 海洋：低于海平面。极区海水冷过冻结阈值 → 变成海冰（冰盖自然延伸出海）
-	if c["elev"] < SEA_LEVEL:
-		return C_OCEAN if c["temperature"] >= T_FREEZE else C_ICE
+	if elev < SEA_LEVEL:
+		return C_OCEAN if temp >= T_FREEZE else C_ICE
 
 	# 2) 陆地：按温度分带（阈值+噪声 → 犬牙交错的自然边界），低纬再看湿度
-	if c["temperature"] < T_FREEZE:
+	if temp < T_FREEZE:
 		return C_ICE
-	if c["temperature"] < T_TUNDRA:
+	if temp < T_TUNDRA:
 		return C_TUNDRA
-	if c["temperature"] < T_TAIGA:
+	if temp < T_TAIGA:
 		return C_TAIGA
-	if c["humidity"] < DESERT_HUMID:
+	if humid < DESERT_HUMID:
 		return C_DESERT
 	return C_FOREST
 
@@ -254,15 +260,14 @@ func _biome_color_from_climate(c: Dictionary) -> Color:
 # 陆地从海平面往上爬，按阈值逐级抬升为丘陵→山区；极高的尖峰不可逾越。
 # 冰盖/苔原是“群系颜色”维度的事，它们能不能走、好不好建依然由海拔说了算
 # ——想让冻土更难通行，把 HILL1_ELEV 往下调一档即可，不需要新逻辑。
-func _terrain_level_from_climate(c: Dictionary) -> int:
-	var e := float(c["elev"])
-	if e < HILL1_ELEV:
+func _terrain_level(elev: float) -> int:
+	if elev < HILL1_ELEV:
 		return TerrainLevel.FLAT # 海面（海底平原）与沿海平地都是平原
-	if e < HILL2_ELEV:
+	if elev < HILL2_ELEV:
 		return TerrainLevel.SMALL_HILLS
-	if e < MOUNT_ELEV:
+	if elev < MOUNT_ELEV:
 		return TerrainLevel.LARGE_HILLS
-	if e < PEAK_ELEV:
+	if elev < PEAK_ELEV:
 		return TerrainLevel.MOUNTAINOUS
 	return TerrainLevel.IMPASSABLE # 极高尖峰：建不了也翻不过去
 
@@ -270,8 +275,7 @@ func _terrain_level_from_climate(c: Dictionary) -> int:
 # —— 贴片外观：群系纯色打底，地形等级做明暗与基岩色倾斜 ——
 # 越高级的地形越暗、山越高越接近基岩色；玩家肉眼就能读出“哪里翻不过去”。
 # 平原不动颜色（海洋贴片按底色规则正常渲染成海色，与地形数据无关）。
-func _tile_appearance(c: Dictionary, level: int) -> Color:
-	var base := _biome_color_from_climate(c)
+func _tile_appearance(base: Color, level: int) -> Color:
 	var rock_mix := 0.0 # 往基岩色压的比例
 	match level:
 		TerrainLevel.SMALL_HILLS:
@@ -331,6 +335,7 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 	var adj_to := pct_from + span * 0.40   # 打分 + 邻接共占 40%，余下给选区轮
 	var pass_span := span * 0.6 / 3.0      # 每轮选区（含漫灌+清洗）占区间 20%
 	var pass_base := adj_to
+	var t_sel := Time.get_ticks_msec()     # 选区内部阶段打点
 
 	# 1) 大陆噪声打分（分片），并记住得分最高的贴片当种子
 	var scores := PackedFloat32Array()
@@ -346,6 +351,7 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 		sc_at = sc_end
 		_progress(pct_from + (score_to - pct_from) * float(sc_at) / total)
 		await get_tree().process_frame
+	t_sel = _stage_mark("④a大陆打分", t_sel)
 
 	# 2) 邻接表：对偶贴片相邻 = 细分网格三角形一条棱的两端（分片）
 	var neighbors: Array = []
@@ -366,6 +372,7 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 		ti_at = ti_end
 		_progress(score_to + (adj_to - score_to) * float(ti_at) / tris.size())
 		await get_tree().process_frame
+	t_sel = _stage_mark("④b邻接表", t_sel)
 
 	# 3) 迭代漫灌：每次边界贴片按噪声分纯序入堆、并掉分最高的那个，
 	#    长到目标面积后执行第 4 步清洗，并量出清洗吞掉了多少面积（偏差），
@@ -403,6 +410,7 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 			_progress(pass_base + pass_span
 					* (float(pass_i) + 0.5 * float(count) / float(grow_target)))
 			await get_tree().process_frame
+		t_sel = _stage_mark("④c漫灌%d轮" % pass_i, t_sel)
 
 		# 4) 洞区清洗：漫灌停在 grow_target 时，堆里必然还剩一圈“差一点该
 		#    轮到”的边界贴片。纯噪声序下它们贴着海岸连成一条“下一圈等值线”
@@ -444,6 +452,7 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 					await get_tree().process_frame
 			comps.append(comp)
 			s0 += 1
+		t_sel = _stage_mark("④d清洗%d轮" % pass_i, t_sel)
 		# 最大的海面连通块是外侧大洋本体；其余与大陆相邻的是内陆盆地
 		var ocean_size := 0
 		var ocean_at := -1
@@ -551,6 +560,7 @@ class _TileHeap:
 # 其余贴片渲染为纯海洋底色且无地形数据，星球视觉连续不破相。
 func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 	_progress(2.0)
+	var t_stage := Time.get_ticks_msec()  # 阶段耗时打点起点
 
 	# ===== ① 二十面体 12 顶点 + 30 条棱的插值点（几百次向量运算，量小）=====
 	var t := (1.0 + sqrt(5.0)) / 2.0
@@ -635,27 +645,35 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 				if j < SUBDIV - 1 - i:
 					tris.append(Vector3i(grid[i + 1][j], grid[i + 1][j + 1], grid[i][j + 1]))
 		_progress(6.0 + 20.0 * float(fi + 1) / base_faces.size())
-		await get_tree().process_frame # 一个基本面一帧，进度条 6→26%
+		if fi % 3 == 2 or fi == base_faces.size() - 1:
+			await get_tree().process_frame # 每 3 个基本面让一帧，进度条 6→26%
+
+	t_stage = _stage_mark("②基本面细分", t_stage)
 
 	# ===== ③ 顶点 → 相邻三角形索引表（vert_faces，分片扫描）=====
 	# 对偶贴片的“边”由它定：贴片 v 的对偶多边形顶点 = 它周围一圈三角形的重心
 	var total := verts.size()
-	var vert_faces: Dictionary = {}
+	# 预分配 Array[PackedInt32Array]：整数键 Dictionary 每三角要 3 次哈希+装箱，
+	# 预分配数组按索引直达，热循环零哈希。
+	var vert_faces: Array = []
+	vert_faces.resize(total)
+	for i in total:
+		vert_faces[i] = PackedInt32Array()
 	var tri_at := 0
 	while tri_at < tris.size():
 		var endi := mini(tri_at + ADJ_TRIS_PER_FRAME, tris.size())
 		for ti in range(tri_at, endi):
 			var tri := tris[ti]
-			for v in [tri.x, tri.y, tri.z]:
-				if not vert_faces.has(v):
-					vert_faces[v] = []
-				vert_faces[v].append(ti)
+			vert_faces[tri.x].append(ti)
+			vert_faces[tri.y].append(ti)
+			vert_faces[tri.z].append(ti)
 		tri_at = endi
 		_progress(26.0 + 4.0 * float(tri_at) / tris.size())
 		await get_tree().process_frame
 
 	# 保留拓扑方向表：生成完仍要回答“这个球面点能不能交互”
 	_topo_verts = verts
+	t_stage = _stage_mark("③邻接面表", t_stage)
 
 	# ===== ④ 覆盖率选区：一整块连通的“可交互区域”（内部全程分帧，30→44%）=====
 	# 旧实现：洗牌取前 coverage 比例 → 生成区是满天星的碎孤岛。
@@ -667,6 +685,7 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 	_inland_water = select_result["inland_water"]
 	_generated = explored            # 运行期“能否交互”查询表
 	_terrain.resize(total)           # 地形等级在阶段 B 逐贴片填充
+	t_stage = _stage_mark("④覆盖率选区", t_stage)
 
 	# ===== 大陆质心：把“陆地最多的那面”记下来，生成完交给镜头对准 =====
 	# 以质心方向为中心的半球承载的可交互贴片最多（半球面积最大化的方向），
@@ -686,14 +705,25 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 		_region_center = (_region_center / region_n).normalized()
 	else:
 		_region_center = Vector3.UP # 兜底：全海时面朝北极
+	t_stage = _stage_mark("④b大陆质心", t_stage)
 
 	# ===== 阶段 B：对偶贴片 + 颜色 + 网格数组（分帧） =====
 	# 二次生成：贴片几何全部重来，旧的选择状态一并清掉（避免索引错位/悬空高亮）
 	_tile_polys = []
 	deselect()
+	var cli := [0.0, 0.0, 0.0] # 气候复用缓冲：[elev, temperature, humidity]，热循环零分配
+	# 网格数组精确预分配：Σ贴片角点数 = 3×三角形数（每个三角形的三个角各归属
+	# 一块贴片），索引数 = Σ3×(n−2)（凸多边形扇形三角化）。预分配后按索引直写，
+	# 免掉逐元素 append 的扩容拷贝——⑤ 阶段最大的单项开销。
+	var total_corners := tris.size() * 3
 	var mesh_verts := PackedVector3Array()
 	var mesh_colors := PackedColorArray()
+	mesh_verts.resize(total_corners)
+	mesh_colors.resize(total_corners)
 	var mesh_indices := PackedInt32Array()
+	mesh_indices.resize(3 * (total_corners - 2 * total))
+	var vert_cursor := 0 # 已写满的角点数（同时是下一块贴片的顶点基址）
+	var idx_cursor := 0  # 已写满的索引数
 	for v in total:
 		var axis := verts[v] # 已是单位向量
 		# 收集该点周围一圈三角形的重心（对偶多边形的顶点）
@@ -701,11 +731,26 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 		for ti in vert_faces[v]:
 			var tri := tris[ti]
 			cents.append((verts[tri.x] + verts[tri.y] + verts[tri.z]).normalized())
-		# 把相邻面重心按“绕 axis 的方位角”排序，才能连成不自交的多边形
+		# 把相邻面重心按“绕 axis 的方位角”排序，才能连成不自交的多边形。
+		# 5/6 个元素的小数组：先算好角度再手写插入排序——比 sort_custom 的
+		# GDScript lambda 回调（每贴片 ~11 次脚本调用）快一个数量级。
 		var e1: Vector3 = (cents[0] - axis * cents[0].dot(axis)).normalized()
 		var e2 := axis.cross(e1)
-		cents.sort_custom(func(p, q):
-			return _tangent_angle(p, axis, e1, e2) < _tangent_angle(q, axis, e1, e2))
+		var n := cents.size()
+		var angs := PackedFloat32Array()
+		angs.resize(n)
+		for k in n:
+			angs[k] = _tangent_angle(cents[k], axis, e1, e2)
+		for k in range(1, n):
+			var ca := angs[k]
+			var cp := cents[k]
+			var j := k - 1
+			while j >= 0 and angs[j] > ca:
+				angs[j + 1] = angs[j]
+				cents[j + 1] = cents[j]
+				j -= 1
+			angs[j + 1] = ca
+			cents[j + 1] = cp
 		var poly := PackedVector3Array(cents)
 
 		# 缓存贴片边界顶点（单位球面，顺序与 cents 的方位角排序一致）：
@@ -726,21 +771,25 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 				level = TerrainLevel.FLAT
 				col = C_OCEAN
 			else:
-				var c := _climate(center)
-				level = _terrain_level_from_climate(c)
-				col = _tile_appearance(c, level)
+				_climate_fill(center, cli) # 复用数组，热循环零字典分配
+				var elev: float = cli[0]
+				var temp: float = cli[1]
+				level = _terrain_level(elev)
+				col = _tile_appearance(_biome_color(elev, temp, cli[2]), level)
 		_terrain[v] = level
 
 		# 每个贴片用一组“独占”顶点（不与其他贴片共享）→ 顶点色插值后整片均匀
-		var base := mesh_verts.size()
-		for p in poly:
-			mesh_verts.append(p * PLANET_RADIUS)
-			mesh_colors.append(col)
+		var base := vert_cursor
+		for k in poly.size():
+			mesh_verts[base + k] = poly[k] * PLANET_RADIUS
+			mesh_colors[base + k] = col
 		# 凸多边形扇形三角化（五/六边形都是凸的）
-		for i in range(1, poly.size() - 1):
-			mesh_indices.append(base)
-			mesh_indices.append(base + i)
-			mesh_indices.append(base + i + 1)
+		for i in range(1, n - 1):
+			mesh_indices[idx_cursor] = base
+			mesh_indices[idx_cursor + 1] = base + i
+			mesh_indices[idx_cursor + 2] = base + i + 1
+			idx_cursor += 3
+		vert_cursor += n
 
 		# 让出线程：攒够一批就刷新进度条并等下一帧，UI 才能持续响应
 		if v % TILES_PER_FRAME == TILES_PER_FRAME - 1:
@@ -757,6 +806,7 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 			parts.append("%s %d" % [TERRAIN_NAMES[lv], counts[lv]])
 	var ungenerated: int = counts.get(0, 0)
 	print("地形分布：", "，".join(parts), "（已生成 ", total - ungenerated, " / ", total, " 贴片）")
+	t_stage = _stage_mark("⑤对偶贴片+网格", t_stage)
 
 	# ===== ⑥ 收尾：组装 ArrayMesh（让 97% 先画出来再干最后一下）=====
 	_progress(97.0)
@@ -769,12 +819,23 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 	var mesh := ArrayMesh.new()
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 	_progress(100.0)
+	t_stage = _stage_mark("⑥组装ArrayMesh", t_stage)
 	return mesh
 
 
 func _progress(percent: float) -> void:
+	_prog_calls += 1  # 性能打点：每次进度刷新≈一次分帧 await，用于统计各阶段帧数
 	if _menu != null:
 		_menu.set_progress(percent)
+
+
+# 性能打点：打印一个生成阶段的耗时与分帧次数（_progress≈每帧一次），
+# 返回当前时刻作为下一阶段计时起点。只打印，不影响任何功能。
+func _stage_mark(stage: String, t_prev: int) -> int:
+	var now := Time.get_ticks_msec()
+	print("[gen] %s：%d ms / %d 帧" % [stage, now - t_prev, _prog_calls])
+	_prog_calls = 0
+	return now
 
 
 # —— 贴片查询：交互与地形 ——
