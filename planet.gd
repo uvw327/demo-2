@@ -25,6 +25,7 @@ extends Node3D
 
 const OrbitCameraScript := preload("res://orbit_camera.gd")
 const WorldMenuScript := preload("res://world_menu.gd")
+const SELECTION_RING_SHADER := preload("res://selection_ring.gdshader")
 
 # level：递归二分段数，f = 2^level → 贴片总数 = 10·4^level + 2
 # level=7 → f=128 → 163842 个贴片
@@ -118,10 +119,22 @@ var _mesh_instance: MeshInstance3D
 var _topo_verts: Array[Vector3] = []
 var _generated: PackedByteArray = PackedByteArray() # 贴片是否已生成（可交互）
 
+# —— 点击选区：拾取 + 选中高亮 ——
+# 每块贴片的边界顶点（单位球面）：阶段 B 建网格时顺手缓存，
+# 点击选中时据此生成“向内溢出的白色光晕环”（见 _rebuild_selection_ring）。
+var _tile_polys: Array[PackedVector3Array] = []
+var _selected_tile := -1                  # 当前选中贴片索引；-1 = 未选中
+var _orbit: OrbitCamera                   # 轨道相机（点按事件从这里进来）
+var _selection_ring: MeshInstance3D       # 选中环：独立实例，切换选中时重建其 mesh
+var _selection_material: ShaderMaterial   # 选中环材质（白光向内衰减，无呼吸）
+
 
 func _ready() -> void:
-	# 轨道相机控制器：和 cube 场景同款交互（中键环绕 + 滚轮缩放）
-	add_child(OrbitCameraScript.new())
+	# 轨道相机控制器：桌面左键/中键拖拽 + 滚轮，触屏单指拖拽 + 双指捏合；
+	# 短按不动（点按）经 view_tapped 转发到这里做贴片拾取
+	_orbit = OrbitCameraScript.new()
+	add_child(_orbit)
+	_orbit.view_tapped.connect(_on_view_tapped)
 
 	# 启动只做一件事：摆出菜单。星球生成推迟到玩家点击“生成世界”之后，
 	# 之前的“界面一片空白、程序在后台闷头算”被消除了。
@@ -675,6 +688,9 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 		_region_center = Vector3.UP # 兜底：全海时面朝北极
 
 	# ===== 阶段 B：对偶贴片 + 颜色 + 网格数组（分帧） =====
+	# 二次生成：贴片几何全部重来，旧的选择状态一并清掉（避免索引错位/悬空高亮）
+	_tile_polys = []
+	deselect()
 	var mesh_verts := PackedVector3Array()
 	var mesh_colors := PackedColorArray()
 	var mesh_indices := PackedInt32Array()
@@ -691,6 +707,10 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 		cents.sort_custom(func(p, q):
 			return _tangent_angle(p, axis, e1, e2) < _tangent_angle(q, axis, e1, e2))
 		var poly := PackedVector3Array(cents)
+
+		# 缓存贴片边界顶点（单位球面，顺序与 cents 的方位角排序一致）：
+		# 点击选中时用它们生成高亮环；索引与 _topo_verts/_terrain 一致
+		_tile_polys.append(poly)
 
 		# 贴片颜色：未生成 → 纯海洋底色，不做任何噪声采样（这些贴片没有地形）；
 		# 内陆湖 → 海洋色 + 平原地形（“水下也是陆地”）；
@@ -788,6 +808,117 @@ func get_tile_terrain(world_dir: Vector3) -> int:
 	if _generated.is_empty():
 		return TerrainLevel.NOT_GENERATED
 	return _terrain[_nearest_tile(world_dir)]
+
+
+# —— 点击选区：屏幕点按 → 贴片索引 → 白光内溢高亮环 ——
+# 设计约定（与需求确认过的语义一致）：
+#   · 点到星空（射线没碰到星球）→ 取消选中；
+#   · 点到未生成区域（不可探索的空白海面）→ 取消选中；
+#   · 生成区内的海洋贴片可以选中；
+#   · 点到已选中的同一块 → 保持选中（重建同一枚环，无副作用）。
+
+func _on_view_tapped(screen_pos: Vector2) -> void:
+	# 相机射线与单位球的解析求交（不需要物理体）：
+	# |from + t·dir|² = 1 → t² + 2b·t + c = 0，b = from·dir，c = |from|² − 1
+	var from := _orbit.cam.project_ray_origin(screen_pos)
+	var dir := _orbit.cam.project_ray_normal(screen_pos)
+	var b := from.dot(dir)
+	var c := from.length_squared() - 1.0
+	var disc := b * b - c
+	if disc < 0.0:
+		deselect()   # 穿过星空（射线与球不相交）→ 取消
+		return
+	var t := -b - sqrt(disc)
+	if t <= 0.0:
+		deselect()
+		return
+	var tile := _nearest_tile((from + dir * t).normalized())
+	if _generated.is_empty() or _generated[tile] != 1:
+		deselect()   # 未生成的空白海面没有地形数据，不可选中
+		return
+	select_tile(tile)
+
+
+# 选中某块贴片（后续玩法层可直接调用）。重复选中同一块等价于保持选中。
+func select_tile(tile: int) -> void:
+	if _tile_polys.is_empty() or tile < 0 or tile >= _tile_polys.size():
+		return
+	_selected_tile = tile
+	_rebuild_selection_ring()
+
+
+# 取消选中：状态位清零、环隐藏（mesh 留着，下次选中直接复用节点）。
+func deselect() -> void:
+	_selected_tile = -1
+	if _selection_ring != null:
+		_selection_ring.visible = false
+
+
+# 生成选中高亮环：
+# 沿贴片边界做两个同向内收的环——外沿（亮边）与内沿（透明端）
+# 连成一条细环带，整体沿径向抬一点点避免与地表 z-fighting。
+# 顶点色 a = 径向参数（外沿 0 / 内沿 1），shader 里 pow(1−a) 做向内衰减。
+# 环宽随贴片半径而定 → 拉远拉近观感一致；环内收 → 光不会溢到相邻地块。
+func _rebuild_selection_ring() -> void:
+	const EDGE_INSET := 0.05  # 外沿自贴片边界向内收（贴片半径的比例）
+	const GLOW_LENGTH := 0.44 # 光晕向内延伸到的比例（决定晕带厚度）
+	const LIFT := 1.004       # 环带相对星球半径的抬升系数
+	const MIN_BAND_PX := 4.0  # 屏幕像素兜底：整球远观时晕带至少约这么宽（屏上）
+	const BAND_MAX_RATIO := 0.55  # 晕带最厚不超过贴片半径的比例，不吞地块
+	var poly: PackedVector3Array = _tile_polys[_selected_tile]
+	var axis := _topo_verts[_selected_tile]  # 贴片中心方向（单位向量）
+	var count := poly.size()
+	# 贴片外接半径（世界单位）：中心方向到边界角点的最大弦长
+	var tile_r := 0.0
+	for e in poly:
+		tile_r = maxf(tile_r, axis.distance_to(e))
+	# 光晕带宽 = max(贴片半径比例, 屏幕像素兜底换算的世界宽度)，封顶 BAND_MAX_RATIO。
+	# 像素换算：像素/世界 = 视口高 / (2·tan(fov/2)·相机到地表距离)
+	var cam_surf := maxf(0.2, _orbit.dist - PLANET_RADIUS)
+	var px_per_world := get_viewport().get_visible_rect().size.y \
+			/ (2.0 * tan(deg_to_rad(_orbit.cam.fov * 0.5)) * cam_surf)
+	var band_world := MIN_BAND_PX / maxf(1.0, px_per_world)
+	var inner_ratio := clampf(maxf(GLOW_LENGTH, band_world / tile_r), EDGE_INSET * 2.0, BAND_MAX_RATIO)
+	var verts := PackedVector3Array()
+	var colors := PackedColorArray()
+	var indices := PackedInt32Array()
+	for k in count:
+		var edge := poly[k]
+		# 从中心方向向边界方向插值：外沿几乎贴边（亮边），内沿更深（透明端）
+		var outer := axis.lerp(edge, 1.0 - EDGE_INSET).normalized() * PLANET_RADIUS * LIFT
+		var inner := axis.lerp(edge, 1.0 - inner_ratio).normalized() * PLANET_RADIUS * LIFT
+		verts.append(outer)
+		colors.append(Color(1.0, 1.0, 1.0, 0.0))  # t=0 → 边缘全亮
+		verts.append(inner)
+		colors.append(Color(1.0, 1.0, 1.0, 1.0))  # t=1 → 内沿完全透明
+	# 环带四边形：外环与内环按同一角度序连接；顶点布局 [O0,I0,O1,I1,…]
+	# 注意 Godot 的正面三角形是順时针绕序：这里先按"从外看顺时针"连接，
+	# 保证 cull_back 下环带不被剔除（此前反序导致整环消失，已用截图实证）。
+	for k in count:
+		var k1 := (k + 1) % count
+		indices.append(k * 2)
+		indices.append(k1 * 2 + 1)
+		indices.append(k1 * 2)      # 半环带 1：外沿(当前)→内沿(下一角)→外沿(下一角)
+		indices.append(k * 2)
+		indices.append(k * 2 + 1)
+		indices.append(k1 * 2 + 1)  # 半环带 2：外沿(当前)→内沿(当前)→内沿(下一角)
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_COLOR] = colors
+	arrays[Mesh.ARRAY_INDEX] = indices
+	var ring_mesh := ArrayMesh.new()
+	ring_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	if _selection_material == null:
+		_selection_material = ShaderMaterial.new()
+		_selection_material.shader = SELECTION_RING_SHADER
+	if _selection_ring == null:
+		_selection_ring = MeshInstance3D.new()
+		_selection_ring.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		add_child(_selection_ring)
+	_selection_ring.material_override = _selection_material
+	_selection_ring.mesh = ring_mesh
+	_selection_ring.visible = true
 
 
 # 向量 p 在切平面（以 axis 为法线、e1 为 0° 参考方向）上的方位角
