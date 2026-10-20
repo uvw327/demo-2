@@ -8,6 +8,7 @@ const SRC_FILES = [
   "main.gd",
   "orbit_camera.gd",
   "planet.gd",
+  "tile_hud.gd",
   "world_menu.gd",
   "Main.tscn",
   "planet.tscn",
@@ -55,9 +56,26 @@ for (const name of SRC_FILES) {
 cjk.delete(FULLWIDTH_SPACE);
 punct.delete(FULLWIDTH_SPACE);
 
+// 度符号：HUD 经纬度要用（U+00B0，不在 CJK 区，单独保留）
+const extra = new Set();
+for (const name of SRC_FILES) {
+  const p = path.join(process.cwd(), name);
+  if (!fs.existsSync(p)) continue;
+  const lines = fs.readFileSync(p, "utf-8").split(/\r?\n/);
+  for (const line of lines) {
+    const code = stripComment(line);
+    const strRe = /"((?:[^"\\]|\\.)*)"/g;
+    let m;
+    while ((m = strRe.exec(code)) !== null) {
+      for (const c of m[1]) if (c === "\u00b0") extra.add(c);
+    }
+  }
+}
+
 const result =
   [...cjk].sort().join("") +
   [...punct].sort().join("") +
+  [...extra].sort().join("") +
   "\n";
 
 const out = path.join(process.cwd(), "assets", "chinese.txt");

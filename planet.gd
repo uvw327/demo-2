@@ -26,7 +26,6 @@ extends Node3D
 const OrbitCameraScript := preload("res://orbit_camera.gd")
 const WorldMenuScript := preload("res://world_menu.gd")
 const SELECTION_RING_SHADER := preload("res://selection_ring.gdshader")
-
 # level：递归二分段数，f = 2^level → 贴片总数 = 10·4^level + 2
 # level=7 → f=128 → 163842 个贴片
 const LEVEL := 7
@@ -57,6 +56,11 @@ const C_ICE := Color(0.93, 0.95, 0.97)    # 冰盖
 # 视觉上像一张没有贴图的平坦海面，星球整体连续、不出现黑色地块；
 # 逻辑上它属于“未生成”，没有地形数据也不可交互（见 is_tile_interactable）。
 const C_UNGENERATED := C_OCEAN
+
+# ---- 群系 id 表：颜色与 HUD 显示同源（_biome_id 判定，BIOME_NAMES/ COLORS 查表）----
+const BIOME_NONE := 255 # 未生成贴片没有群系
+const BIOME_NAMES := ["海洋", "海冰", "冰盖", "苔原", "寒带", "沙漠", "温带森林"]
+const BIOME_COLORS: Array[Color] = [C_OCEAN, C_ICE, C_ICE, C_TUNDRA, C_TAIGA, C_DESERT, C_FOREST]
 
 # ---- 地形等级（“地形五级”，由海拔高度划分，与群系颜色是两套独立维度）----
 # 群系颜色只负责“长什么样子”（森林/沙漠/冰原…），地形数据只负责“好不好走”：
@@ -109,6 +113,11 @@ var _continent_noise: FastNoiseLite # 大陆形状噪声：决定“已生成区
 var _terrain: PackedByteArray = PackedByteArray()
 # 大陆内部的内陆湖表：贴片索引 → 1(内陆湖：渲染海色，地形平原)
 var _inland_water: PackedByteArray = PackedByteArray()
+# —— HUD 显示用的逐贴片缓存（阶段 B 填充，二次生成时重置）——
+var _tile_biome := PackedByteArray()    # 群系 id（BIOME_NONE=未生成）
+var _tile_elev := PackedFloat32Array()  # 海拔噪声值
+var _tile_temp := PackedFloat32Array()  # 温度
+var _tile_humid := PackedFloat32Array() # 湿度
 
 var _menu: CanvasLayer           # “创建世界”菜单 UI
 var _rain_shift := 0.0           # 本次生成的湿度整体偏移
@@ -131,9 +140,14 @@ var _selected_tile := -1                  # 当前选中贴片索引；-1 = 未�
 var _orbit: OrbitCamera                   # 轨道相机（点按事件从这里进来）
 var _selection_ring: MeshInstance3D       # 选中环：独立实例，切换选中时重建其 mesh
 var _selection_material: ShaderMaterial   # 选中环材质（白光向内衰减，无呼吸）
+var _hud: TileHud                         # 贴片信息 HUD：选中贴片时亮出，取消选中即隐藏
 
 
 func _ready() -> void:
+	# 贴片信息 HUD：平时隐藏，选中贴片时亮出（数据在 select_tile 时组装）
+	_hud = TileHud.new()
+	add_child(_hud)
+
 	# 轨道相机控制器：桌面左键/中键拖拽 + 滚轮，触屏单指拖拽 + 双指捏合；
 	# 短按不动（点按）经 view_tapped 转发到这里做贴片拾取
 	_orbit = OrbitCameraScript.new()
@@ -237,22 +251,27 @@ func _climate_fill(center: Vector3, out: Array) -> void:
 		0.0, 1.0)
 
 
-# —— 生物群系纯色（颜色只描述“长什么样”，地形数据另算）——
-func _biome_color(elev: float, temp: float, humid: float) -> Color:
-	# 1) 海洋：低于海平面。极区海水冷过冻结阈值 → 变成海冰（冰盖自然延伸出海）
+# —— 生物群系判定/纯色（颜色只描述“长什么样”，地形数据另算）——
+# id 与名字/颜色同源：同一套分支出 id，群系名（HUD）与渲染色都查表。
+func _biome_id(elev: float, temp: float, humid: float) -> int:
+	# 海洋：低于海平面。极区海水冷过冻结阈值 → 变成海冰（冰盖自然延伸出海）
 	if elev < SEA_LEVEL:
-		return C_OCEAN if temp >= T_FREEZE else C_ICE
+		return 0 if temp >= T_FREEZE else 1
 
-	# 2) 陆地：按温度分带（阈值+噪声 → 犬牙交错的自然边界），低纬再看湿度
+	# 陆地：按温度分带（阈值+噪声 → 犬牙交错的自然边界），低纬再看湿度
 	if temp < T_FREEZE:
-		return C_ICE
+		return 2 # 冰盖
 	if temp < T_TUNDRA:
-		return C_TUNDRA
+		return 3 # 苔原
 	if temp < T_TAIGA:
-		return C_TAIGA
+		return 4 # 寒带
 	if humid < DESERT_HUMID:
-		return C_DESERT
-	return C_FOREST
+		return 5 # 沙漠
+	return 6     # 温带森林
+
+
+func _biome_color(elev: float, temp: float, humid: float) -> Color:
+	return BIOME_COLORS[_biome_id(elev, temp, humid)]
 
 
 # —— 地形等级判定：单看海拔（ Bonus：同一个贴片的群系颜色与地形是两个维度）——
@@ -685,6 +704,12 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 	_inland_water = select_result["inland_water"]
 	_generated = explored            # 运行期“能否交互”查询表
 	_terrain.resize(total)           # 地形等级在阶段 B 逐贴片填充
+	# HUD 显示缓存：群系 id / 海拔 / 温湿度（未生成贴片保持 BIOME_NONE / 0）
+	_tile_biome.resize(total)
+	_tile_biome.fill(BIOME_NONE)
+	_tile_elev.resize(total)
+	_tile_temp.resize(total)
+	_tile_humid.resize(total)
 	t_stage = _stage_mark("④覆盖率选区", t_stage)
 
 	# ===== 大陆质心：把“陆地最多的那面”记下来，生成完交给镜头对准 =====
@@ -767,15 +792,24 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 		var level := TerrainLevel.NOT_GENERATED
 		var col := C_UNGENERATED
 		if explored[v] == 1:
+			# 气候采样：湖贴片同样采样（HUD 要显示它的海拔/温湿度），
+			# 但湖的地形与颜色仍走湖规则——生成结果与此前完全一致。
+			_climate_fill(center, cli) # 复用数组，热循环零字典分配
+			var elev: float = cli[0]
+			var temp: float = cli[1]
+			var humid: float = cli[2]
+			_tile_elev[v] = elev
+			_tile_temp[v] = temp
+			_tile_humid[v] = humid
 			if _inland_water[v] == 1:
 				level = TerrainLevel.FLAT
 				col = C_OCEAN
+				_tile_biome[v] = 0 # 内陆湖：群系按海洋计（渲染同为海色）
 			else:
-				_climate_fill(center, cli) # 复用数组，热循环零字典分配
-				var elev: float = cli[0]
-				var temp: float = cli[1]
 				level = _terrain_level(elev)
-				col = _tile_appearance(_biome_color(elev, temp, cli[2]), level)
+				var biome := _biome_id(elev, temp, humid)
+				_tile_biome[v] = biome
+				col = _tile_appearance(BIOME_COLORS[biome], level)
 		_terrain[v] = level
 
 		# 每个贴片用一组“独占”顶点（不与其他贴片共享）→ 顶点色插值后整片均匀
@@ -906,13 +940,46 @@ func select_tile(tile: int) -> void:
 		return
 	_selected_tile = tile
 	_rebuild_selection_ring()
+	_update_hud(tile)
 
 
-# 取消选中：状态位清零、环隐藏（mesh 留着，下次选中直接复用节点）。
+# 取消选中：状态位清零、环隐藏（mesh 留着，下次选中直接复用节点）、HUD 收起。
 func deselect() -> void:
 	_selected_tile = -1
 	if _selection_ring != null:
 		_selection_ring.visible = false
+	if _hud != null:
+		_hud.hide_panel()
+
+
+# —— HUD 内容组装：贴片编号 / 地形 / 群系 / 海拔 / 温湿度 / 经纬度 ——
+# 数据源：阶段 B 逐贴片缓存的 _terrain / _tile_biome / _tile_elev 等；
+# 经纬度由贴片中心方向反算（lat = asin(y)，lon = atan2(z, x)，赤道零纬度、
+# x 正方向为经度零点——世界坐标约定，不对应真实地理）。
+func _update_hud(tile: int) -> void:
+	# 生成尚未跑到阶段 B 时缓存数组还是空的（只可能来自测试的直接调用），静默跳过
+	if _hud == null or _tile_biome.is_empty() or tile >= _tile_biome.size():
+		return
+	var poly: PackedVector3Array = _tile_polys[tile]
+	var center := Vector3.ZERO
+	for p in poly:
+		center += p
+	center = (center / poly.size()).normalized()
+	var lat := rad_to_deg(asin(clampf(center.y, -1.0, 1.0)))
+	var lon := rad_to_deg(atan2(center.z, center.x))
+	var lat_str := "%.1f°%s" % [absf(lat), "N" if lat >= 0.0 else "S"]
+	var lon_str := "%.1f°%s" % [absf(lon), "E" if lon >= 0.0 else "W"]
+	var biome := _tile_biome[tile]
+	var biome_str: String = "未生成" if biome == BIOME_NONE else BIOME_NAMES[biome]
+	var lake_mark := "（内陆湖）" if _inland_water[tile] == 1 else ""
+	var lines := PackedStringArray([
+		"地形：%s" % TERRAIN_NAMES[_terrain[tile]],
+		"群系：%s%s" % [biome_str, lake_mark],
+		"海拔：%.3f" % _tile_elev[tile],
+		"温度：%.2f　湿度：%.2f" % [_tile_temp[tile], _tile_humid[tile]],
+		"经纬度：%s，%s" % [lat_str, lon_str],
+	])
+	_hud.show_tile("贴片 #%d" % tile, lines)
 
 
 # 生成选中高亮环：

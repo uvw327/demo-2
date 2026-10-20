@@ -8,6 +8,7 @@ SRC_FILES = [
     pathlib.Path("main.gd"),
     pathlib.Path("orbit_camera.gd"),
     pathlib.Path("planet.gd"),
+    pathlib.Path("tile_hud.gd"),
     pathlib.Path("world_menu.gd"),
     pathlib.Path("Main.tscn"),
     pathlib.Path("planet.tscn"),
@@ -50,8 +51,19 @@ for path in SRC_FILES:
 # 全角空格等空白一律不要
 cjk.discard("\u3000")
 punct.discard("\u3000")
+# 度符号：HUD 经纬度要用（U+00B0，不在 CJK 区，单独保留）
+extra = set()
+for path in SRC_FILES:
+    if not path.exists():
+        continue
+    for line in path.read_text(encoding="utf-8").splitlines():
+        code = strip_comment(line)
+        for m in str_re.finditer(code):
+            for ch in m.group(1):
+                if ch == "\u00b0":
+                    extra.add(ch)
 
-result = "".join(sorted(cjk)) + "".join(sorted(punct))
+result = "".join(sorted(cjk)) + "".join(sorted(punct)) + "".join(sorted(extra))
 out = pathlib.Path("assets/chinese.txt")
 out.parent.mkdir(parents=True, exist_ok=True)
 out.write_bytes((result + "\n").encode("utf-8"))
