@@ -139,6 +139,7 @@ static func build_manifest(
 			"simd": false,
 			"threads": false,
 			"wasmExceptions": false,
+			"javascriptEval": true,
 		},
 		"artifacts": {
 			"godot.js": {"sha256": _sha256(js_path)},
@@ -324,6 +325,13 @@ func _validate(editor_version: String, editor_commit: String) -> void:
 		or bool(features.get("wasmExceptions", true))
 	):
 		error = "Template enables unsupported WASM features"
+		return
+	# The JavaScriptBridge (GodotJSWrapper) must stay linked. Raw bundles
+	# predating this flag omit it, which is treated as enabled for backwards
+	# compatibility; a bundle that explicitly disables it is rejected because
+	# `JavaScriptBridge.get_interface()` would silently return null.
+	if not bool(features.get("javascriptEval", true)):
+		error = "Template must keep the JavaScript bridge enabled"
 		return
 
 	var artifacts_value: Variant = manifest.get("artifacts", {})

@@ -1812,19 +1812,15 @@ func _patch_godot_js(path: String, platform: String = "wechat") -> Error:
 		)
 		modified = true
 
-	# TikTok's native package scan forbids real eval calls. Certified templates
-	# built with javascript_eval=no need no rewrite; older exact templates are
-	# converted to an explicit unsupported bridge without leaving an eval( token.
+	# TikTok's native package scan forbids real eval calls. Bridge-enabled
+	# certified templates (javascript_eval=yes) are converted to an explicit
+	# unsupported bridge without leaving an eval( token; eval-free bundles that
+	# predate the flag need no rewrite.
 	if bool(PLATFORM_CONTRACTS[platform].forbids_javascript_eval):
 		if content.contains("eval("):
 			var eval_start := content.find("function _godot_js_eval(")
 			var eval_end := content.find("var IDHandler", eval_start)
-			var eval_import := "godot_js_eval:_godot_js_eval"
-			if (
-				eval_start < 0
-				or eval_end <= eval_start
-				or content.count(eval_import) != 1
-			):
+			if eval_start < 0 or eval_end <= eval_start:
 				_log("  [color=red]godot.js 的 JavaScript eval 实现不符合已认证结构[/color]")
 				return ERR_FILE_CORRUPT
 			var disabled_eval := (
@@ -1836,10 +1832,16 @@ func _patch_godot_js(path: String, platform: String = "wechat") -> Error:
 				+ disabled_eval
 				+ content.substr(eval_end)
 			)
+			# optimize=size lets Emscripten minify the wasm import key, so the
+			# mapping may be `ze:_godot_js_eval` rather than
+			# `godot_js_eval:_godot_js_eval`. Match the stable value side.
+			if not content.contains(":_godot_js_eval"):
+				_log("  [color=red]godot.js 的 JavaScript eval wasm 导入不符合已认证结构[/color]")
+				return ERR_FILE_CORRUPT
 			content = content.replace(
-				eval_import, "godot_js_eval:_godot_js_disabled")
+				":_godot_js_eval", ":_godot_js_disabled")
 			modified = true
-		if content.contains("eval("):
+		if content.contains("eval(") or content.contains("_godot_js_eval"):
 			_log("  [color=red]TikTok godot.js 仍包含禁止的 eval()[/color]")
 			return ERR_FILE_CORRUPT
 

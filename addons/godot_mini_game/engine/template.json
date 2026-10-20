@@ -7,19 +7,20 @@
   "emscriptenVersion": "4.0.11",
   "profile": "2d_full",
   "target": "release",
-  "revision": 2,
+  "revision": 3,
   "bridgeAbi": 1,
   "features": {
     "simd": false,
     "threads": false,
-    "wasmExceptions": false
+    "wasmExceptions": false,
+    "javascriptEval": true
   },
   "artifacts": {
     "godot.js": {
-      "sha256": "da2cbbfcd3946639d11f10f6094f166c3a1ce3a8d25ddc689b61c0bfbfc70418"
+      "sha256": "ab78a80241c8caba34cb146dc681446994a03e9fd98687d8e0c03d55bd35f73a"
     },
     "godot.wasm.br": {
-      "sha256": "f24650556cc422da40261f5daa9eed69adbef6e9fa068c4a5da655fc28f40d16"
+      "sha256": "81043617bfc87432c0efde9dcafbaa21cdab9685d5368e6dce7b108850957090"
     }
   }
 }
