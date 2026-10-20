@@ -24,6 +24,7 @@ extends Node3D
 #      贴片总数 = 10 × f² + 2（f = 每条棱的等分数）。
 
 const OrbitCameraScript := preload("res://orbit_camera.gd")
+const StarDomeScript := preload("res://star_dome.gd")
 const WorldMenuScript := preload("res://world_menu.gd")
 const SELECTION_RING_SHADER := preload("res://selection_ring.gdshader")
 # level：递归二分段数，f = 2^level → 贴片总数 = 10·4^level + 2
@@ -155,6 +156,7 @@ var _orbit: OrbitCamera                   # 轨道相机（点按事件从这里
 var _selection_ring: MeshInstance3D       # 选中环：独立实例，切换选中时重建其 mesh
 var _selection_material: ShaderMaterial   # 选中环材质（白光向内衰减，无呼吸）
 var _hud: TileHud                         # 贴片信息 HUD：选中贴片时亮出，取消选中即隐藏
+var _star_dome: StarDome                  # 背景星空：代码构建（种子驱动，见 star_dome.gd）
 
 
 func _ready() -> void:
@@ -168,6 +170,12 @@ func _ready() -> void:
 	add_child(_orbit)
 	_orbit.view_tapped.connect(_on_view_tapped)
 
+	# 背景星空：菜单页就有（菜单背后不是死灰底）；种子等到生成请求时才填，
+	# 菜单相位先用 0 号种子铺一层，玩家感知只是“星空早就挂在那了”
+	_star_dome = StarDomeScript.new()
+	add_child(_star_dome)
+	_star_dome.build(0)
+
 	# 启动只做一件事：摆出菜单。星球生成推迟到玩家点击“生成世界”之后，
 	# 之前的“界面一片空白、程序在后台闷头算”被消除了。
 	_menu = WorldMenuScript.new()
@@ -180,6 +188,9 @@ func _on_generate_requested(params: Dictionary) -> void:
 	_init_noise(params["seed"])
 	_rain_shift = params["rainfall"] * RAIN_SHIFT
 	_temp_shift = params["temperature"] * TEMP_SHIFT
+	# 星空：同种子同星图（换种子生成才会重铺；同种子短路时星穹保持不动）。
+	# 成本几毫秒级，不值得为它分帧。
+	_star_dome.build(params["seed"])
 	# 区域中心 = 生成这一刻镜头正对的方向：球冠围着玩家看到的半球长
 	#（贴镜头、天然不落在极点），生成后镜头对准同一方向，零校准。
 	_region_center = _camera_fwd_dir()

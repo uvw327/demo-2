@@ -6,7 +6,7 @@ extends CanvasLayer
 # 本文件不写任何中文文案——显示内容由 planet.gd 组装传入，字形清单
 # 由 extract_chinese.py 扫描源码字符串统一收集，别在这里内联中文。
 
-const UI_FONT := preload("res://assets/font/glyphs.tres") # 与菜单同一套烘焙字形
+const UI_FONT := preload("res://assets/font/game-ui-han-sans-3500.otf") # 与菜单同一套烘焙字形
 
 const BG_ALPHA := 0.55    # 面板底色透明度（黑）
 const RADIUS := 12        # 圆角半径（px）

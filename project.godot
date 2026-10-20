@@ -43,3 +43,4 @@ enabled=PackedStringArray("res://addons/font_baker/plugin.cfg", "res://addons/go
 rendering_device/driver.windows="d3d12"
 renderer/rendering_method="gl_compatibility"
 renderer/rendering_method.mobile="gl_compatibility"
+environment/defaults/default_clear_color=Color(0.0627451, 0.0901961, 0.1176471, 1)
