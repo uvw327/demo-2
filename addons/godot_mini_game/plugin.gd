@@ -37,4 +37,16 @@ func _exit_tree() -> void:
 func _current_autoload_path() -> String:
 	if not ProjectSettings.has_setting(SDK_AUTOLOAD_SETTING):
 		return ""
-	return str(ProjectSettings.get_setting(SDK_AUTOLOAD_SETTING, "")).trim_prefix("*")
+	var raw := str(ProjectSettings.get_setting(SDK_AUTOLOAD_SETTING, "")).trim_prefix("*")
+	# project.godot 里的脚本路径可能被写成 uid:// 形式（编辑器会做这种改写，指向的
+	# 其实就是同一个 MiniGameSDK.gd）。这里先把它解析回真实路径再比较，
+	# 否则“同一脚本、两种写法”会被下面的重名检查误判成冲突，每次启动编辑器都报错。
+	if raw.begins_with("uid://"):
+		var id := ResourceUID.text_to_id(raw)
+		if id != ResourceUID.INVALID_ID and ResourceUID.has_id(id):
+			return ResourceUID.get_id_path(id)
+		# uid 缓存尚未就绪时兜底：直接加载解析出 resource_path
+		var res := load(raw)
+		if res != null and not res.resource_path.is_empty():
+			return res.resource_path
+	return raw
