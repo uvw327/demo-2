@@ -28,7 +28,7 @@ const WorldMenuScript := preload("res://world_menu.gd")
 const SELECTION_RING_SHADER := preload("res://selection_ring.gdshader")
 # level：递归二分段数，f = 2^level → 贴片总数 = 10·4^level + 2
 # level=7 → f=128 → 163842 个贴片
-const LEVEL := 7
+const LEVEL := 6
 # 【性能对照已测毕】临时切成 level=6（40962 贴片，与 planet_demo 对齐）实测：
 # headless 纯计算 558ms，窗口内墙钟 629/724/729ms——与 JS demo 同级（~320ms）
 # 属同量级，详见 2026-10 性能对照分析。需要复测时取消下行注释并注释上一行。

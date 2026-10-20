@@ -17,8 +17,8 @@ config/icon="res://icon.svg"
 
 [autoload]
 
-MiniGameSDK="*uid://bfx3t6wuymbrq"
 _mcp_game_helper="*res://addons/godot_ai/runtime/game_helper.gd"
+MiniGameSDK="*res://addons/godot_mini_game/MiniGameSDK.gd"
 
 [display]
 

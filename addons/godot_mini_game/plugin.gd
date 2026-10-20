@@ -37,16 +37,32 @@ func _exit_tree() -> void:
 func _current_autoload_path() -> String:
 	if not ProjectSettings.has_setting(SDK_AUTOLOAD_SETTING):
 		return ""
-	var raw := str(ProjectSettings.get_setting(SDK_AUTOLOAD_SETTING, "")).trim_prefix("*")
-	# project.godot 里的脚本路径可能被写成 uid:// 形式（编辑器会做这种改写，指向的
-	# 其实就是同一个 MiniGameSDK.gd）。这里先把它解析回真实路径再比较，
-	# 否则“同一脚本、两种写法”会被下面的重名检查误判成冲突，每次启动编辑器都报错。
-	if raw.begins_with("uid://"):
-		var id := ResourceUID.text_to_id(raw)
-		if id != ResourceUID.INVALID_ID and ResourceUID.has_id(id):
-			return ResourceUID.get_id_path(id)
-		# uid 缓存尚未就绪时兜底：直接加载解析出 resource_path
-		var res := load(raw)
-		if res != null and not res.resource_path.is_empty():
-			return res.resource_path
-	return raw
+	return _resolve_autoload_path(
+		str(ProjectSettings.get_setting(SDK_AUTOLOAD_SETTING, ""))
+	)
+
+
+## 把 autoload 设置值解析成真实资源路径。
+##
+## autoload 值以 `*` 开头表示已启用，后面可能是 `res://...`，也可能是 Godot 4.7
+## 写出的 `uid://...`。两者指向同一个脚本时必须归一到同一路径再比较，否则插件会
+## 把自己的 autoload 误判成“名字被占用”。
+static func _resolve_autoload_path(setting_value: String) -> String:
+	var value := setting_value.strip_edges().trim_prefix("*").strip_edges()
+	if value.is_empty():
+		return ""
+
+	if value.begins_with("uid://"):
+		var uid := ResourceUID.text_to_id(value)
+		if uid != ResourceUID.INVALID_ID and ResourceUID.has_id(uid):
+			var cached_path := ResourceUID.get_id_path(uid)
+			if not cached_path.is_empty():
+				return cached_path
+		# 编辑器 uid 缓存可能尚未就绪（首次导入、命令行启动等），此时用 load()
+		# 兜底取 resource_path；仍然失败就退回原始字符串，避免误杀合法配置。
+		if ResourceLoader.exists(value):
+			var resource := ResourceLoader.load(value)
+			if resource != null and not resource.resource_path.is_empty():
+				return resource.resource_path
+
+	return value
