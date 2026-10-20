@@ -29,21 +29,21 @@ const SELECTION_RING_SHADER := preload("res://selection_ring.gdshader")
 # level：递归二分段数，f = 2^level → 贴片总数 = 10·4^level + 2
 # level=7 → f=128 → 163842 个贴片
 const LEVEL := 7
+# 【性能对照已测毕】临时切成 level=6（40962 贴片，与 planet_demo 对齐）实测：
+# headless 纯计算 558ms，窗口内墙钟 629/724/729ms——与 JS demo 同级（~320ms）
+# 属同量级，详见 2026-10 性能对照分析。需要复测时取消下行注释并注释上一行。
+#const LEVEL := 6
 const SUBDIV := 1 << LEVEL # 每条棱的等分数 f
 const PLANET_RADIUS := 1.0
 
-# 每“帧”处理这么多贴片再让出一帧给 UI 刷新（分帧生成，进度条才能动）。
-# 性能权衡：帧数 × 帧间隔是生成耗时的硬地板（60Hz 每帧 16.7ms），
-# 预算切太碎会让“等帧”时间远超计算本身——这里是生成速度的第一参数。
-const TILES_PER_FRAME := 12000
-# —— 生成管线其他重活的帧预算：每个重活每帧只吃这么多，吃完就让帧 ——
-# 生成是全屏进度条阻塞态，预算可以大方些：单帧计算 ~30-80ms 的“小卡顿”
-# 在进度条动画里完全无感，换来总帧数从 200+ 砍到 ~35。
-const ADJ_TRIS_PER_FRAME := 180000   # 邻接面表：每帧处理的三角形数
-const SCORE_TILES_PER_FRAME := 60000 # 大陆噪声打分：每帧采样的贴片数
-const FLOOD_POPS_PER_FRAME := 30000  # 选区漫灌：每帧并入大陆的贴片数
-const BFS_POPS_PER_FRAME := 100000   # 洞区清洗 BFS：每帧弹出的贴片数
-const CENTROID_SLICE_TILES := 40000  # 大陆质心累计：每帧累加的贴片数
+# —— 生成管线的分帧预算：墙钟制 ——
+# 旧方案“每帧固定处理 N 项”在所有刷新率下都得凑整帧：帧间隔里的空转
+# 是硬地板（60Hz 每帧 16.7ms，微信 30fps 更是 33ms）。现在改为按墙钟
+# 切片：实测上一帧的真实节奏，把本帧的计算吃满 ~70%，其余还给渲染与
+# 进度条刷新。纯计算量不变，省掉的是等帧空转（高刷屏收益最大）。
+const GEN_SLICE_RATIO := 0.70 # 每帧让生成吃掉的帧间隔比例
+const GEN_SLICE_MIN_MS := 30  # 切片下限：块头要够大，60fps 一帧干货 ~30ms（老方案 30-80ms 哲学）
+const GEN_SLICE_MAX_MS := 64  # 切片上限：进度条仍以 ~15fps 刷新，低配端避免大卡死
 
 # ---- 生物群系纯色（RGB 0..1）----
 const C_OCEAN := Color(0.13, 0.32, 0.57)  # 海洋
@@ -351,9 +351,9 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 
 	var span := pct_to - pct_from
 	var score_to := pct_from + span * 0.18 # 打分占区间的 18%
-	var adj_to := pct_from + span * 0.40   # 打分 + 邻接共占 40%，余下给选区轮
-	var pass_span := span * 0.6 / 3.0      # 每轮选区（含漫灌+清洗）占区间 20%
-	var pass_base := adj_to
+	var adj_to := pct_from + span * 0.40  # 打分 + 邻接共占 40%，余下给选区
+	var flood_to := adj_to + span * 0.24  # 单轮漫灌共占 24%（快照续灌挤进各轮前半段）
+	var wash_span := span * 0.12          # 每轮清洗占 12%（最多 3 轮，合计 36%）
 	var t_sel := Time.get_ticks_msec()     # 选区内部阶段打点
 
 	# 1) 大陆噪声打分（分片），并记住得分最高的贴片当种子
@@ -362,14 +362,15 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 	var best := 0
 	var sc_at := 0
 	while sc_at < total:
-		var sc_end := mini(sc_at + SCORE_TILES_PER_FRAME, total)
+		var sc_end := mini(sc_at + SLICE_CHECK_STRIDE, total)
 		for i in range(sc_at, sc_end):
 			scores[i] = _continent_noise.get_noise_3dv(verts[i])
 			if scores[i] > scores[best]:
 				best = i
 		sc_at = sc_end
-		_progress(pct_from + (score_to - pct_from) * float(sc_at) / total)
-		await get_tree().process_frame
+		# 墙钟切片：每 ~512 项结一次钟，用满本帧就先算下一批
+		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(pct_from + (score_to - pct_from) * float(sc_at) / total)
 	t_sel = _stage_mark("④a大陆打分", t_sel)
 
 	# 2) 邻接表：对偶贴片相邻 = 细分网格三角形一条棱的两端（分片）
@@ -379,7 +380,7 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 		neighbors[i] = PackedInt32Array()
 	var ti_at := 0
 	while ti_at < tris.size():
-		var ti_end := mini(ti_at + ADJ_TRIS_PER_FRAME, tris.size())
+		var ti_end := mini(ti_at + SLICE_CHECK_STRIDE, tris.size())
 		for ti in range(ti_at, ti_end):
 			var t := tris[ti]
 			neighbors[t.x].append(t.y)
@@ -389,47 +390,104 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 			neighbors[t.z].append(t.x)
 			neighbors[t.x].append(t.z)
 		ti_at = ti_end
-		_progress(score_to + (adj_to - score_to) * float(ti_at) / tris.size())
-		await get_tree().process_frame
+		# 墙钟切片：每 ~512 项结一次钟，用满本帧就让出
+		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(score_to + (adj_to - score_to) * float(ti_at) / tris.size())
 	t_sel = _stage_mark("④b邻接表", t_sel)
 
-	# 3) 迭代漫灌：每次边界贴片按噪声分纯序入堆、并掉分最高的那个，
-	#    长到目标面积后执行第 4 步清洗，并量出清洗吞掉了多少面积（偏差），
-	#    下一轮按偏差回调生长预算，两三轮内可交互区面积收敛到精确 target。
+	# 3) 选区漫灌：每次边界贴片按噪声分纯序入堆、并掉分最高的那个。
 	#    不加逐贴片随机抖动——抖动会让扩张顺序近乎随机，停止时残留一大片
 	#    散碎边界（碎斑根因）；海岸犬牙细节由多倍频噪声梯度自己撕出来。
+	#    原实现“灌到 target→清洗→量偏差→从头整灌到回调后的预算”最多跑 3
+	#    轮，每轮都把同一串弹堆重复了一遍（同种子同分数 → 弹出顺序固定）。
+	#    现改为：漫灌只做一次、灌到 target；从 target×50% 起每跨过一个
+	#    面积里程碑就把（state、边界堆、已并数）快照一份，漫灌终点本身
+	#    也补一份快照。每轮评价时从“不高于该轮停止面积的最近快照”续灌
+	#    到精确面积——续灌与从头整灌逐位等价（同序弹出同一批贴片），
+	#    绝大部分重复弹堆被省掉，语义（偏差回调、清洗规则）完全不变。
 	# 贴片状态：0 还没碰到、1 在边界堆里待命、2 已并入大陆
 	var state := PackedByteArray()
 	state.resize(total)
+	var heap := _TileHeap.new()
+	state[best] = 2
+	var count := 1
+	for nb in neighbors[best]:
+		if state[nb] == 0:
+			state[nb] = 1
+			heap.push(scores[nb], nb)
+	var next_ms := roundi(target * 0.5)      # 快照覆盖 target×50% → target
+	var ms_step := maxi(1, roundi(target * 0.04)) # 快照面积步长：只影响续灌工作量，不影响结果
+	var snap_states: Array = []              # PackedByteArray：里程碑时刻的漫灌状态
+	var snap_heaps: Array = []               # [prio, idx]：里程碑时刻的边界堆（COW 快照）
+	var snap_counts: Array = []              # 与上两表同序的“已并入面积”
+	while count < target and heap.size() > 0:
+		# 墙钟切片：以 ~512 pop 为一批，批内零查钟，批尾结一次钟
+		var pop_end := count + SLICE_CHECK_STRIDE
+		while count < target and heap.size() > 0 and count < pop_end:
+			var v := heap.pop()
+			if state[v] == 2:
+				continue
+			state[v] = 2
+			count += 1
+			for nb in neighbors[v]:
+				if state[nb] == 0:
+					state[nb] = 1
+					heap.push(scores[nb], nb)
+			if next_ms <= count and next_ms <= target:
+				snap_states.append(state.duplicate())
+				snap_heaps.append([heap._prio.duplicate(), heap._idx.duplicate()])
+				snap_counts.append(count)
+				next_ms += ms_step
+		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(adj_to + (flood_to - adj_to)
+					* float(mini(count, target)) / float(target))
+	# 漫灌终点（=target 或堆提前死掉）也补一份快照：评价轮要从“最靠后的
+	# ≤停止面积”的快照续灌，终点快照能把续灌工作量压到最小。
+	snap_states.append(state.duplicate())
+	snap_heaps.append([heap._prio.duplicate(), heap._idx.duplicate()])
+	snap_counts.append(count)
+	t_sel = _stage_mark("④c漫灌单轮", t_sel)
+
+	# 4) 轮次评价：每轮从快照续灌到该轮精确停止面积，再清洗、量偏差、
+	#    回调生长预算（最多 3 轮，与旧实现的轮次语义一致）。下面的清洗
+	#    注释沿用旧实现原文。
 	var grow_target := target
-	for pass_i in 3:
-		state.fill(0)
-		inland_water.fill(0)
-		var heap := _TileHeap.new()
-		state[best] = 2
-		var count := 1
-		for nb in neighbors[best]:
-			if state[nb] == 0:
-				state[nb] = 1
-				heap.push(scores[nb], nb)
-		while count < grow_target and heap.size() > 0:
-			# 帧预算：每帧只并入这么多贴片，进度条随漫灌推进走半段轮进度
-			var batch := 0
-			while count < grow_target and heap.size() > 0 and batch < FLOOD_POPS_PER_FRAME:
-				var v := heap.pop()
-				if state[v] == 2:
+	var final_state: PackedByteArray = snap_states[snap_states.size() - 1] # 兜底：评价轮极端早退时=漫灌终点
+	var final_water := PackedByteArray()
+	final_water.resize(total)
+	for eval_i in 3:
+		# 定位快照：最后一个“已并面积 ≤ 本轮生长预算”的快照
+		var si := -1
+		while si + 1 < snap_counts.size() and snap_counts[si + 1] <= grow_target:
+			si += 1
+		if si < 0:
+			# 理论极端（生长预算回撤到首个快照面积以下）：用保底结果收尾
+			print("选区：生长预算回撤到首个快照面积以下，提前收尾（罕见）")
+			break
+		var st: PackedByteArray = snap_states[si].duplicate()
+		var h2 := _TileHeap.new()
+		# load 必须喂“再复制一份”的数组：续灌的弹堆/入堆会写堆数组，
+		# 直接装快照本体（无复制共享）会把快照写脏，下一轮的续灌起点就被污染。
+		h2.load(snap_heaps[si][0].duplicate(), snap_heaps[si][1].duplicate())
+		var grown: int = snap_counts[si]
+		# 快照续灌到精确停止面积：与从头整灌同序弹出，结果逐位等价；
+		# 续灌会写 st/堆数组，COW 会让它们自动脱离快照本体。
+		while grown < grow_target and h2.size() > 0:
+			# 墙钟切片：以 ~512 pop 为一批，批内零查钟，批尾结一次钟
+			var pop_end := grown + SLICE_CHECK_STRIDE
+			while grown < grow_target and h2.size() > 0 and grown < pop_end:
+				var v := h2.pop()
+				if st[v] == 2:
 					continue
-				state[v] = 2
-				count += 1
+				st[v] = 2
+				grown += 1
 				for nb in neighbors[v]:
-					if state[nb] == 0:
-						state[nb] = 1
-						heap.push(scores[nb], nb)
-				batch += 1
-			_progress(pass_base + pass_span
-					* (float(pass_i) + 0.5 * float(count) / float(grow_target)))
-			await get_tree().process_frame
-		t_sel = _stage_mark("④c漫灌%d轮" % pass_i, t_sel)
+					if st[nb] == 0:
+						st[nb] = 1
+						h2.push(scores[nb], nb)
+			if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+				await _slice_yield(flood_to + wash_span
+						* (float(eval_i) + 0.5 * float(grown) / float(grow_target)))
 
 		# 4) 洞区清洗：漫灌停在 grow_target 时，堆里必然还剩一圈“差一点该
 		#    轮到”的边界贴片。纯噪声序下它们贴着海岸连成一条“下一圈等值线”
@@ -447,31 +505,28 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 		var s0 := 0
 		var pops := 0
 		while s0 < total:
-			if state[s0] == 2 or seen[s0] == 1:
+			if st[s0] == 2 or seen[s0] == 1:
 				s0 += 1
 				continue
 			var comp := PackedInt32Array()
 			var stack: Array = [s0]
 			seen[s0] = 1
 			while stack.size() > 0:
-				# 帧预算：每帧只弹这么多，进度条随 BFS 推进走后半个轮进度
-				var batch := 0
-				while stack.size() > 0 and batch < BFS_POPS_PER_FRAME:
+				# 墙钟切片：以 ~512 pop 为一批，批内零查钟，批尾结一次钟
+				var pop_end := pops + SLICE_CHECK_STRIDE
+				while stack.size() > 0 and pops < pop_end:
 					var w: int = stack.pop_back()
 					comp.append(w)
+					pops += 1
 					for nb in neighbors[w]:
-						if state[nb] != 2 and seen[nb] == 0:
+						if st[nb] != 2 and seen[nb] == 0:
 							seen[nb] = 1
 							stack.append(nb)
-					batch += 1
-				pops += batch
-				if batch >= BFS_POPS_PER_FRAME:
-					_progress(pass_base + pass_span * (float(pass_i) + 0.5
+				if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+					await _slice_yield(flood_to + wash_span * (float(eval_i) + 0.5
 							+ 0.5 * float(pops) / float(total)))
-					await get_tree().process_frame
 			comps.append(comp)
 			s0 += 1
-		t_sel = _stage_mark("④d清洗%d轮" % pass_i, t_sel)
 		# 最大的海面连通块是外侧大洋本体；其余与大陆相邻的是内陆盆地
 		var ocean_size := 0
 		var ocean_at := -1
@@ -481,6 +536,8 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 				ocean_at = ci
 		var lake_sizes := []
 		var absorbed := 0
+		var iw := PackedByteArray()
+		iw.resize(total)
 		for ci in comps.size():
 			if ci == ocean_at:
 				continue
@@ -489,18 +546,21 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 			if comp.size() < MIN_LAKE_TILES:
 				# 碎斑级小洞：直接补成陆地（该地区照常生成地形群系）
 				for w in comp:
-					state[w] = 2
+					st[w] = 2
 			else:
 				# 内陆湖：并入可交互区，但渲染成海洋色
 				lake_sizes.append(comp.size())
 				for w in comp:
-					state[w] = 2
-					inland_water[w] = 1
+					st[w] = 2
+					iw[w] = 1
 		# 本轮结束后的可交互区面积；偏差用于把下轮生长预算往回收
-		var region_size := count + absorbed
+		var region_size := grown + absorbed
 		var dev := region_size - target
 		print("选区第 %d 轮：生长 %d + 吞洞 %d = %d 贴片（目标 %d，偏差 %d）；内陆湖 %s"
-				% [pass_i, count, absorbed, region_size, target, dev, str(lake_sizes)])
+				% [eval_i, grown, absorbed, region_size, target, dev, str(lake_sizes)])
+		final_state = st
+		final_water = iw
+		t_sel = _stage_mark("④d清洗%d轮" % eval_i, t_sel)
 		if dev == 0:
 			break
 		grow_target -= dev
@@ -508,7 +568,8 @@ func _select_generated_region(verts: Array[Vector3], tris: Array[Vector3i],
 			break
 
 	for i in total:
-		region[i] = 1 if state[i] == 2 else 0
+		region[i] = 1 if final_state[i] == 2 else 0
+	inland_water = final_water
 	return {"region": region, "inland_water": inland_water}
 
 
@@ -520,6 +581,12 @@ class _TileHeap:
 
 	func size() -> int:
 		return _prio.size()
+
+	# 从快照灌装（数组进堆）：COW 语义保证 push/pop 时才写拷贝，
+	# 不会碰坏快照本体。
+	func load(p: PackedFloat64Array, i: PackedInt32Array) -> void:
+		_prio = p
+		_idx = i
 
 	func push(p: float, i: int) -> void:
 		_prio.append(p)
@@ -579,6 +646,7 @@ class _TileHeap:
 # 其余贴片渲染为纯海洋底色且无地形数据，星球视觉连续不破相。
 func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 	_progress(2.0)
+	_slice_begin() # 管线起点即首帧切片起点（入口前刚让过一帧）
 	var t_stage := Time.get_ticks_msec()  # 阶段耗时打点起点
 
 	# ===== ① 二十面体 12 顶点 + 30 条棱的插值点（几百次向量运算，量小）=====
@@ -663,9 +731,10 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 				tris.append(Vector3i(grid[i][j], grid[i + 1][j], grid[i][j + 1]))
 				if j < SUBDIV - 1 - i:
 					tris.append(Vector3i(grid[i + 1][j], grid[i + 1][j + 1], grid[i][j + 1]))
+			# 墙钟切片以面粒度让帧（基本面只有 ~20/8 个，逐面查钟不贵）
+			if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+				await _slice_yield(6.0 + 20.0 * float(fi + 1) / base_faces.size())
 		_progress(6.0 + 20.0 * float(fi + 1) / base_faces.size())
-		if fi % 3 == 2 or fi == base_faces.size() - 1:
-			await get_tree().process_frame # 每 3 个基本面让一帧，进度条 6→26%
 
 	t_stage = _stage_mark("②基本面细分", t_stage)
 
@@ -680,15 +749,16 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 		vert_faces[i] = PackedInt32Array()
 	var tri_at := 0
 	while tri_at < tris.size():
-		var endi := mini(tri_at + ADJ_TRIS_PER_FRAME, tris.size())
+		var endi := mini(tri_at + SLICE_CHECK_STRIDE, tris.size())
 		for ti in range(tri_at, endi):
 			var tri := tris[ti]
 			vert_faces[tri.x].append(ti)
 			vert_faces[tri.y].append(ti)
 			vert_faces[tri.z].append(ti)
 		tri_at = endi
-		_progress(26.0 + 4.0 * float(tri_at) / tris.size())
-		await get_tree().process_frame
+		# 墙钟切片：每 ~512 项结一次钟，用满本帧就让出
+		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(26.0 + 4.0 * float(tri_at) / tris.size())
 
 	# 保留拓扑方向表：生成完仍要回答“这个球面点能不能交互”
 	_topo_verts = verts
@@ -719,13 +789,15 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 	var region_n := 0
 	var cc_at := 0
 	while cc_at < total:
-		var cc_end := mini(cc_at + CENTROID_SLICE_TILES, total)
+		var cc_end := mini(cc_at + SLICE_CHECK_STRIDE, total)
 		for i in range(cc_at, cc_end):
 			if explored[i] == 1:
 				_region_center += verts[i]
 				region_n += 1
 		cc_at = cc_end
-		await get_tree().process_frame
+		# 质心阶段进度条无变化，用记忆的当前值喂回保持刷新节奏
+		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(_gen_pct)
 	if region_n > 0:
 		_region_center = (_region_center / region_n).normalized()
 	else:
@@ -825,10 +897,10 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 			idx_cursor += 3
 		vert_cursor += n
 
-		# 让出线程：攒够一批就刷新进度条并等下一帧，UI 才能持续响应
-		if v % TILES_PER_FRAME == TILES_PER_FRAME - 1:
-			_progress(44.0 + 53.0 * float(v + 1) / total)
-			await get_tree().process_frame
+		# 让出线程：每 ~512 贴片结一次墙钟，本帧吃满才让（批内零查钟）
+		if v % SLICE_CHECK_STRIDE == SLICE_CHECK_STRIDE - 1 or v == total - 1:
+			if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+				await _slice_yield(44.0 + 53.0 * float(v + 1) / total)
 
 	# —— 地形分布统计（顺手把五级各有多少贴片打到日志里，调参数时好对照）——
 	var counts := {}
@@ -857,8 +929,11 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 	return mesh
 
 
+var _gen_pct := 0.0 # 最近一次喂给进度条的百分比（无进度阶段让帧时原样喂回）
+
 func _progress(percent: float) -> void:
 	_prog_calls += 1  # 性能打点：每次进度刷新≈一次分帧 await，用于统计各阶段帧数
+	_gen_pct = percent
 	if _menu != null:
 		_menu.set_progress(percent)
 
@@ -870,6 +945,48 @@ func _stage_mark(stage: String, t_prev: int) -> int:
 	print("[gen] %s：%d ms / %d 帧" % [stage, now - t_prev, _prog_calls])
 	_prog_calls = 0
 	return now
+
+
+# —— 墙钟切片三件套：让“每帧干多少活”贴合真实帧率而不是凑整帧空转 ——
+# 用法（所有生成热循环同款，“批处理式”：批内零查钟，批尾结一次钟）：
+#   while 条件:
+#       var 批尾 := 当前数 + SLICE_CHECK_STRIDE
+#       while 条件 and 当前数 < 批尾:
+#           ...一个小步的工作...
+#       if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+#           await _slice_yield(当前进度)
+var _gen_frame_ms := 16.0    # 实测帧间隔（指数平滑，初值按 60Hz 估）
+var _gen_slice_t0 := 0       # 本帧切片起点
+var _gen_slice_prev_t0 := 0  # 上一帧切片起点（用来量真实帧间隔）
+
+
+# 让帧归来时调用：以两帧切片起点的间隔平滑出帧率节奏
+func _slice_begin() -> void:
+	var now := Time.get_ticks_msec()
+	if _gen_slice_prev_t0 > 0:
+		var dt := float(now - _gen_slice_prev_t0)
+		if dt >= 1.0 and dt < 500.0: # 过滤进度条被窗口阻塞之类的时间毛刺
+			_gen_frame_ms = lerpf(_gen_frame_ms, dt, 0.3)
+	_gen_slice_prev_t0 = now
+	_gen_slice_t0 = now
+	_gen_budget = clampi(roundi(_gen_frame_ms * GEN_SLICE_RATIO), GEN_SLICE_MIN_MS, GEN_SLICE_MAX_MS)
+
+
+# 墙钟切片的检查写法有讲究：Time.get_ticks_msec() 绑定调用 ~1-2μs、
+# GDScript 调 GDScript 的函数 ~0.5μs——百万次的热循环里两者都是语言税。
+# 因此采用“批处理式”结构：内层 for 连续处理 ~SLICE_CHECK_STRIDE 项
+# （零检查），批尾才结一次钟（批 = 512 项，最长超支 ~0.3-3ms 可接受）。
+const SLICE_CHECK_STRIDE := 512
+var _gen_budget := 11           # 当前帧的计算墙钟预算 ms（_slice_begin 按帧率刷新）
+
+
+# 让出一帧并刷新进度（协程：切片位点用 await 调用）。
+# 归来（下一帧起点）即重置切片起点——所有位点统一在“归来帧”重新计费，
+# 阶段边界处的首帧不会被上一阶段的旧计时冤枉成超时。
+func _slice_yield(p: float) -> void:
+	_progress(p)
+	await get_tree().process_frame
+	_slice_begin()
 
 
 # —— 贴片查询：交互与地形 ——
