@@ -741,6 +741,10 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 	# ===== ③ 顶点 → 相邻三角形索引表（vert_faces，分片扫描）=====
 	# 对偶贴片的“边”由它定：贴片 v 的对偶多边形顶点 = 它周围一圈三角形的重心
 	var total := verts.size()
+	# 同循环顺带预计算三角形球面重心存表：它是同一个顶点周围贴片共享的
+	# 对偶顶点候选，原本 ⑤ 逐贴片要重算 3 遍，这里只算一遍（合并不白费）。
+	var tri_cents := PackedVector3Array()
+	tri_cents.resize(tris.size())
 	# 预分配 Array[PackedInt32Array]：整数键 Dictionary 每三角要 3 次哈希+装箱，
 	# 预分配数组按索引直达，热循环零哈希。
 	var vert_faces: Array = []
@@ -755,6 +759,7 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 			vert_faces[tri.x].append(ti)
 			vert_faces[tri.y].append(ti)
 			vert_faces[tri.z].append(ti)
+			tri_cents[ti] = (verts[tri.x] + verts[tri.y] + verts[tri.z]).normalized()
 		tri_at = endi
 		# 墙钟切片：每 ~512 项结一次钟，用满本帧就让出
 		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
@@ -821,46 +826,56 @@ func _build_goldberg_mesh_async(coverage: float) -> ArrayMesh:
 	mesh_indices.resize(3 * (total_corners - 2 * total))
 	var vert_cursor := 0 # 已写满的角点数（同时是下一块贴片的顶点基址）
 	var idx_cursor := 0  # 已写满的索引数
+	# 每贴片复用的环排序暂存（角点数 ≤6）：省掉每贴片 1 次 Array 分配 +
+	# 6 次 append + 1 次 PackedFloat resize 的固定开销
+	var ring_buf: Array[Vector3] = []
+	ring_buf.resize(6)
+	var ang_buf := PackedFloat32Array()
+	ang_buf.resize(6)
 	for v in total:
 		var axis := verts[v] # 已是单位向量
-		# 收集该点周围一圈三角形的重心（对偶多边形的顶点）
-		var cents: Array[Vector3] = []
-		for ti in vert_faces[v]:
-			var tri := tris[ti]
-			cents.append((verts[tri.x] + verts[tri.y] + verts[tri.z]).normalized())
+		# 收集该点周围一圈三角形的重心（对偶多边形的顶点，③ 阶段已算好存表）；
+		# 顺带累加出贴片中心方向（center = 重心均值方向），免再开一条循环
+		var vert_rings: PackedInt32Array = vert_faces[v] # 本地别名：少一次成员链寻取
+		var n := vert_rings.size()
+		var cent_sum := Vector3.ZERO
+		var kc := 0
+		for ti in vert_rings:
+			var c := tri_cents[ti]
+			ring_buf[kc] = c
+			cent_sum += c
+			kc += 1
 		# 把相邻面重心按“绕 axis 的方位角”排序，才能连成不自交的多边形。
 		# 5/6 个元素的小数组：先算好角度再手写插入排序——比 sort_custom 的
 		# GDScript lambda 回调（每贴片 ~11 次脚本调用）快一个数量级。
-		var e1: Vector3 = (cents[0] - axis * cents[0].dot(axis)).normalized()
+		var e1: Vector3 = (ring_buf[0] - axis * ring_buf[0].dot(axis)).normalized()
 		var e2 := axis.cross(e1)
-		var n := cents.size()
-		var angs := PackedFloat32Array()
-		angs.resize(n)
-		for k in n:
-			angs[k] = _tangent_angle(cents[k], axis, e1, e2)
-		for k in range(1, n):
-			var ca := angs[k]
-			var cp := cents[k]
-			var j := k - 1
-			while j >= 0 and angs[j] > ca:
-				angs[j + 1] = angs[j]
-				cents[j + 1] = cents[j]
+		for kk in n:
+			ang_buf[kk] = _tangent_angle(ring_buf[kk], axis, e1, e2)
+		for kk in range(1, n):
+			var ca := ang_buf[kk]
+			var cp: Vector3 = ring_buf[kk]
+			var j := kk - 1
+			while j >= 0 and ang_buf[j] > ca:
+				ang_buf[j + 1] = ang_buf[j]
+				ring_buf[j + 1] = ring_buf[j]
 				j -= 1
-			angs[j + 1] = ca
-			cents[j + 1] = cp
-		var poly := PackedVector3Array(cents)
-
-		# 缓存贴片边界顶点（单位球面，顺序与 cents 的方位角排序一致）：
-		# 点击选中时用它们生成高亮环；索引与 _topo_verts/_terrain 一致
+			ang_buf[j + 1] = ca
+			ring_buf[j + 1] = cp
+		# 缓存贴片边界顶点（单位球面，顺序与方位角排序一致）：点击选中时
+		# 用它们生成高亮环；索引与 _topo_verts/_terrain 一致。每贴片要私有
+		# 数组，不能用复用缓冲，按 n 精确拷出
+		var poly := PackedVector3Array()
+		poly.resize(n)
+		for kk in n:
+			poly[kk] = ring_buf[kk]
 		_tile_polys.append(poly)
 
 		# 贴片颜色：未生成 → 纯海洋底色，不做任何噪声采样（这些贴片没有地形）；
 		# 内陆湖 → 海洋色 + 平原地形（“水下也是陆地”）；
 		# 其余已生成 → 群系纯色 + 地形明暗
-		var center := Vector3.ZERO
-		for p in poly:
-			center += p
-		center = (center / poly.size()).normalized() # 贴片中心方向：噪声与纬度的采样点
+		# 中心方向的重心均值已在上面 cents 循环里累出（同一批球的面向量）
+		var center := (cent_sum / n).normalized() # 贴片中心方向：噪声与纬度的采样点
 		var level := TerrainLevel.NOT_GENERATED
 		var col := C_UNGENERATED
 		if explored[v] == 1:
@@ -1169,5 +1184,7 @@ func _rebuild_selection_ring() -> void:
 
 # 向量 p 在切平面（以 axis 为法线、e1 为 0° 参考方向）上的方位角
 func _tangent_angle(p: Vector3, axis: Vector3, e1: Vector3, e2: Vector3) -> float:
-	var pp := (p - axis * p.dot(axis)).normalized()
+	# 对切平面投影做 atan2 即可；atan2 对正比例缩放不变，无需 normalize
+	# 转单位长度（省一次归一化，每贴片 ×6 的固定开销）。
+	var pp := p - axis * p.dot(axis)
 	return atan2(pp.dot(e2), pp.dot(e1))
