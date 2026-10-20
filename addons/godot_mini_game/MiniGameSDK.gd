@@ -172,11 +172,10 @@ var is_mini_game: bool:
 func _ready() -> void:
 	if not OS.has_feature("web"):
 		return
-	var candidate := JavaScriptBridge.get_interface(BRIDGE_GLOBAL_NAME)
+	var candidate := _probe_bridge_interface()
 	if candidate == null:
-		_fail_bridge_initialization(
-			"Mini-game Bridge ABI %d (%s) is not available" % [
-				BRIDGE_ABI_VERSION, BRIDGE_GLOBAL_NAME])
+		# 普通 Web 导出没有小游戏运行时。这里必须静默降级：直接调用
+		# get_interface(BRIDGE_GLOBAL_NAME) 会在接口缺失时由引擎打印 ERROR。
 		return
 	var validation_raw: Variant = candidate.validateBridge(
 		BRIDGE_ABI_VERSION, JSON.stringify(REQUIRED_BRIDGE_METHODS))
@@ -191,6 +190,23 @@ func _ready() -> void:
 	bridge_info = info.duplicate(true)
 	bridge_initialization_error = ""
 	_setup_lifecycle()
+
+
+## 探测小游戏桥接口；普通 Web 导出返回 null。
+##
+## 不能直接调用 get_interface(BRIDGE_GLOBAL_NAME)：接口不存在时 Godot 会通过
+## ERR_FAIL_COND_V_MSG 打印 "No interface ... registered"。普通 Web 页面没有
+## platform_runtime.js 注入桥，因此每次启动都会刷这条 ERROR。
+## window 在浏览器和小游戏宿主里都存在，取 window 本身不会失败；再从 window
+## 上读取桥对象，就能把“不是小游戏环境”和“桥存在但版本不匹配”区分开。
+static func _probe_bridge_interface() -> JavaScriptObject:
+	var window := JavaScriptBridge.get_interface("window")
+	if window == null:
+		return null
+	var candidate: Variant = window.get(BRIDGE_GLOBAL_NAME)
+	if candidate is JavaScriptObject:
+		return candidate
+	return null
 
 
 static func _bridge_validation_error(
