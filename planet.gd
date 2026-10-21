@@ -157,6 +157,7 @@ var _selection_ring: MeshInstance3D       # 选中环：独立实例，切换选
 var _selection_material: ShaderMaterial   # 选中环材质（白光向内衰减，无呼吸）
 var _hud: TileHud                         # 贴片信息 HUD：选中贴片时亮出，取消选中即隐藏
 var _star_dome: StarDome                  # 背景星空：代码构建（种子驱动，见 star_dome.gd）
+var _music: AudioStreamPlayer             # 背景音乐（These_Lands.ogg）：星球生成完毕后才开始播
 
 
 func _ready() -> void:
@@ -175,6 +176,12 @@ func _ready() -> void:
 	_star_dome = StarDomeScript.new()
 	add_child(_star_dome)
 	_star_dome.build(0)
+
+	# 背景音乐（These_Lands.ogg）：不自动播，等星球生成完毕后再由代码开播。
+	# 曲子是长循环的 BGM，导入参数已开 loop；这里再兜一次底（换资源时不失效）。
+	_music = get_node_or_null("StartMusic") as AudioStreamPlayer
+	if _music != null and _music.stream is AudioStreamOggVorbis:
+		(_music.stream as AudioStreamOggVorbis).loop = true
 
 	# 启动只做一件事：摆出菜单。星球生成推迟到玩家点击“生成世界”之后，
 	# 之前的“界面一片空白、程序在后台闷头算”被消除了。
@@ -223,12 +230,26 @@ func _on_generate_requested(params: Dictionary) -> void:
 			"，覆盖率 ", roundi(params["coverage"] * 100), "%，总耗时 ",
 			Time.get_ticks_msec() - t0, " ms")
 
+	# 背景音乐：星球生成完毕、玩家看得见星球的那一刻才开播（菜单阶段保持安静）。
+	# 二次生成时若音乐已在放，不打断它（避免每次换种子都重来一遍前奏）。
+	_start_music()
+
 	# 菜单使命完成：先隐藏（避免和相机拖拽抢鼠标）再销毁。
 	# 二次生成（代码直调 _on_generate_requested）时菜单可能已被撤掉，判空兜底。
 	if _menu != null:
 		_menu.hide_menu()
 		_menu.queue_free()
 		_menu = null
+
+
+# 开播背景音乐（These_Lands.ogg）。
+# 规则：等星球生成完毕才播——菜单与生成过程保持安静，星球一露面就有 BGM 衬底。
+# 已在播就不重复触发（二次生成换种子时曲子不中断）。
+func _start_music() -> void:
+	if _music == null:
+		return
+	if not _music.playing:
+		_music.play()
 
 
 # 生成时刻视口相机的世界朝向（相机沿本地 -Z 看）。
