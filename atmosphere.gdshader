@@ -20,12 +20,14 @@ shader_type spatial;
 // blend_add：加法混合，光晕只提亮、不遮暗（与原版 Blend SrcAlpha One 一致）。
 render_mode unshaded, cull_front, depth_draw_never, blend_add;
 
-// 偏蓝白的辉光色（取自原版 PlanetGlow 的颜色）
-uniform vec3 glow_color = vec3(0.706, 0.839, 1.0);
-// 带的半宽（星球半径的比例）：0.08 = 原版 8/100
-uniform float band_width = 0.08;
+// 偏蓝的辉光色：原版截图里的星球光晕读起来是明确的“钢蓝”，
+// 不是白色 —— 蓝味足了才压得住背景星空的相对亮度，星空才显得更深邃。
+// （取自原版 PlanetGlow 的 (0.706, 0.839, 1.0)，但往蓝里再压一档。）
+uniform vec3 glow_color = vec3(0.42, 0.60, 1.0);
+// 带的半宽（星球半径的比例）：0.095 ≈ 原版 8/100，略放宽让边缘更柔
+uniform float band_width = 0.095;
 // 整体强度：原版靠日照侧提亮，本项目无太阳概念，取一个固定的自发光强度
-uniform float intensity = 0.45;
+uniform float intensity = 0.42;
 
 void fragment() {
 	// 星球中心（世界原点）在视空间的位置：视空间里相机恒在原点，

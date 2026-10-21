@@ -66,8 +66,8 @@ func _initialize() -> void:
 		print("FAIL: MultiMesh.use_colors 未开启 —— instance color 不会生效")
 		quit(1)
 		return
-	if dim_ratio < 0.85 or dim_ratio > 0.95:
-		print("FAIL: 暗星占比异常 =", dim_ratio, "（期望 ~0.90）")
+	if dim_ratio < 0.85 or dim_ratio > 0.97:
+		print("FAIL: 暗星占比异常 =", dim_ratio, "（期望 ~0.92）")
 		quit(1)
 		return
 	if bright == 0:
@@ -75,6 +75,22 @@ func _initialize() -> void:
 		quit(1)
 		return
 	print("PASS: 亮度随机性（暗星 ", dim, " / 亮星 ", bright, "，use_colors 已开）")
+
+	# 3.6) 星点密度护栏：一个 quad = 一颗星（贴图里只放 1 颗），
+	# 所以「贴图里的星数」必须恒为 1 —— 改回 3 颗会让同一 quad 的 3 颗星
+	# 共享同一个 instance color，缩小后糊成「三个等亮小点」连成一串，
+	# 与原版「每颗星亮度独立」的观感不符。
+	if StarDome.GLYPHS.size() != 1:
+		print("FAIL: 贴图里放了 ", StarDome.GLYPHS.size(),
+			" 颗星 —— 必须是 1 颗（每 quad 只能带一个 instance color）")
+		quit(1)
+		return
+	if StarDome.STAR_COUNT < 3000:
+		print("FAIL: STAR_COUNT = ", StarDome.STAR_COUNT,
+			" 过少 —— 屏幕上会变成稀疏星场（原版观感是密而不挤）")
+		quit(1)
+		return
+	print("PASS: 星点密度（1 星/quad，", StarDome.STAR_COUNT, " 个 quad）")
 
 	# 4) 方向分布：球面均匀 → 三轴均值≈0、方差相等。以原图位置还原单位方向后统计。
 	var sx := 0.0

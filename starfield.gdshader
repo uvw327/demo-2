@@ -7,7 +7,7 @@ shader_type spatial;
 // blend_mix：普通 alpha 混合（星星半透明地叠在深空背景上）。
 render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;
 
-// 64×64「三颗四芒星」glyph：RGB 纯白，只有 alpha 变化；每个 quad 显示完整 UV。
+// 64×64「四芒星」glyph：RGB 纯白，只有 alpha 变化；每个 quad 显示完整 UV。
 // filter_linear_mipmap：缩小时按屏幕占比取 mip 层，避免星点边缘闪烁。
 uniform sampler2D star_tex : source_color, filter_linear_mipmap;
 

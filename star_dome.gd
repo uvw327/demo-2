@@ -4,16 +4,22 @@ extends MultiMeshInstance3D
 #
 # 做法：半径 DOME_RADIUS 的天球上按“三高斯归一化”撒 STAR_COUNT 个均匀方向，
 # 每个方向放一个朝向球心的 quad（单 MultiMesh，1 个 draw call），
-# quad 显示同一张 64×64「三颗四芒星」glyph 的完整 UV → 实际星点 ≈ 3×quad 数。
+# quad 显示同一张 64×64「四芒星」glyph 的完整 UV。
 # 随机尺寸 + 随机绕法线旋转，让同一张贴图看起来像千星群而非复制粘贴。
 #
+# **1 quad = 1 颗星**（与原版「1 张贴图 3 颗星」不同）：
+# instance color 的粒度是「每 quad 一个」，同一 quad 里的多颗星必然同亮度，
+# 缩小后会糊成「三个等亮小点」连成一串。原版观感是「每颗星亮度独立」，
+# 所以这里一张贴图只放一颗星，quad 数相应提高以补回星点密度。
+#
 # 星感三要素（对照 RimWorld 的调校要点）：
-# · glyph 是“软”的：菱形核用 pow 平滑衰减（中心亮、边缘快速变暗），十字臂细到
-#   几乎看不见；alpha 生成后再过一遍 3×3 盒式模糊 —— 边缘没有硬锯齿，
+# · glyph 是“软”的：菱形核用 pow 平滑衰减（中心亮、边缘快速变暗），十字臂细而暗；
+#   alpha 生成后再过一遍 3×3 盒式模糊 —— 边缘没有硬锯齿，
 #   远看是噪点而不是硬编码的几何体。
 # · 每颗星有独立亮度与色温：MultiMesh instance color（use_colors）承载，
 #   shader 里与贴图 alpha 相乘 —— 九成暗星、一成亮星、偶尔冷蓝/暖黄。
 #   亮度靠颜色而不是物理尺寸，所以星点可以画得很小而不刺眼。
+#   十字臂的 alpha 也随 instance color 一起压暗 → 只有最亮的几颗才透出 ✦ 的四芒。
 # · 星球边缘的大气辉光（atmosphere.gdshader）压住背景相对亮度，
 #   星空因此显得更深邃（对应原版 WorldLayer_Glow 的观感补偿）。
 #
@@ -27,22 +33,32 @@ extends MultiMeshInstance3D
 # —— 参数表（全部集中在此调参，见规划文档 §4.2）——
 const STAR_SHADER := preload("res://starfield.gdshader")
 const DOME_RADIUS := 400.0  # 天球半径：最远视距 10 的 40 倍，远沉入 far(4000) 之内
-const STAR_COUNT := 1500    # quad 数（= 原版 StarsCount；实际星点 ≈ 3×1500）
-# quad 边长 / 天球半径 → 角尺寸 ≈ 该比值（弧度）：0.015→0.86°，0.08→4.6°。
-# 比上一版（0.04~0.22）小一个数量级：星点从“大十字”缩成“细碎噪点”，
+# quad 数 = 星点数（**每张贴图只放 1 颗星**，见下方 GLYPHS 的说明）。
+# 原版是「1 张贴图 3 颗星 × 1500 quad」；我们改成「1 张贴图 1 颗星」，
+# 因为一个 quad 的 3 颗星共享**同一个 instance color**（同亮度），
+# 缩小后会糊成 3 个等亮的小点连成一串 —— 屏幕上读起来是「三胞胎」，
+# 与原版「每颗星亮度独立」的观感不符。改成一颗一 quad 后，
+# 每颗星各有各的 instance color，才对得上原版截图。
+# quad 数相应提高以补回星点密度（仍是 1 个 draw call、静态缓冲）。
+const STAR_COUNT := 8000
+# quad 边长 / 天球半径 → 角尺寸 ≈ 该比值（弧度）：0.010→0.57°，0.05→2.9°。
+# 对标原版截图：那里的星是「细碎小点」，最亮的也就几像素；
+# 我们之前 0.08 的上限在 2000px 宽的画面上会糊成 20px 的团。
 # 刺眼感主要靠 instance color 的亮度分布压住，而不是靠物理尺寸。
-const STAR_SIZE_MIN := 0.015
-const STAR_SIZE_MAX := 0.08
+const STAR_SIZE_MIN := 0.010
+const STAR_SIZE_MAX := 0.05
 # 亮星可以略大、暗星一律偏小：亮度与尺寸弱相关，视觉上更自然
-const DIM_SIZE_MAX := 0.045
-const BRIGHT_SIZE_MIN := 0.03
+const DIM_SIZE_MAX := 0.028
+const BRIGHT_SIZE_MIN := 0.020
 
 # —— 亮度/色温分布（写进 MultiMesh instance color）——
 # 90% 暗星（灰 0.2~0.6）、10% 亮星（灰 0.8~1.0）；
 # 亮星里再取一小部分染成极淡的冷蓝/暖黄（“偶尔混入”，不做主导）。
-const DIM_RATIO := 0.90
-const DIM_GRAY_MIN := 0.2
-const DIM_GRAY_MAX := 0.6
+# 注：原版截图里绝大多数星是“暗到几乎看不见的灰点”，只有零星几颗明显更亮，
+# 所以暗星区间的上限压到 0.55、亮星比例压到 8% —— 亮星更少、更集中。
+const DIM_RATIO := 0.92
+const DIM_GRAY_MIN := 0.18
+const DIM_GRAY_MAX := 0.55
 const BRIGHT_GRAY_MIN := 0.8
 # 亮星中染成异色的比例
 const TINTED_RATIO := 0.15
@@ -62,15 +78,19 @@ const TEX_SIZE := 64
 const GLYPH_CORE_R := 0.45
 # 核心衰减指数：越大越锐（中心亮核收紧、边缘掉得快）
 const GLYPH_FALLOFF := 3.0
-# 十字臂：极细极暗 —— 远看几乎不可见，拉近才隐约是 ✦ 的四芒
-const GLYPH_ARM_W := 0.09   # 臂宽 / 半箭长
-const GLYPH_ARM_LEN := 1.6  # 臂长 / 半箭长
-const GLYPH_ARM_BRIGHT := 0.10  # 臂亮度系数（远看几乎不发光）
-# 三颗星：中心(px)、半箭长 s（菱形核尖端到中心的像素距离；臂再向外探 1.6s）
+# 十字臂：细而暗 —— 暗星的臂几乎看不见（ALBEDO = instance color 整体压暗），
+# 只有最亮的那几颗才透出 ✦ 的四芒，正是原版截图里的观感：
+# 满屏细碎暗点 + 零星几颗带十字光芒的亮星。
+const GLYPH_ARM_W := 0.10   # 臂宽 / 半箭长
+const GLYPH_ARM_LEN := 1.7  # 臂长 / 半箭长
+const GLYPH_ARM_BRIGHT := 0.26  # 臂亮度系数（相对核心；靠 instance color 区分明暗）
+# 贴图内容：只有**一颗**星（居中）。
+# 原版是一张 64×64 里放 3 颗四芒星；但一个 quad 只能带一个 instance color，
+# 三颗星会共享同一亮度 → 缩小后糊成「三个等亮小点」连成一串，
+# 与原版「每颗星亮度独立」的观感不符。改成一颗一 quad（数量相应提高）。
+# 参数：中心(px)、半箭长 s（菱形核尖端到中心的像素距离；臂再向外探 1.7s）
 const GLYPHS := [
-	[Vector2(32, 32), 11.0],  # 中央大星
-	[Vector2(49, 15), 5.0],   # 右上小星
-	[Vector2(15, 49), 4.5],   # 左下小星
+	[Vector2(32, 32), 11.0],  # 唯一的一颗星
 ]
 
 var star_seed := -1  # 当前星空种子；-1 = 尚未构建

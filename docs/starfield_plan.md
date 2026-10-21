@@ -76,10 +76,10 @@ A 作为回退方案记录在案，但先不引入 Environment 这条新依赖�
 | 文件 | 职责 |
 | --- | --- |
 | `starfield.gdshader`（新） | `shader_type spatial; render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;`；`ALBEDO = COLOR.rgb`（**顶点色 × instance color = 每颗星的亮度/色温**），`ALPHA = tex.a * COLOR.a`（只承载形状，不掺亮度）；保持**深度测试开启**（靠远距自然被星球遮挡，这是与原版 `ZTest Off` 的有意差异——我们没有双相机，开深度反而更稳），深度写入关闭 |
-| `star_dome.gd`（新，`class_name StarDome extends MultiMeshInstance3D`） | ① `_make_star_tex()`：运行期程序化烘焙 64×64「菱形核（pow 平滑衰减）+ 极细暗十字臂」三颗 glyph（纯白 RGB、只动 alpha），再过一遍 3×3 盒式模糊 + 峰值归一化；② `build(seed)`：SeededRNG → 高斯均匀球面方向 × 1500 → 每 quad 一个 instance（切平面 basis + 随机绕法线旋转 + 随机尺寸 + 随机 instance color），transform 先算进 GDScript 数组 `_built`、颜色进 `_built_colors`（冒烟可测）再提交 MultiMesh（dummy 渲染器读不回）；③ `_process`：仅做 `global_position = cam.global_position`；④ 种子变了才重建 |
+| `star_dome.gd`（新，`class_name StarDome extends MultiMeshInstance3D`） | ① `_make_star_tex()`：运行期程序化烘焙 64×64「菱形核（pow 平滑衰减）+ 极细暗十字臂」**1 颗** glyph（纯白 RGB、只动 alpha），再过一遍 3×3 盒式模糊 + 峰值归一化；② `build(seed)`：SeededRNG → 高斯均匀球面方向 × 8000 → 每 quad 一个 instance（切平面 basis + 随机绕法线旋转 + 随机尺寸 + 随机 instance color），transform 先算进 GDScript 数组 `_built`、颜色进 `_built_colors`（冒烟可测）再提交 MultiMesh（dummy 渲染器读不回）；③ `_process`：仅做 `global_position = cam.global_position`；④ 种子变了才重建 |
 | `atmosphere.gdshader`（新，第 2 轮新增） | 星球大气辉光：包住星球的球壳（1.081× 半径），按「视线到球心的最近距离 d」算一条 `a = max(0, 1 - |(d-1)/0.08|)` 的带，`ALPHA = a³·intensity`，加法混合（对照原版 `Custom_PlanetGlow`） |
 | `planet.gd`（改，~10 行） | `_ready`：`add_child(_star_dome); _star_dome.build(0)`（菜单相位即有星空）；`_on_generate_requested` 换种子时 `build(seed)`；星球上线时 `_build_atmosphere()` 挂辉光球壳 |
-| `tools/test_starfield.gd`（新，冒烟护栏） | 数量/确定性（同 seed 逐位一致、换 seed 变化）/方向分布均匀/材质就绪/**亮度随机性（暗星占比 ~0.90、use_colors 已开）**/相机跟随，共 7 项 |
+| `tools/test_starfield.gd`（新，冒烟护栏） | 数量/确定性（同 seed 逐位一致、换 seed 变化）/方向分布均匀/材质就绪/**亮度随机性（暗星占比 ~0.92、use_colors 已开）**/**星点密度（1 星/quad、quad 数下限）**/相机跟随，共 8 项 |
 
 装配后场景树（全部运行期代码构建，与现有风格一致）：
 
@@ -98,23 +98,35 @@ Planet (Node3D)
 | 常量 | 终值 | 备注 |
 | --- | --- | --- |
 | `DOME_RADIUS` | 400 | 最远视距 10 的 40 倍，沉入 far(4000) 内 |
-| `STAR_COUNT` | 1500 | = 原版 StarsCount |
-| `STAR_SIZE_MIN / MAX` | **0.015 / 0.08** | 角尺寸 ≈ 0.86°~4.6°。**第 2 轮从 0.04/0.22 再砍一个数量级**——首版星点还是太大太扎眼；现在星星只占画面很小的面积，亮度交给 instance color 控制 |
-| `DIM_SIZE_MAX` / `BRIGHT_SIZE_MIN` | 0.045 / 0.03 | 暗星一律偏小、亮星允许更大：亮度与尺寸弱相关 → 少数「主角星」+ 满屏细碎噪点 |
-| `DIM_RATIO` | **0.90** | 90% 暗星（灰 0.2~0.6）、10% 亮星（灰 0.8~1.0）；亮星里 15% 染成极淡冷蓝/暖黄 |
-| `GLYPHS` | 半箭长 11 / 5 / 4.5 px | 三颗星（中央大 + 右上/左下小） |
-| `GLYPH_CORE_R` / `GLYPH_FALLOFF` | **0.45 / 3.0** | 菱形核 = 曼哈顿距离场经 `pow(1 - d/0.45, 3)` 平滑衰减：**中心亮、边缘快速变暗**（不再是实心硬边） |
-| `GLYPH_ARM_LEN / ARM_W` / `GLYPH_ARM_BRIGHT` | 1.6 / 0.09 / **0.10** | 十字臂：极细极暗，远看几乎不可见，拉近才隐约是 ✦ 的四芒 |
+| `STAR_COUNT` | **8000** | 1 星/quad（见下方「1 quad = 1 星」说明）→ 8000 个星点。实测屏幕密度 ~480 个/百万像素，与原版截图一致 |
+| `STAR_SIZE_MIN / MAX` | **0.010 / 0.05** | 角尺寸 ≈ 0.57°~2.9°。**第 3 轮再缩**：对标原版截图，那里的星是「细碎小点」，最亮的也就几像素；0.08 的上限在 2000px 宽的画面上会糊成 20px 的团 |
+| `DIM_SIZE_MAX` / `BRIGHT_SIZE_MIN` | 0.028 / 0.020 | 暗星一律偏小、亮星允许更大：亮度与尺寸弱相关 → 少数「主角星」+ 满屏细碎噪点 |
+| `DIM_RATIO` | **0.92** | 92% 暗星（灰 0.18~0.55）、8% 亮星（灰 0.8~1.0）；亮星里 15% 染成极淡冷蓝/暖黄 |
+| `GLYPHS` | **1 颗**，半箭长 11 px | **第 3 轮改为 1 张贴图只放 1 颗星**（原版是 1 张放 3 颗）——见下方「1 quad = 1 星」 |
+| `GLYPH_CORE_R` / `GLYPH_FALLOFF` | 0.45 / 3.0 | 菱形核 = 曼哈顿距离场经 `pow(1 - d/0.45, 3)` 平滑衰减：**中心亮、边缘快速变暗**（不再是实心硬边） |
+| `GLYPH_ARM_LEN / ARM_W` / `GLYPH_ARM_BRIGHT` | 1.7 / 0.10 / **0.26** | 十字臂：细而暗。臂的 alpha 会随 instance color 一起被压暗 → **暗星的臂几乎看不见，只有最亮的几颗才透出 ✦ 的四芒**（正是原版观感） |
 | `TEX_SIZE` + 3×3 盒式模糊 + 峰值归一化 | 64 | 模糊抹掉硬锯齿；归一化把被模糊削掉的中心亮度补回来（否则整片星空偏暗） |
 | `BACKGROUND` | `#10171E` | RadWorld 天空相机清色；写入 project.godot 的 default_clear_color |
 | `ATMOSPHERE_RADIUS`（`planet.gd`） | 1.081 | 大气辉光球壳半径 / 星球半径（= 原版 108.1/100） |
-| 辉光 `band_width` / `intensity` | 0.08 / 0.45 | = 原版 `_GlowRadius` 8/100；`a³` 三次方让带边缘迅速熄灭 |
+| 辉光 `band_width` / `intensity` / `glow_color` | 0.095 / 0.42 / (0.42,0.60,1.0) | = 原版 `_GlowRadius` 8/100 略放宽；`a³` 三次方让带边缘迅速熄灭；**颜色往蓝里压**——原版截图的光晕是明确的「钢蓝」不是白色 |
 
 第 2 轮调校的核心认识：**原版 RimWorld 的星星本身就是「暗色噪点 + 少数亮星」**，
 不是「一堆亮十字」。首版之所以完全不像，是因为亮度维度根本没参与——
 所有星星的 ALBEDO 都是纯白，唯一的区分手段是几何大小，于是只能靠放大来「显得有层次」，
 结果就是刺眼的硬边白十字。第 2 轮把层次从「几何大小」搬到「instance color 的亮度」，
 几何就可以缩到很小很碎，刺眼感自然消失。
+
+第 3 轮（对标原版截图的像素级比对）又补了两条：
+
+1. **1 quad = 1 颗星**（原版是 1 张贴图放 3 颗）。
+   一个 quad 只能带**一个** instance color → 同一 quad 里的 3 颗星必然同亮度。
+   缩小后它们会糊成「三个等亮的小点」连成一串（截图里能明显看到这种「三胞胎」链条），
+   与原版「每颗星亮度独立」的观感不符。改成一颗一 quad 后，每颗星各有各的
+   instance color，才对得上。quad 数相应从 1500 提到 8000 补回星点密度
+   （实测屏幕密度 ~480 个/百万像素，与原版截图一致；仍是 1 个 draw call、静态缓冲）。
+2. **辉光往蓝里压**：原版截图里星球光晕是明确的「钢蓝」，不是白色；
+   `glow_color` 从原版的 (0.706,0.839,1.0) 压到 (0.42,0.60,1.0)。
+   蓝味足了才压得住背景星空的相对亮度，星空才显得更深邃。
 
 > **instance color 的一个坑（务必记住）**：`MultiMesh.set_instance_color()` 是
 > **乘在网格顶点色上**的（引擎文档原话：*multiplying* the mesh's existing vertex colors）。
@@ -198,6 +210,16 @@ Blend SrcAlpha One / ZTest Off / ZWrite Off
 - 大气辉光：新增 `atmosphere.gdshader`（距离带算法，对照原版 `Custom_PlanetGlow`）；
 - 护栏：冒烟脚本新增「亮度随机性」断言（共 7 项）。
 
+**第 3 轮调校（已实施：按原版截图做像素级比对）**
+- **1 quad = 1 颗星**（原版 1 张贴图 3 颗）：同 quad 的 3 颗星共享一个 instance color，
+  缩小后糊成「三个等亮小点」连成一串 → 改为 1 颗一 quad，quad 数 1500 → 8000 补回密度；
+- 尺寸再缩：`STAR_SIZE_MIN/MAX` = 0.015/0.08 → **0.010/0.05**（原版截图的星是几像素的小点）；
+- 辉光往蓝里压：`glow_color` (0.706,0.839,1.0) → **(0.42,0.60,1.0)**，`intensity` 0.38 → 0.42，
+  `band_width` 0.08 → 0.095（更柔）；
+- 暗星占比 0.90 → 0.92（暗星上限 0.55，亮星更少更集中）；
+- 护栏：冒烟脚本新增「星点密度」断言（共 8 项）；
+- 实测：屏幕星点密度 ~480 个/百万像素、402 FPS、3 个 draw call、星穹 build() 13ms。
+
 **明确不做**（与原版对齐，写进了规划避免歧义）：
 - 星星闪烁（原版 shader 无时间项）；
 - 地图侧/菜单侧加星（原版世界地图夜景无星空）；
@@ -239,4 +261,12 @@ Blend SrcAlpha One / ZTest Off / ZWrite Off
 
 ## 8. 一句话规划
 
-**一个种子驱动的 MultiMesh 星穹（1500 个带"三颗四芒星"glyph 的 quad，随机旋转缩放，挂在相机位置上静止不动）+ 一张烘好的 64×64 贴图 + 默认清屏色换成 #10171E——单 draw call、零视差、零光照依赖、同种子同星空。**
+**一个种子驱动的 MultiMesh 星穹（8000 个带“四芒星”glyph 的 quad —— 一 quad 一颗星，
+各有各的随机亮度与色温，随机旋转缩放，挂在相机位置上静止不动）+ 一张运行期程序化生成的
+64×64 贴图 + 默认清屏色换成 #10171E + 星球外面一层蓝色大气辉光 ——
+单 draw call、零视差、零光照依赖、同种子同星空。**
+
+> 与原版的唯一结构性差异：**原版 1 张贴图放 3 颗星 × 1500 quad**，
+> 本项目 **1 张贴图 1 颗星 × 8000 quad**。原因是 instance color 的粒度是「每 quad 一个」，
+> 原版那 3 颗星共享同一亮度，缩小后会糊成等亮的三胞胎（详见 §4.2 第 3 轮说明）。
+> 观感目标与原版一致：**深邃黑底 + 满屏细碎暗点 + 零星几颗带 ✦ 光芒的亮星**。
