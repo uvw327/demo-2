@@ -27,8 +27,10 @@ const OrbitCameraScript := preload("res://orbit_camera.gd")
 const StarDomeScript := preload("res://star_dome.gd")
 const WorldMenuScript := preload("res://world_menu.gd")
 const BiomeAtlasScript := preload("res://biome_atlas.gd")
+const HillsAtlasScript := preload("res://hills_atlas.gd")
 const SELECTION_RING_SHADER := preload("res://selection_ring.gdshader")
 const ATMOSPHERE_SHADER := preload("res://atmosphere.gdshader")
+const HILLS_SHADER := preload("res://planet_hills.gdshader")
 # level：递归二分段数，f = 2^level → 贴片总数 = 10·4^level + 2
 # level=7 → f=128 → 163842 个贴片
 const LEVEL := 6
@@ -155,6 +157,12 @@ var _generated: PackedByteArray = PackedByteArray() # 贴片是否已生成（�
 # 每块贴片的边界顶点（单位球面）：阶段 B 建网格时顺手缓存，
 # 点击选中时据此生成“向内溢出的白色光晕环”（见 _rebuild_selection_ring）。
 var _tile_polys: Array[PackedVector3Array] = []
+# 每块贴片的中心方向（单位球面，与 _tile_polys 同序同生命周期）：
+# 阶段 B 同一处缓存，丘陵 quad 按它定位（见 _build_hills_mesh）。
+var _tile_centers := PackedVector3Array()
+# —— 丘陵/山脉贴片层（第 2 期）：独立 MeshInstance3D，1 次 draw call ——
+var _hills_instance: MeshInstance3D = null
+var _hills_atlas: Dictionary = {} # 丘陵图集（惰性打包一次，换种子不重做）
 var _selected_tile := -1                  # 当前选中贴片索引；-1 = 未选中
 var _orbit: OrbitCamera                   # 轨道相机（点按事件从这里进来）
 var _selection_ring: MeshInstance3D       # 选中环：独立实例，切换选中时重建其 mesh
@@ -179,6 +187,104 @@ func _ensure_biome_atlas() -> Dictionary:
 		_biome_atlas = BiomeAtlasScript.build()
 		_biome_cell_origins = _biome_atlas["cell_origins"]
 	return _biome_atlas
+
+
+# —— 第 2 期：丘陵/山脉手绘贴片层（规划 §4 步骤 5-6，参考 22-PlanetTextures.md §6）——
+# 参数表（集中调参，出截图后逐轮调）：
+const HILLS_OFFSET := 0.005   # quad 离球面高度（×R）：原版同值防 z-fighting；过大 limb 会浮空
+const QUAD_SIZE_MIN := 0.9    # quad 边长 / 平均贴片宽下限（原版 BaseSizeRange 0.9–1.1）
+const QUAD_SIZE_MAX := 1.1
+# 球面位置抖动上限（× 平均贴片宽，按地形等级递减：小山最散、大山最贴中心——原版 §6.2 表）
+const JITTER_SMALL_HILLS := 0.37
+const JITTER_LARGE_HILLS := 0.20
+const JITTER_HIGH := 0.08 # 山区 / 不可逾越同值
+
+
+# 丘陵图集惰性装配（一次打包，换种子不重做——与 biome 图集同策略）
+func _ensure_hills_atlas() -> Dictionary:
+	if _hills_atlas.is_empty():
+		_hills_atlas = HillsAtlasScript.build()
+	return _hills_atlas
+
+
+# 构建丘陵贴片网格（第 2 期核心）：每个 terrain ≥ 小丘陵 的贴片，在其中心方向
+# 加抖动后的位置上方贴一个切线 quad（alpha 混合渲染，见 planet_hills.gdshader）。
+# · 随机性走独立 RNG（seed ^ "HILL"）：不碰地形/气候随机流 → 主生成确定性不破坏；
+#   quad 数组只依赖 (world_seed, _terrain, _tile_centers) → 同种子重建逐位一致。
+# · 一次同步构建（30% 档 ~3.7k quad、100% 档 ~12k quad，毫秒级，不进分帧热路径）。
+func _build_hills_mesh(world_seed: int) -> ArrayMesh:
+	var hills := _ensure_hills_atlas()
+	var cells: Array[Vector2] = hills["cell_origins"]
+	var sprite_uv: Vector2 = hills["sprite_uv"]
+	var variant_uv := sprite_uv * 0.5 # 每格 2×2 变体 = 半个 sprite
+	var rng := RandomNumberGenerator.new()
+	rng.seed = world_seed ^ 0x48494c4c # "HILL"：独立随机流（同 star_dome.build 语义）
+	var total := _terrain.size()
+	# 平均贴片宽（单位球等面积圆直径 = 4/√N，弧度 × R 换算世界单位）：与原版
+	# averageTileSize 同语义，quad 边长与球面抖动都以它为尺
+	var avg_tile := 4.0 / sqrt(float(total))
+	var verts := PackedVector3Array()
+	var uvs := PackedVector2Array()
+	var indices := PackedInt32Array()
+	var quad_n := 0
+	for v in total:
+		var lv: int = _terrain[v]
+		if lv < TerrainLevel.SMALL_HILLS:
+			continue # 平原 / 水域 / 未生成（NOT_GENERATED=0、FLAT=1）都不贴
+		# 位置抖动：中心 + 随机单位向量 × 量程再归一化（归一化去掉径向分量
+		# → 与原版「加 UnitVector3 再 normalize*半径」等效，纯角位置抖动）
+		var j := JITTER_SMALL_HILLS
+		if lv == TerrainLevel.LARGE_HILLS:
+			j = JITTER_LARGE_HILLS
+		elif lv >= TerrainLevel.MOUNTAINOUS:
+			j = JITTER_HIGH
+		var dir := (_tile_centers[v] + Vector3(rng.randfn(), rng.randfn(),
+				rng.randfn()).normalized() * (j * avg_tile)).normalized()
+		# 切平面正交基（同 star_dome）：法线 = dir（朝外）
+		var helper := Vector3.UP if absf(dir.y) < 0.9 else Vector3.RIGHT
+		var x_axis := (helper - dir * helper.dot(dir)).normalized()
+		var y_axis := dir.cross(x_axis)
+		# 随机绕法线旋转（原版 randomizeRotation 同款，消复制感）
+		var angle := rng.randf() * TAU
+		var xr := x_axis.rotated(dir, angle)
+		var yr := y_axis.rotated(dir, angle)
+		# 半边长 = 随机尺寸 × 平均贴片宽 / 2（quad 边长在贴片宽上下浮动）
+		var half := rng.randf_range(QUAD_SIZE_MIN, QUAD_SIZE_MAX) * avg_tile \
+				* 0.5 * PLANET_RADIUS
+		var pos := dir * ((1.0 + HILLS_OFFSET) * PLANET_RADIUS)
+		var vi := verts.size()
+		verts.append(pos - xr * half - yr * half)
+		verts.append(pos + xr * half - yr * half)
+		verts.append(pos + xr * half + yr * half)
+		verts.append(pos - xr * half + yr * half)
+		# UV：按地形等级选图集格 + 2×2 变体随机（原版 Rand.Range(0,2) 两轴）
+		var cell := cells[lv - TerrainLevel.SMALL_HILLS]
+		var o := cell + Vector2(rng.randi_range(0, 1), rng.randi_range(0, 1)) \
+				* variant_uv
+		# 纹理「上」对齐 +y_axis（与 star_dome 的 quad UV 同构；随机旋转后朝向天然随机）
+		uvs.append(o + Vector2(0, 1) * variant_uv)
+		uvs.append(o + Vector2(1, 1) * variant_uv)
+		uvs.append(o + Vector2(1, 0) * variant_uv)
+		uvs.append(o + Vector2(0, 0) * variant_uv)
+		# 三角形（与 star_dome 的 quad 同构：0,1,2 / 0,2,3）
+		indices.append(vi)
+		indices.append(vi + 1)
+		indices.append(vi + 2)
+		indices.append(vi)
+		indices.append(vi + 2)
+		indices.append(vi + 3)
+		quad_n += 1
+	if quad_n == 0:
+		return null # 全平原/水世界：不建丘陵层
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_TEX_UV] = uvs
+	arrays[Mesh.ARRAY_INDEX] = indices
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	print("丘陵贴片层：", quad_n, " 个 quad（/ ", total, " 贴片）")
+	return mesh
 
 
 func _ready() -> void:
@@ -247,6 +353,19 @@ func _on_generate_requested(params: Dictionary) -> void:
 	add_child(_mesh_instance)
 	# 大气光晕：紧跟星球上线（星球边缘那圈柔和的蓝白光晕，见 atmosphere.gdshader）
 	_build_atmosphere()
+	# 丘陵/山脉贴片层（第 2 期）：独立 MeshInstance3D 仍只 1 次 draw call，
+	# 旧层与旧星球同步退场（同 _mesh_instance 的二次生成语义）
+	if _hills_instance != null:
+		_hills_instance.queue_free()
+	var hills_mesh := _build_hills_mesh(params["seed"])
+	_hills_instance = MeshInstance3D.new()
+	if hills_mesh != null:
+		_hills_instance.mesh = hills_mesh
+		var hmat := ShaderMaterial.new()
+		hmat.shader = HILLS_SHADER
+		hmat.set_shader_parameter("hills_atlas", _ensure_hills_atlas()["texture"])
+		_hills_instance.material_override = hmat
+		add_child(_hills_instance)
 
 	# 生成完把画面交给玩家：镜头对准区域（球冠）中心——大陆正对着玩家，
 	# 北极朝上。focus_on 对准生成前就定好的 _region_center，
@@ -711,6 +830,7 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 	# ===== 阶段 B：对偶贴片 + 颜色 + 网格数组（分帧） =====
 	# 二次生成：贴片几何全部重来，旧的选择状态一并清掉（避免索引错位/悬空高亮）
 	_tile_polys = []
+	_tile_centers.clear()
 	deselect()
 	var cli := [0.0, 0.0, 0.0] # 气候复用缓冲：[elev, temperature, humidity]，热循环零分配
 	# 网格数组精确预分配：Σ贴片角点数 = 3×三角形数（每个三角形的三个角各归属
@@ -782,6 +902,7 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		# 极区的内陆水域还会自然结冰（比旧语义更真实）。
 		# 中心方向的重心均值已在上面 cents 循环里累出（同一批球的面向量）
 		var tile_dir := (cent_sum / n).normalized() # 贴片中心方向：噪声与纬度的采样点
+		_tile_centers.append(tile_dir) # 中心缓存：丘陵 quad 按它定位（与 _tile_polys 同序）
 		var level := TerrainLevel.NOT_GENERATED
 		# 顶点色 = 色调制器（不再是最终色，最终色由「贴图 × macro × 它」合成）：
 		# 未生成 → 全白不动色、a=0 无岩石混合——恰与生成海域的 _tile_appearance(FLAT)
