@@ -75,11 +75,13 @@ A 作为回退方案记录在案，但先不引入 Environment 这条新依赖�
 
 | 文件 | 职责 |
 | --- | --- |
-| `starfield.gdshader`（新） | `shader_type spatial; render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;`；`ALBEDO = COLOR.rgb`（**顶点色 × instance color = 每颗星的亮度/色温**），`ALPHA = tex.a * COLOR.a`（只承载形状，不掺亮度）；保持**深度测试开启**（靠远距自然被星球遮挡，这是与原版 `ZTest Off` 的有意差异——我们没有双相机，开深度反而更稳），深度写入关闭 |
-| `star_dome.gd`（新，`class_name StarDome extends MultiMeshInstance3D`） | ① `_make_star_tex()`：运行期程序化烘焙 64×64「菱形核（pow 平滑衰减）+ 极细暗十字臂」**1 颗** glyph（纯白 RGB、只动 alpha），再过一遍 3×3 盒式模糊 + 峰值归一化；② `build(seed)`：SeededRNG → 高斯均匀球面方向 × 8000 → 每 quad 一个 instance（切平面 basis + 随机绕法线旋转 + 随机尺寸 + 随机 instance color），transform 先算进 GDScript 数组 `_built`、颜色进 `_built_colors`（冒烟可测）再提交 MultiMesh（dummy 渲染器读不回）；③ `_process`：仅做 `global_position = cam.global_position`；④ 种子变了才重建 |
+| `starfield.gdshader`（新） | `shader_type spatial; render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;`；`ALBEDO = COLOR.rgb`（**顶点色 × instance color = 每颗星的亮度/色温**），`ALPHA = tex.a * COLOR.a`（只承载形状，不掺亮度）；**vertex() 里用 `INSTANCE_CUSTOM` 改写 UV** —— 逐实例采样图集里的不同一颗星（GL Compatibility 顶点阶段支持，已实测验证）；保持**深度测试开启**（靠远距自然被星球遮挡，这是与原版 `ZTest Off` 的有意差异——我们没有双相机，开深度反而更稳），深度写入关闭 |
+| `assets/stars.png`（新，从 RimWorld 提取） | **原版星点图集**：1024×1024 里散布着 22 颗独立的柔光星点精灵（8×8 ~ 20×20 px，峰值 alpha 0.15~0.95）。SHA256 与原版 `Stars #1196.png` 一致。**这是第 3 轮换掉「程序化造贴图」的关键** —— 原版真实的星点长这样，比自己造的像 |
+| `star_atlas.gd`（新） | 图集处理：① `extract_sprites()` 把 1024² 图集按连通域切成 22 颗独立精灵（记录包围盒/峰值 alpha）；② `make_four_point_star()` 程序化补一颗**柔光四芒星**（原版截图里最亮的那几颗带 ✦，图集里没有）；③ `pack()` 把 23 颗精灵紧凑打包成 320×320 网格图集（每格留一倍白边防 mipmap 串味），返回每颗的 UV 矩形。**全部运行期做，不产生新资产文件** |
+| `star_dome.gd`（新，`class_name StarDome extends MultiMeshInstance3D`） | ① 启动时 `_ensure_atlas()` 一次性切分+打包图集（结果缓存，换种子不重做）；② `build(seed)`：SeededRNG → 高斯均匀球面方向 × 16000 → 每 quad 一个 instance（切平面 basis + 随机绕法线旋转 + 随机尺寸 + 随机 instance color + 随机采样图集里的一颗星）；UV 矩形经 `INSTANCE_CUSTOM` 传给 vertex()；transform 进 `_built`、颜色进 `_built_colors`（冒烟可测）再提交 MultiMesh（dummy 渲染器读不回）；③ `_process`：仅做 `global_position = cam.global_position`；④ 种子变了才重建 |
 | `atmosphere.gdshader`（新，第 2 轮新增） | 星球大气辉光：包住星球的球壳（1.081× 半径），按「视线到球心的最近距离 d」算一条 `a = max(0, 1 - |(d-1)/0.08|)` 的带，`ALPHA = a³·intensity`，加法混合（对照原版 `Custom_PlanetGlow`） |
 | `planet.gd`（改，~10 行） | `_ready`：`add_child(_star_dome); _star_dome.build(0)`（菜单相位即有星空）；`_on_generate_requested` 换种子时 `build(seed)`；星球上线时 `_build_atmosphere()` 挂辉光球壳 |
-| `tools/test_starfield.gd`（新，冒烟护栏） | 数量/确定性（同 seed 逐位一致、换 seed 变化）/方向分布均匀/材质就绪/**亮度随机性（暗星占比 ~0.92、use_colors 已开）**/**星点密度（1 星/quad、quad 数下限）**/相机跟随，共 8 项 |
+| `tools/test_starfield.gd`（新，冒烟护栏） | 数量/确定性（同 seed 逐位一致、换 seed 变化）/方向分布均匀/材质就绪/**亮度随机性（暗星占比 ~0.92、use_colors 已开）**/**星点密度（切出的精灵数 ≥ 4、quad 数下限）**/相机跟随，共 8 项 |
 
 装配后场景树（全部运行期代码构建，与现有风格一致）：
 
@@ -98,14 +100,12 @@ Planet (Node3D)
 | 常量 | 终值 | 备注 |
 | --- | --- | --- |
 | `DOME_RADIUS` | 400 | 最远视距 10 的 40 倍，沉入 far(4000) 内 |
-| `STAR_COUNT` | **8000** | 1 星/quad（见下方「1 quad = 1 星」说明）→ 8000 个星点。实测屏幕密度 ~480 个/百万像素，与原版截图一致 |
-| `STAR_SIZE_MIN / MAX` | **0.010 / 0.05** | 角尺寸 ≈ 0.57°~2.9°。**第 3 轮再缩**：对标原版截图，那里的星是「细碎小点」，最亮的也就几像素；0.08 的上限在 2000px 宽的画面上会糊成 20px 的团 |
-| `DIM_SIZE_MAX` / `BRIGHT_SIZE_MIN` | 0.028 / 0.020 | 暗星一律偏小、亮星允许更大：亮度与尺寸弱相关 → 少数「主角星」+ 满屏细碎噪点 |
+| `STAR_COUNT` | **16000** | 1 quad = 1 颗星（见下方「1 quad = 1 星」说明）→ 16000 个星点。实测屏幕密度 ~870 个/百万像素，与原版截图一致 |
+| `STAR_SIZE_MIN / MAX` | **0.0018 / 0.0070** | 角尺寸 ≈ 0.10°~0.40°（2000px 宽的画面上 ≈ 2.7~11px）。**第 3 轮再砍一个量级**：对标原版截图，那里的星是「细碎小点」。⚠️ 与旧版不同：图集里的精灵**恰好铺满整个 quad**（UV 矩形正好框住那颗星）→ quad 尺寸就是星的屏幕尺寸，数值必须小 |
+| `DIM_SIZE_MAX` / `BRIGHT_SIZE_MIN` | 0.0032 / 0.0032 | 暗星一律偏小、亮星允许更大：亮度与尺寸弱相关 → 少数「主角星」+ 满屏细碎噪点 |
 | `DIM_RATIO` | **0.92** | 92% 暗星（灰 0.18~0.55）、8% 亮星（灰 0.8~1.0）；亮星里 15% 染成极淡冷蓝/暖黄 |
-| `GLYPHS` | **1 颗**，半箭长 11 px | **第 3 轮改为 1 张贴图只放 1 颗星**（原版是 1 张放 3 颗）——见下方「1 quad = 1 星」 |
-| `GLYPH_CORE_R` / `GLYPH_FALLOFF` | 0.45 / 3.0 | 菱形核 = 曼哈顿距离场经 `pow(1 - d/0.45, 3)` 平滑衰减：**中心亮、边缘快速变暗**（不再是实心硬边） |
-| `GLYPH_ARM_LEN / ARM_W` / `GLYPH_ARM_BRIGHT` | 1.7 / 0.10 / **0.26** | 十字臂：细而暗。臂的 alpha 会随 instance color 一起被压暗 → **暗星的臂几乎看不见，只有最亮的几颗才透出 ✦ 的四芒**（正是原版观感） |
-| `TEX_SIZE` + 3×3 盒式模糊 + 峰值归一化 | 64 | 模糊抹掉硬锯齿；归一化把被模糊削掉的中心亮度补回来（否则整片星空偏暗） |
+| `SAMPLE_JITTER_MIN / MAX` | 0.75 / 1.35 | 抽到精灵后再乘一层随机大小 → 「采样哪颗 + 抽到后多大」两层随机 |
+| `FOUR_POINT_SIZE` / `FOUR_POINT_RATIO` | 0.0200 / 0.10 | 程序化四芒星的尺寸与使用比例（只给最亮的少数星）。原版截图里最亮的那几颗带 ✦，而图集里没有 → 用程序化补一颗 |
 | `BACKGROUND` | `#10171E` | RadWorld 天空相机清色；写入 project.godot 的 default_clear_color |
 | `ATMOSPHERE_RADIUS`（`planet.gd`） | 1.081 | 大气辉光球壳半径 / 星球半径（= 原版 108.1/100） |
 | 辉光 `band_width` / `intensity` / `glow_color` | 0.095 / 0.42 / (0.42,0.60,1.0) | = 原版 `_GlowRadius` 8/100 略放宽；`a³` 三次方让带边缘迅速熄灭；**颜色往蓝里压**——原版截图的光晕是明确的「钢蓝」不是白色 |
@@ -116,14 +116,21 @@ Planet (Node3D)
 结果就是刺眼的硬边白十字。第 2 轮把层次从「几何大小」搬到「instance color 的亮度」，
 几何就可以缩到很小很碎，刺眼感自然消失。
 
-第 3 轮（对标原版截图的像素级比对）又补了两条：
+第 3 轮（**换用原版真贴图** + 对标截图做像素级比对）补了三条：
 
-1. **1 quad = 1 颗星**（原版是 1 张贴图放 3 颗）。
+1. **改用原版提取的星点图集**（`assets/stars.png`，SHA256 与原版 `Stars #1196.png` 一致）。
+   之前是自己程序化造一张 64×64 的三颗星贴图 —— 造出来的东西**怎么调都不像原版**，
+   因为原版的星点本来就是「一堆大小不一、柔光程度不一的独立光斑」。
+   现在把 1024² 图集按连通域切成 22 颗独立精灵，紧凑打包成 320×320 供逐颗随机采样，
+   每颗星再叠上随机大小 + 随机亮度 + 随机色温。
+2. **1 quad = 1 颗星**（原版是 1 张贴图放 3 颗）。
    一个 quad 只能带**一个** instance color → 同一 quad 里的 3 颗星必然同亮度。
    缩小后它们会糊成「三个等亮的小点」连成一串（截图里能明显看到这种「三胞胎」链条），
    与原版「每颗星亮度独立」的观感不符。改成一颗一 quad 后，每颗星各有各的
-   instance color，才对得上。quad 数相应从 1500 提到 8000 补回星点密度
-   （实测屏幕密度 ~480 个/百万像素，与原版截图一致；仍是 1 个 draw call、静态缓冲）。
+   instance color，才对得上。quad 数相应提到 16000 补回星点密度
+   （实测屏幕密度 ~870 个/百万像素，与原版截图一致；仍是 1 个 draw call、静态缓冲）。
+3. **逐实例 UV 采样**：一颗星要采图集里的**不同一块**，靠 `INSTANCE_CUSTOM` 把
+   UV 矩形传进 vertex() 改写 UV（GL Compatibility 顶点阶段支持，已实测验证）。
 2. **辉光往蓝里压**：原版截图里星球光晕是明确的「钢蓝」，不是白色；
    `glow_color` 从原版的 (0.706,0.839,1.0) 压到 (0.42,0.60,1.0)。
    蓝味足了才压得住背景星空的相对亮度，星空才显得更深邃。

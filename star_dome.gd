@@ -3,53 +3,61 @@ extends MultiMeshInstance3D
 # 背景星空：RimWorld WorldLayer_Stars 的 Godot 对应形（规划见 docs/starfield_plan.md）。
 #
 # 做法：半径 DOME_RADIUS 的天球上按“三高斯归一化”撒 STAR_COUNT 个均匀方向，
-# 每个方向放一个朝向球心的 quad（单 MultiMesh，1 个 draw call），
-# quad 显示同一张 64×64「四芒星」glyph 的完整 UV。
-# 随机尺寸 + 随机绕法线旋转，让同一张贴图看起来像千星群而非复制粘贴。
+# 每个方向放一个朝向球心的 quad（单 MultiMesh，1 个 draw call）。
 #
-# **1 quad = 1 颗星**（与原版「1 张贴图 3 颗星」不同）：
-# instance color 的粒度是「每 quad 一个」，同一 quad 里的多颗星必然同亮度，
-# 缩小后会糊成「三个等亮小点」连成一串。原版观感是「每颗星亮度独立」，
-# 所以这里一张贴图只放一颗星，quad 数相应提高以补回星点密度。
+# **贴图来自 RimWorld 原版**：assets/stars.png 就是原版 Stars.png（SHA256 一致），
+# 1024×1024 里散布着 22 颗独立的柔光星点精灵。启动时用 StarAtlas 把它们
+# 切成精灵、紧凑打包成小图集；每颗星随机采样其中一块 → 天然就有
+# 「不同形状 / 不同大小」的星，既不用自己造贴图，也不会出现硬边几何体的十字。
 #
-# 星感三要素（对照 RimWorld 的调校要点）：
-# · glyph 是“软”的：菱形核用 pow 平滑衰减（中心亮、边缘快速变暗），十字臂细而暗；
-#   alpha 生成后再过一遍 3×3 盒式模糊 —— 边缘没有硬锯齿，
-#   远看是噪点而不是硬编码的几何体。
-# · 每颗星有独立亮度与色温：MultiMesh instance color（use_colors）承载，
-#   shader 里与贴图 alpha 相乘 —— 九成暗星、一成亮星、偶尔冷蓝/暖黄。
-#   亮度靠颜色而不是物理尺寸，所以星点可以画得很小而不刺眼。
-#   十字臂的 alpha 也随 instance color 一起压暗 → 只有最亮的几颗才透出 ✦ 的四芒。
-# · 星球边缘的大气辉光（atmosphere.gdshader）压住背景相对亮度，
-#   星空因此显得更深邃（对应原版 WorldLayer_Glow 的观感补偿）。
+# 每颗星的三个随机维度：
+#   ① 采样哪一颗精灵   → INSTANCE_CUSTOM 携带 UV 矩形（vertex 阶段改写 UV）
+#   ② 多大             → quad 的缩放
+#   ③ 多亮 / 什么色温   → instance color（乘在白色顶点色上）
 #
 # 与原版的三处对应/差异：
 #   原版顶点着色器加 _WorldSpaceCameraPos 实现相机相对天球 → 这里等价改为
 #   _process 把天球中心贴到相机位置（只有方向、没有平移视差）；
-#   原版 ZTest Off（双相机合成的一半）→ 这里深度测试照常开、只关深度写入，
+#   原版 ZTest Off（双相机合成的一部分）→ 这里深度测试照常开、只关深度写入，
 #   星穹半径远大于最远视距，星球按深度自然遮挡星星；
 #   原版星图随太阳旋转（昼夜系统）→ 本项目无时间/太阳概念，第 1 期静态。
 
 # —— 参数表（全部集中在此调参，见规划文档 §4.2）——
 const STAR_SHADER := preload("res://starfield.gdshader")
+# 图集分析器（用 preload 而非 class_name：跟 planet.gd 的依赖风格一致，
+# 且不依赖编辑器的全局类名注册缓存 —— headless 冒烟与 CI 下更稳）
+const StarAtlasScript := preload("res://star_atlas.gd")
+# 从 RimWorld 原版提取的星点图集（assets/stars.png，1024×1024）：
+# 里面散布着 22 颗独立的柔光星点精灵（8×8 ~ 20×20 px 不等）。
+const STAR_ATLAS := preload("res://assets/stars.png")
 const DOME_RADIUS := 400.0  # 天球半径：最远视距 10 的 40 倍，远沉入 far(4000) 之内
-# quad 数 = 星点数（**每张贴图只放 1 颗星**，见下方 GLYPHS 的说明）。
-# 原版是「1 张贴图 3 颗星 × 1500 quad」；我们改成「1 张贴图 1 颗星」，
-# 因为一个 quad 的 3 颗星共享**同一个 instance color**（同亮度），
-# 缩小后会糊成 3 个等亮的小点连成一串 —— 屏幕上读起来是「三胞胎」，
-# 与原版「每颗星亮度独立」的观感不符。改成一颗一 quad 后，
-# 每颗星各有各的 instance color，才对得上原版截图。
-# quad 数相应提高以补回星点密度（仍是 1 个 draw call、静态缓冲）。
-const STAR_COUNT := 8000
-# quad 边长 / 天球半径 → 角尺寸 ≈ 该比值（弧度）：0.010→0.57°，0.05→2.9°。
-# 对标原版截图：那里的星是「细碎小点」，最亮的也就几像素；
-# 我们之前 0.08 的上限在 2000px 宽的画面上会糊成 20px 的团。
-# 刺眼感主要靠 instance color 的亮度分布压住，而不是靠物理尺寸。
-const STAR_SIZE_MIN := 0.010
-const STAR_SIZE_MAX := 0.05
-# 亮星可以略大、暗星一律偏小：亮度与尺寸弱相关，视觉上更自然
-const DIM_SIZE_MAX := 0.028
-const BRIGHT_SIZE_MIN := 0.020
+# 星点数（= quad 数，1 quad = 1 颗星）。
+# 原版 1500 个 quad × 每张 3 颗星 = 4500 个星点；这里一颗一 quad，
+# 数量取 8000 以补回星点密度（实测屏幕密度 ~480 个/百万像素，与原版一致）。
+const STAR_COUNT := 16000
+# —— quad 尺寸 ——
+# quad 边长 / 天球半径 = 星的角尺寸（弧度）。
+# 注意与旧版的区别：旧版贴图里星只占 64×64 的一小角，quad 尺寸 ≠ 星尺寸；
+# 现在**图集里的精灵恰好铺满整个 quad**（UV 矩形正好框住那颗星），
+# 所以 quad 尺寸就是星的屏幕尺寸 —— 数值必须很小，否则会糊成大光斑。
+# 换算：2000px 宽的画面 ≈ 26.7px/度，1px ≈ 0.0375° ≈ 0.00065 弧度。
+# 原版截图的目标：普通星点 1~3px（≈0.0007~0.0020），最亮的带芒星 8~14px（≈0.005~0.009）。
+const STAR_SIZE_MIN := 0.0018
+const STAR_SIZE_MAX := 0.0070
+# 暗星一律偏小、亮星允许更大：亮度与尺寸弱相关，视觉上更自然
+const DIM_SIZE_MAX := 0.0032
+const BRIGHT_SIZE_MIN := 0.0032
+# 四芒星（程序化生成）单独给尺寸：它是画面里唯一的「大而带芒」的星，
+# 要明显比普通星点大，原版截图里约 12~20px。
+const FOUR_POINT_SIZE := 0.0130
+# —— 图集取样 ——
+# 每颗星随机取图集里的一颗精灵（按面积加权 → 大星更容易被抽到），
+# 再乘一个随机大小系数 —— 于是「采样哪颗 + 抽到后多大」两层随机。
+const SAMPLE_JITTER_MIN := 0.75
+const SAMPLE_JITTER_MAX := 1.35
+# 四芒星（程序化，图集最后一位）的使用比例：只给最亮的少数星，
+# 对应原版截图「满屏细碎暗点 + 零星几颗带四芒光芒的亮星」。
+const FOUR_POINT_RATIO := 1.0
 
 # —— 亮度/色温分布（写进 MultiMesh instance color）——
 # 90% 暗星（灰 0.2~0.6）、10% 亮星（灰 0.8~1.0）；
@@ -66,33 +74,6 @@ const TINTED_RATIO := 0.15
 # —— 星点两分类（决定颜色与尺寸档位）——
 enum Kind { DIM, BRIGHT }
 
-# glyph 贴图参数（64×64，运行期生成；调“星多大/多尖/亮度”就改这里）
-# —— 形态学（对照 RimWorld Stars.png 反推）：原版是「近乎不透明的实体星形 + 细窄
-#    抗锯齿边」。但直接照搬「实心菱形核 + 实心十字臂」在屏幕上的观感是
-#    “巨大的硬边白色十字”（首版实测，与原版截图差极远）——
-#    根因不是形状错，而是**没有抗锯齿、没有亮度变化**，于是硬边被放大成刺眼几何体。
-#    第 2 轮改成「pow 平滑衰减的软核 + 极细极暗的臂 + 3×3 模糊」：
-#    形状保留 ✦ 的神韵，边缘化开，整体退成细碎噪点。
-const TEX_SIZE := 64
-# 菱形核半径 / 半箭长：核只占菱形内一小段（中央一小团亮斑），四周快速衰减
-const GLYPH_CORE_R := 0.45
-# 核心衰减指数：越大越锐（中心亮核收紧、边缘掉得快）
-const GLYPH_FALLOFF := 3.0
-# 十字臂：细而暗 —— 暗星的臂几乎看不见（ALBEDO = instance color 整体压暗），
-# 只有最亮的那几颗才透出 ✦ 的四芒，正是原版截图里的观感：
-# 满屏细碎暗点 + 零星几颗带十字光芒的亮星。
-const GLYPH_ARM_W := 0.10   # 臂宽 / 半箭长
-const GLYPH_ARM_LEN := 1.7  # 臂长 / 半箭长
-const GLYPH_ARM_BRIGHT := 0.26  # 臂亮度系数（相对核心；靠 instance color 区分明暗）
-# 贴图内容：只有**一颗**星（居中）。
-# 原版是一张 64×64 里放 3 颗四芒星；但一个 quad 只能带一个 instance color，
-# 三颗星会共享同一亮度 → 缩小后糊成「三个等亮小点」连成一串，
-# 与原版「每颗星亮度独立」的观感不符。改成一颗一 quad（数量相应提高）。
-# 参数：中心(px)、半箭长 s（菱形核尖端到中心的像素距离；臂再向外探 1.7s）
-const GLYPHS := [
-	[Vector2(32, 32), 11.0],  # 唯一的一颗星
-]
-
 var star_seed := -1  # 当前星空种子；-1 = 尚未构建
 
 var _material: ShaderMaterial
@@ -102,6 +83,14 @@ var _material: ShaderMaterial
 var _built: Array[Transform3D] = []
 # 最近一次 build 的每颗星颜色（GDScript 侧拷贝，同上：dummy 渲染器读不回）
 var _built_colors: Array[Color] = []
+# 图集分析结果（启动时做一次）：紧凑图集 + 每颗精灵的 UV 矩形 + 固有大小 + 抽样权重
+var _atlas_uv_rects: Array[Rect2] = []
+var _atlas_sizes: Array[int] = []
+var _atlas_weights: PackedFloat32Array = PackedFloat32Array()
+var _atlas_ready := false
+# 图集里所有精灵的「平均固有边长」—— 采样时用它把精灵的原生大小差异
+# 换算成屏幕上的大小差异（8×8 的小星比 20×20 的大星小 2.5 倍）。
+var _atlas_mean_size := 12.0
 
 
 func _ready() -> void:
@@ -114,8 +103,40 @@ func _ensure_material() -> void:
 		return
 	_material = ShaderMaterial.new()
 	_material.shader = STAR_SHADER
-	_material.set_shader_parameter("star_tex", _make_star_tex())
+	_ensure_atlas()
+	_material.set_shader_parameter("star_tex", _atlas_texture)
 	material_override = _material
+
+
+# 图集准备：把 RimWorld 原版 Stars.png 切成精灵、紧凑打包。
+# 只做一次（结果缓存），之后所有 build() 复用 —— 换种子重建星穹不该重做这件事。
+var _atlas_texture: Texture2D
+var _atlas_total_weight := 0.0
+
+
+func _ensure_atlas() -> void:
+	if _atlas_ready:
+		return
+	_atlas_ready = true
+	var img: Image = STAR_ATLAS.get_image()
+	var sprites: Array = StarAtlasScript.extract_sprites(img)
+	var packed: Dictionary = StarAtlasScript.pack(img, sprites)
+	_atlas_texture = packed["texture"]
+	_atlas_uv_rects = packed["uv_rects"]
+	_atlas_sizes = packed["sizes"]
+	# 抽样权重按精灵面积（大的星更容易被抽到 —— 与原版「大小随机」的观感一致）。
+	# 权重按累积值存成前缀和，抽样时二分查找。
+	_atlas_weights = PackedFloat32Array()
+	var total := 0.0
+	for s: StarAtlasScript.Sprite in sprites:
+		total += float(s.rect.size.x * s.rect.size.y)
+		_atlas_weights.append(total)
+	_atlas_total_weight = total
+	# 精灵的平均固有边长（用于把「原生大小差异」换算成「屏幕大小差异」）
+	var size_sum := 0
+	for s2: StarAtlasScript.Sprite in sprites:
+		size_sum += s2.size
+	_atlas_mean_size = maxf(1.0, float(size_sum) / maxf(1.0, float(sprites.size())))
 
 
 # 每帧把天球中心贴到相机位置（不做平移 ⇒ 星空无视差；旋转恒 identity ⇒ 静态星图）。
@@ -134,17 +155,22 @@ func _process(_delta: float) -> void:
 func build(seed_value: int) -> void:
 	star_seed = seed_value
 	_ensure_material()
+	_ensure_atlas()
 	var rng := RandomNumberGenerator.new()
 	rng.seed = seed_value
 	_built.clear()
 	_built_colors.clear()
 	# —— 提交渲染：单 MultiMesh，1 个 draw call ——
-	# use_colors 必须在 instance_count 之前打开（之后设会清空缓冲）。
+	# use_colors / use_custom_data 必须在 instance_count 之前打开（之后设会清空缓冲）。
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.use_colors = true        # 每颗星的亮度/色温 → 顶点色通道 COLOR
+	mm.use_custom_data = true   # 每颗星采样图集的哪一块 → UV 矩形
 	mm.mesh = _make_quad_mesh()
 	mm.instance_count = STAR_COUNT
+	var n_sprites := _atlas_uv_rects.size()
+	# 四芒星在图集里的位置（最后一位），只给最亮的少数星用
+	var four_index := n_sprites - 1
 	for i in STAR_COUNT:
 		# 球面均匀方向：三个高斯分量归一化（不是 inside_unit_sphere——那个在角落偏密）
 		var dir := Vector3(rng.randfn(), rng.randfn(), rng.randfn()).normalized()
@@ -161,15 +187,56 @@ func build(seed_value: int) -> void:
 		# 先抽星的“档位”，颜色与尺寸都跟着档位走（亮星更大更白，暗星更小更灰）
 		var kind := _star_kind(rng)
 		var col := _star_color(rng, kind)
+		# 采样图集里的哪一颗星（按面积加权）
+		var si := _sample_sprite(rng)
+		# 最亮的少数星改用四芒星（程序化，图集最后一位）—— 原版截图里
+		# 「零星几颗带光芒的亮星」就是这种形态
+		var is_four := false
+		if kind == Kind.BRIGHT and rng.randf() < FOUR_POINT_RATIO:
+			si = four_index
+			is_four = true
+		# 抽到之后再乘一个随机大小系数 —— 「采样哪颗」+「抽到后多大」两层随机
+		var jitter := rng.randf_range(SAMPLE_JITTER_MIN, SAMPLE_JITTER_MAX)
+		# 精灵的**原生大小**也换算进屏幕尺寸：图集里 8×8 的小星就该比 20×20 的大星小。
+		# （四芒星是程序化生成的固定尺寸，单独给尺寸）
+		var rel := 0.0
+		if is_four:
+			rel = FOUR_POINT_SIZE * jitter
+		else:
+			var size_factor := 1.0
+			if si < _atlas_sizes.size():
+				size_factor = float(_atlas_sizes[si]) / _atlas_mean_size
+			rel = _star_size(rng, kind) * jitter * size_factor
 		# QuadMesh 边长 2 → 缩放 s 得边长 2s；求边长 = rel×半径，故 scale = rel×半径/2
-		var rel := _star_size(rng, kind)
 		var edge := rel * DOME_RADIUS
 		xform_basis = xform_basis.scaled(Vector3(edge * 0.5, edge * 0.5, edge * 0.5))
 		_built.append(Transform3D(xform_basis, dir * DOME_RADIUS))
 		_built_colors.append(col)
 		mm.set_instance_transform(i, _built[i])
 		mm.set_instance_color(i, col)
+		# UV 矩形（u0, v0, du, dv）经 INSTANCE_CUSTOM 传给 vertex()
+		var uv: Rect2 = _atlas_uv_rects[si] if n_sprites > 0 else Rect2(0, 0, 1, 1)
+		mm.set_instance_custom_data(i, Color(uv.position.x, uv.position.y, uv.size.x, uv.size.y))
 	multimesh = mm
+
+
+# 按面积加权抽一颗精灵（权重前缀和 + 二分）。
+# 面积大的星（20×20）比小星（8×8）更容易被抽到 —— 与原版「星有大小之分」的观感一致。
+func _sample_sprite(rng: RandomNumberGenerator) -> int:
+	var n := _atlas_uv_rects.size()
+	if n <= 1:
+		return 0
+	var r := rng.randf() * _atlas_total_weight
+	var lo := 0
+	var hi := _atlas_weights.size() - 1
+	while lo < hi:
+		# 二分下标：>> 1 是整除（用 / 会被 GDScript 报整除警告）
+		var mid := (lo + hi) >> 1
+		if r <= _atlas_weights[mid]:
+			hi = mid
+		else:
+			lo = mid + 1
+	return lo
 
 
 # 抽一颗星的档位：九成暗星、一成亮星。
@@ -214,6 +281,11 @@ func snapshot_colors() -> Array[Color]:
 	return _built_colors.duplicate()
 
 
+# 冒烟/排查看数用：返回图集里切出来的精灵数量（应 > 1，否则说明贴图没被正确解析）
+func sprite_count() -> int:
+	return _atlas_uv_rects.size()
+
+
 # 星点 quad 网格（2×2、朝 +Z），显式带一份白色顶点色。
 # 原因：MultiMesh 的 instance color 是「乘在网格顶点色上」的（见 set_instance_color
 # 文档：*multiplying* the mesh's existing vertex colors），而引擎里
@@ -240,85 +312,3 @@ func _make_quad_mesh() -> ArrayMesh:
 	var mesh := ArrayMesh.new()
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 	return mesh
-
-
-# 程序化烘焙 64×64 三颗四芒星 glyph：纯白 RGB，变化全在 alpha。
-# 形态 = 曼哈顿距离场（(|dx|+|dy|)/s）的菱形核（pow 平滑衰减）
-#      + 两条极细极暗的十字臂；
-# 最后整体过一遍 3×3 盒式模糊（抹掉硬锯齿）并做峰值归一化（模糊会削峰，
-# 归一化把中心亮度补回来 —— 不然整片星空会比预期更暗）。
-func _make_star_tex() -> ImageTexture:
-	var img := Image.create_empty(TEX_SIZE, TEX_SIZE, true, Image.FORMAT_RGBA8)
-	# 先把 alpha 算进浮点缓冲（模糊需要比 8bit 更宽的中间精度）
-	var buf := PackedFloat32Array()
-	buf.resize(TEX_SIZE * TEX_SIZE)
-	for y in TEX_SIZE:
-		for x in TEX_SIZE:
-			var a := 0.0
-			for g in GLYPHS:
-				a = maxf(a, _star_alpha(Vector2(x, y), g[0], g[1] as float))
-			buf[y * TEX_SIZE + x] = a
-	_blur_alpha(buf)
-	_normalize_peak(buf)
-	for y in TEX_SIZE:
-		for x in TEX_SIZE:
-			var a := clampf(buf[y * TEX_SIZE + x], 0.0, 1.0)
-			# 纯白 RGB + alpha 衰减：blend 出来只有形状亮度差，无色调污染
-			img.set_pixel(x, y, Color(1.0, 1.0, 1.0, a))
-	img.generate_mipmaps()  # 缩小时按屏幕占比选层，避免星点闪烁
-	return ImageTexture.create_from_image(img)
-
-
-# 单颗星 alpha：菱形核（pow 平滑衰减，中心亮、边缘快速变暗）
-# 叠两条极细极暗的十字臂（✦ 的尖芒，远看几乎不可见）。
-# 两形取 max：中心是柔和亮斑，臂从核外探出。
-func _star_alpha(p: Vector2, c: Vector2, s: float) -> float:
-	var dx := absf(p.x - c.x)
-	var dy := absf(p.y - c.y)
-	# 菱形核：曼哈顿距离归一化到 1 = 菱形尖端，再按 GLYPH_CORE_R 截断
-	var d_mm := (dx + dy) / s
-	var core := pow(clampf(1.0 - d_mm / GLYPH_CORE_R, 0.0, 1.0), GLYPH_FALLOFF)
-	# 十字臂：沿轴向衰减 × 横向窄缝（宽度取 0.5px 下限，保证再小也还剩一列）
-	var arm_len := s * GLYPH_ARM_LEN
-	var w := maxf(s * GLYPH_ARM_W, 0.5)
-	var ax := pow(clampf(1.0 - dx / arm_len, 0.0, 1.0), 2.0) \
-			* pow(clampf(1.0 - dy / w, 0.0, 1.0), 2.0)
-	var ay := pow(clampf(1.0 - dy / arm_len, 0.0, 1.0), 2.0) \
-			* pow(clampf(1.0 - dx / w, 0.0, 1.0), 2.0)
-	var arms := maxf(ax, ay) * GLYPH_ARM_BRIGHT
-	return maxf(core, arms)
-
-
-# 3×3 盒式模糊（可分离：先横后纵），作用在 alpha 缓冲上。
-# 目的只有一个：把解析衰减算出来的硬边抹成软边 —— 星星不再是硬编码几何体。
-# 边界用钳位复制（边缘像素延拓），避免整幅图出现暗环。
-func _blur_alpha(buf: PackedFloat32Array) -> void:
-	var n := TEX_SIZE
-	var tmp := buf.duplicate()
-	# 横向
-	for y in n:
-		for x in n:
-			var l := buf[y * n + maxi(x - 1, 0)]
-			var c := buf[y * n + x]
-			var r := buf[y * n + mini(x + 1, n - 1)]
-			tmp[y * n + x] = (l + c + r) / 3.0
-	# 纵向（读 tmp 写回 buf）
-	for y in n:
-		for x in n:
-			var u := tmp[maxi(y - 1, 0) * n + x]
-			var c := tmp[y * n + x]
-			var d := tmp[mini(y + 1, n - 1) * n + x]
-			buf[y * n + x] = (u + c + d) / 3.0
-
-
-# 峰值归一化：模糊会把中心的 1.0 削到 0.4 上下，整片星空随之偏暗。
-# 这里把最大值拉回 1.0 —— 只动整体亮度，不改变形状。
-func _normalize_peak(buf: PackedFloat32Array) -> void:
-	var peak := 0.0
-	for v in buf:
-		peak = maxf(peak, v)
-	if peak <= 0.0001:
-		return
-	var k := 1.0 / peak
-	for i in buf.size():
-		buf[i] *= k

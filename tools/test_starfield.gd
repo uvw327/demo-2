@@ -76,13 +76,15 @@ func _initialize() -> void:
 		return
 	print("PASS: 亮度随机性（暗星 ", dim, " / 亮星 ", bright, "，use_colors 已开）")
 
-	# 3.6) 星点密度护栏：一个 quad = 一颗星（贴图里只放 1 颗），
-	# 所以「贴图里的星数」必须恒为 1 —— 改回 3 颗会让同一 quad 的 3 颗星
-	# 共享同一个 instance color，缩小后糊成「三个等亮小点」连成一串，
-	# 与原版「每颗星亮度独立」的观感不符。
-	if StarDome.GLYPHS.size() != 1:
-		print("FAIL: 贴图里放了 ", StarDome.GLYPHS.size(),
-			" 颗星 —— 必须是 1 颗（每 quad 只能带一个 instance color）")
+	# 3.6) 星点密度护栏：
+	#   ① 图集必须切出**多颗**独立精灵（每颗星随机采样其中一颗）——
+	#      切不出来就退化成「所有星长得一样」。
+	#   ② 每颗星各有各的 instance color —— 这是「每颗星亮度独立」的前提
+	#      （同一 quad 塞多颗星会共享一个颜色，缩小后糊成等亮三胞胎）。
+	#   ③ quad 数不能太少，否则屏幕上会变成稀疏星场（原版观感是密而不挤）。
+	if dome.sprite_count() < 4:
+		print("FAIL: 图集只切出 ", dome.sprite_count(),
+			" 颗星 —— 采样素材太少，星星会长得千篇一律")
 		quit(1)
 		return
 	if StarDome.STAR_COUNT < 3000:
@@ -90,7 +92,8 @@ func _initialize() -> void:
 			" 过少 —— 屏幕上会变成稀疏星场（原版观感是密而不挤）")
 		quit(1)
 		return
-	print("PASS: 星点密度（1 星/quad，", StarDome.STAR_COUNT, " 个 quad）")
+	print("PASS: 星点密度（图集 ", dome.sprite_count(),
+		" 颗精灵，", StarDome.STAR_COUNT, " 个 quad）")
 
 	# 4) 方向分布：球面均匀 → 三轴均值≈0、方差相等。以原图位置还原单位方向后统计。
 	var sx := 0.0
