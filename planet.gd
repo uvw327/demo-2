@@ -26,6 +26,7 @@ extends Node3D
 const OrbitCameraScript := preload("res://orbit_camera.gd")
 const StarDomeScript := preload("res://star_dome.gd")
 const WorldMenuScript := preload("res://world_menu.gd")
+const BiomeAtlasScript := preload("res://biome_atlas.gd")
 const SELECTION_RING_SHADER := preload("res://selection_ring.gdshader")
 const ATMOSPHERE_SHADER := preload("res://atmosphere.gdshader")
 # level：递归二分段数，f = 2^level → 贴片总数 = 10·4^level + 2
@@ -163,6 +164,21 @@ var _star_dome: StarDome                  # 背景星空：代码构建（种子
 var _music: AudioStreamPlayer             # 背景音乐（These_Lands.ogg）：星球生成完毕后才开始播
 var _atmosphere: MeshInstance3D           # 星球大气光晕：半径 1.081× 的球壳（见 atmosphere.gdshader）
 
+# —— 生态色卡图集（一次性运行期打包，见 biome_atlas.gd / docs/planet_textures_plan.md）——
+# 结果缓存：换种子重建星球只重铺网格，不重做图集。
+var _biome_atlas: Dictionary = {}
+# 图集 8 个格子的原点 UV（[0..6]=生态色卡按 BIOME_NAMES 顺序，[7]=未生成纯色）：
+# 网格构建（⑤ 阶段写 UV2）与材质装配都要用，_ensure_biome_atlas 里一并回填。
+var _biome_cell_origins: Array[Vector2] = []
+
+
+# 图集惰性装配：build 网格与材质装配都会兜底调用（同 star_dome 的 _ensure_* 风格）
+func _ensure_biome_atlas() -> Dictionary:
+	if _biome_atlas.is_empty():
+		_biome_atlas = BiomeAtlasScript.build(C_UNGENERATED)
+		_biome_cell_origins = _biome_atlas["cell_origins"]
+	return _biome_atlas
+
 
 func _ready() -> void:
 	# 贴片信息 HUD：平时隐藏，选中贴片时亮出（数据在 select_tile 时组装）
@@ -220,8 +236,12 @@ func _on_generate_requested(params: Dictionary) -> void:
 	# 星球上线：材质固定，MeshInstance 装配后加入场景
 	_mesh_instance = MeshInstance3D.new()
 	_mesh_instance.mesh = mesh
+	var atlas := _ensure_biome_atlas()
 	var mat := ShaderMaterial.new()
 	mat.shader = load("res://planet_surface.gdshader")
+	mat.set_shader_parameter("biome_atlas", atlas["texture"])
+	mat.set_shader_parameter("macro_tex", atlas["macro"])
+	mat.set_shader_parameter("cell_uv", atlas["cell_uv"])
 	_mesh_instance.material_override = mat
 	add_child(_mesh_instance)
 	# 大气光晕：紧跟星球上线（星球边缘那圈柔和的蓝白光晕，见 atmosphere.gdshader）
@@ -392,23 +412,27 @@ func _terrain_level(elev: float) -> TerrainLevel:
 	return TerrainLevel.IMPASSABLE # 极高尖峰：建不了也翻不过去
 
 
-# —— 贴片外观：群系纯色打底，地形等级做明暗与基岩色倾斜 ——
-# 越高级的地形越暗、山越高越接近基岩色；玩家肉眼就能读出“哪里翻不过去”。
-# 平原不动颜色（海洋贴片按底色规则正常渲染成海色，与地形数据无关）。
-func _tile_appearance(base: Color, level: int) -> Color:
+# —— 贴片外观：顶点色 = 色调制器（不再输出最终色）——
+# 最终色由 shader 里「生态贴图 × WorldMacro × 这里返回的调制器」合成：
+#   rgb = 明暗乘数（越高级的地形越暗，玩家肉眼能读出「哪里翻不过去」）
+#   a   = 往基岩色压的比例（shader 里向 ROCK_COLOR lerp；山区对半、不可逾越几乎纯岩）
+# 平原/水域 = 全白不动色（贴图原色直出）；海洋贴片的海色来自 Ocean.png，
+# 与地形数据无关。
+func _tile_appearance(level: int) -> Color:
+	var dark := 1.0 # 明暗乘数
 	var rock_mix := 0.0 # 往基岩色压的比例
 	match level:
 		TerrainLevel.SMALL_HILLS:
-			base = base * 0.92 # 一点点暗：腿脚还行
+			dark = 0.92 # 一点点暗：腿脚还行
 		TerrainLevel.LARGE_HILLS:
-			base = base * 0.82
+			dark = 0.82
 		TerrainLevel.MOUNTAINOUS:
-			base = base * 0.72
-			rock_mix = 0.4 # 山区：群系色 + 灰褐基岩对半
+			dark = 0.72
+			rock_mix = 0.4 # 山区：贴图色 + 灰褐基岩对半
 		TerrainLevel.IMPASSABLE:
-			base = base * 0.6
+			dark = 0.6
 			rock_mix = 0.8 # 不可逾越：几乎纯基岩，一眼识别
-	return base.lerp(C_ROCK, rock_mix)
+	return Color(dark, dark, dark, rock_mix)
 
 
 # —— 覆盖率选区：「扰动球冠」（重写于第 4 轮性能手术，参考 RimWorld WorldGrid 球冠裁切）——
@@ -541,6 +565,8 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 	_progress(2.0)
 	_slice_begin() # 管线起点即首帧切片起点（入口前刚让过一帧）
 	var t_stage := Time.get_ticks_msec()  # 阶段耗时打点起点
+	# 生态色卡图集：⑤ 循环逐片写 UV2 格子原点前必须就绪（惰性，一次生成只打包一次）
+	_ensure_biome_atlas()
 
 	# ===== ① 二十面体 12 顶点 + 30 条棱的插值点（几百次向量运算，量小）=====
 	var t := (1.0 + sqrt(5.0)) / 2.0
@@ -694,6 +720,10 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 	var mesh_colors := PackedColorArray()
 	mesh_verts.resize(total_corners)
 	mesh_colors.resize(total_corners)
+	# UV2 = 生态色卡图集的格子原点（逐片恒定，见 biome_atlas.gd / 规划文档 §3①）：
+	# fragment 按它定位该片 biome 的图集格子 —— 这是「7 个 biome 仍只有 1 次 draw call」的关键
+	var mesh_uv2 := PackedVector2Array()
+	mesh_uv2.resize(total_corners)
 	var mesh_indices := PackedInt32Array()
 	mesh_indices.resize(3 * (total_corners - 2 * total))
 	var vert_cursor := 0 # 已写满的角点数（同时是下一块贴片的顶点基址）
@@ -751,7 +781,12 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		# 中心方向的重心均值已在上面 cents 循环里累出（同一批球的面向量）
 		var tile_dir := (cent_sum / n).normalized() # 贴片中心方向：噪声与纬度的采样点
 		var level := TerrainLevel.NOT_GENERATED
-		var col := C_UNGENERATED
+		# 顶点色 = 色调制器（不再是最终色，最终色由「贴图 × macro × 它」合成）：
+		# 未生成 → 全白不动色、a=0 无岩石混合（图集第 8 格本身就是纯色，无需再调制）。
+		# ⚠️ 不能用 Color.WHITE——它的 a=1，会把 a 当岩石混合量的 shader 推成纯基岩色
+		var col := Color(1.0, 1.0, 1.0, 0.0)
+		# 图集格子原点（UV2）：未生成 → 第 8 格纯色；已生成 → 该片 biome 的格子
+		var cell: Vector2 = _biome_cell_origins[7]
 		if explored[v] == 1:
 			# 气候采样：水域贴片同样采样（HUD 要显示它的海拔/温湿度）；
 			# 海岸收边已在 _climate_fill 内部作用到海拔上。
@@ -766,7 +801,8 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 			level = _terrain_level(elev)
 			var biome := _biome_id(elev, temp, humid)
 			_tile_biome[v] = biome
-			col = _tile_appearance(BIOME_COLORS[biome], level)
+			col = _tile_appearance(level)
+			cell = _biome_cell_origins[biome]
 		_terrain[v] = level
 
 		# 每个贴片用一组“独占”顶点（不与其他贴片共享）→ 顶点色插值后整片均匀
@@ -774,6 +810,7 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		for k in poly.size():
 			mesh_verts[base + k] = poly[k] * PLANET_RADIUS
 			mesh_colors[base + k] = col
+			mesh_uv2[base + k] = cell
 		# 凸多边形扇形三角化（五/六边形都是凸的）
 		for i in range(1, n - 1):
 			mesh_indices[idx_cursor] = base
@@ -806,6 +843,7 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = mesh_verts
 	arrays[Mesh.ARRAY_COLOR] = mesh_colors
+	arrays[Mesh.ARRAY_TEX_UV2] = mesh_uv2
 	arrays[Mesh.ARRAY_INDEX] = mesh_indices
 	var mesh := ArrayMesh.new()
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
