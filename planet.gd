@@ -57,10 +57,10 @@ const C_FOREST := Color(0.25, 0.56, 0.26) # 温带森林
 const C_TAIGA := Color(0.15, 0.38, 0.30)  # 寒带（针叶林）
 const C_TUNDRA := Color(0.56, 0.56, 0.45) # 苔原
 const C_ICE := Color(0.93, 0.95, 0.97)    # 冰盖
-# 未生成区域（覆盖率外）：直接渲染为“纯海洋底色”——和海洋同一片深蓝，
-# 视觉上像一张没有贴图的平坦海面，星球整体连续、不出现黑色地块；
-# 逻辑上它属于“未生成”，没有地形数据也不可交互（见 is_tile_interactable）。
-const C_UNGENERATED := C_OCEAN
+# 未生成区域（覆盖率外）：渲染为「遥远的不可探索深洋」——UV2 指向图集第 8 格
+# （Ocean 卡备份），贴图 × macro × 顶点色与已生成海域逐像素一致，覆盖区边界
+# 无缝，不再出现与海洋对比强烈的浅蓝死海块；逻辑上它仍属于“未生成”，
+# 没有地形数据也不可交互（见 is_tile_interactable）。
 
 # ---- 群系 id 表：颜色与 HUD 显示同源（_biome_id 判定，BIOME_NAMES/ COLORS 查表）----
 const BIOME_NONE := 255 # 未生成贴片没有群系
@@ -167,15 +167,16 @@ var _atmosphere: MeshInstance3D           # 星球大气光晕：半径 1.081× 
 # —— 生态色卡图集（一次性运行期打包，见 biome_atlas.gd / docs/planet_textures_plan.md）——
 # 结果缓存：换种子重建星球只重铺网格，不重做图集。
 var _biome_atlas: Dictionary = {}
-# 图集 8 个格子的原点 UV（[0..6]=生态色卡按 BIOME_NAMES 顺序，[7]=未生成纯色）：
-# 网格构建（⑤ 阶段写 UV2）与材质装配都要用，_ensure_biome_atlas 里一并回填。
+# 图集 8 个格子的原点 UV（[0..6]=生态色卡按 BIOME_NAMES 顺序，
+# [7]=Ocean 卡备份 = 未生成深洋）：网格构建（⑤ 阶段写 UV2）与材质装配都要用，
+# _ensure_biome_atlas 里一并回填。
 var _biome_cell_origins: Array[Vector2] = []
 
 
 # 图集惰性装配：build 网格与材质装配都会兜底调用（同 star_dome 的 _ensure_* 风格）
 func _ensure_biome_atlas() -> Dictionary:
 	if _biome_atlas.is_empty():
-		_biome_atlas = BiomeAtlasScript.build(C_UNGENERATED)
+		_biome_atlas = BiomeAtlasScript.build()
 		_biome_cell_origins = _biome_atlas["cell_origins"]
 	return _biome_atlas
 
@@ -773,7 +774,8 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 			poly[kk] = ring_buf[kk]
 		_tile_polys.append(poly)
 
-		# 贴片颜色：未生成 → 纯海洋底色，不做任何噪声采样（这些贴片没有地形）；
+		# 贴片颜色：未生成 → 深洋观感（第 8 格 Ocean 卡备份），不做地形噪声采样
+		#（这些贴片没有地形）；
 		# 已生成 → 气候采样，区内海拔 < 海平面的低洼自然派生为水域
 		# （内海/内陆湖/大陆架）——渲染群系表的海色/海冰，地形按海拔自然
 		# 落在平原；不再需要旧的“内陆湖强制海色”分支，湖与海同色同地形，
@@ -782,10 +784,12 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		var tile_dir := (cent_sum / n).normalized() # 贴片中心方向：噪声与纬度的采样点
 		var level := TerrainLevel.NOT_GENERATED
 		# 顶点色 = 色调制器（不再是最终色，最终色由「贴图 × macro × 它」合成）：
-		# 未生成 → 全白不动色、a=0 无岩石混合（图集第 8 格本身就是纯色，无需再调制）。
+		# 未生成 → 全白不动色、a=0 无岩石混合——恰与生成海域的 _tile_appearance(FLAT)
+		# 同值（且第 8 格也是 Ocean 卡）→ 三件套全对齐，覆盖区边界无亮度台阶。
 		# ⚠️ 不能用 Color.WHITE——它的 a=1，会把 a 当岩石混合量的 shader 推成纯基岩色
 		var col := Color(1.0, 1.0, 1.0, 0.0)
-		# 图集格子原点（UV2）：未生成 → 第 8 格纯色；已生成 → 该片 biome 的格子
+		# 图集格子原点（UV2）：未生成 → 第 8 格（Ocean 卡备份 = 遥远深洋）；
+		# 已生成 → 该片 biome 的格子
 		var cell: Vector2 = _biome_cell_origins[7]
 		if explored[v] == 1:
 			# 气候采样：水域贴片同样采样（HUD 要显示它的海拔/温湿度）；

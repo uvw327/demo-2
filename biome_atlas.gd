@@ -2,7 +2,9 @@ class_name BiomeAtlas
 extends RefCounted
 # 生态色卡图集：把 7 张原版生态色卡（512²，见 docs/planet_textures_plan.md §2）
 # 各缩到 256²，打包成 4×2 网格图集，供 planet_surface.gdshader 逐贴片按 UV2 采样。
-# 第 8 格 = 未生成区域的纯色格（死海蓝），于是「已生成 + 未生成」仍是 1 次 draw call。
+# 第 8 格 = Ocean 卡的备份：未生成贴片（覆盖率外 = 遥远的不可探索深洋）的
+# UV2 指向它，与已生成海域逐像素同观感（同一贴图 × 同一 macro × 同一全白
+# 调制器 → 覆盖区边界无缝），仍是 1 次 draw call。
 #
 # 为什么打包成一张图集（而不是照抄原版「一个 biome 一个材质」）：
 #   原版 7+ 个 biome 各一个 subMesh/材质 → 7+ 次 draw call；
@@ -43,21 +45,25 @@ const MACRO_TEXTURE := preload("res://assets/WorldMacro.png")
 
 
 # 打包图集。只做一次（调用方缓存结果），换种子重建星球不重做。
-# ungenerated_color：第 8 格的纯色（planet.gd 传 C_UNGENERATED）。
 # 返回：
 #   texture      → 紧凑图集纹理（含 mipmap）
 #   macro        → WorldMacro 纹理
 #   cell_origins → Array[Vector2]，8 个格子有效区左上角的 UV（写进网格 UV2）
 #   cell_uv      → Vector2，单格有效区的 UV 尺寸（shader 里乘 fract 平铺坐标）
-static func build(ungenerated_color: Color) -> Dictionary:
+static func build() -> Dictionary:
 	var cell := SPRITE + GUTTER * 2
 	var aw := COLS * cell
 	var ah := ROWS * cell
 	var atlas := Image.create_empty(aw, ah, false, Image.FORMAT_RGBA8)
 	atlas.fill(Color(0, 0, 0, 0))
+	# 打包 8 格 = 7 张色卡 + 第 8 格再放一份 Ocean 卡：未生成贴片（覆盖率外 =
+	# 遥远的不可探索深洋）UV2 指向它 → 与已生成海域逐像素同观感，覆盖区边界无缝。
+	#（Ocean 会被取两次：i=0 与 i=7；第二次 get_image 拿到的可能已是 256²，
+	#  同尺寸 resize 是 no-op、内容不变，两格 blit 结果逐位一致）
+	var pack: Array = BIOME_TEXTURES + [BIOME_TEXTURES[0]]
 	var cell_origins: Array[Vector2] = []
-	for i in BIOME_TEXTURES.size():
-		var src: Image = BIOME_TEXTURES[i].get_image()
+	for i in pack.size():
+		var src: Image = pack[i].get_image()
 		if src.get_format() != Image.FORMAT_RGBA8:
 			src.convert(Image.FORMAT_RGBA8)
 		# 512 → 256：色卡是近纯色低对比噪声，缩半后颗粒感不变
@@ -67,13 +73,6 @@ static func build(ungenerated_color: Color) -> Dictionary:
 		atlas.blit_rect(src, Rect2i(0, 0, SPRITE, SPRITE), Vector2i(ox, oy))
 		_pad_gutter(atlas, src, ox, oy)
 		cell_origins.append(Vector2(float(ox) / float(aw), float(oy) / float(ah)))
-	# 第 8 格：未生成区域纯色（与海洋同色，视觉上是「没贴图的平坦海面」），
-	# 连同 gutter 一起填满 —— 纯色格边缘延展 = 纯色本身。
-	var ox8 := (7 % COLS) * cell + GUTTER
-	var oy8 := int(7 / float(COLS)) * cell + GUTTER
-	atlas.fill_rect(Rect2i(ox8 - GUTTER, oy8 - GUTTER, SPRITE + GUTTER * 2,
-			SPRITE + GUTTER * 2), ungenerated_color)
-	cell_origins.append(Vector2(float(ox8) / float(aw), float(oy8) / float(ah)))
 	# mipmap：远景整颗星球缩小后必须走 mipmap，否则星点/颗粒会闪
 	atlas.generate_mipmaps()
 	return {

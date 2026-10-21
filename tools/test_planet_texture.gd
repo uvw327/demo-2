@@ -63,6 +63,20 @@ func _run() -> void:
 					and g2.a > 0.99 and gf.a > 0.99 and gf.is_equal_approx(edge)
 	print(bin_if(ok_pad, "gutter 边缘延展正确（8 格 g0/gfar/角 = 内容色，无透明黑）"))
 
+	# —— 1c) 第 8 格 = Ocean 卡备份：未生成贴片与已生成海域逐像素同观感的前提 ——
+	var ok_cell8: bool = atlas_img != null
+	if ok_cell8:
+		var p0 := Vector2i(int(round(origins[0].x * float(aw))),
+				int(round(origins[0].y * float(ah))))
+		var p8 := Vector2i(int(round(origins[7].x * float(aw))),
+				int(round(origins[7].y * float(ah))))
+		# 内容区 3 个抽查点：两格必须一致且不透明（同一张 Ocean 缩放图的两次 blit）
+		for q in [Vector2i(17, 240), Vector2i(128, 128), Vector2i(240, 17)]:
+			var c0: Color = atlas_img.get_pixel(p0.x + q.x, p0.y + q.y)
+			var c8: Color = atlas_img.get_pixel(p8.x + q.x, p8.y + q.y)
+			ok_cell8 = ok_cell8 and c0.a > 0.99 and c0.is_equal_approx(c8)
+	print(bin_if(ok_cell8, "第 8 格 = Ocean 卡备份（与第 0 格内容一致）"))
+
 	# —— 2) 生成星球 ——
 	planet._on_generate_requested({
 		"seed": 4242, "coverage": 0.3, "rainfall": 1, "temperature": 1,

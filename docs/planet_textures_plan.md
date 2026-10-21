@@ -107,10 +107,20 @@ fragment 用 `normalize(world_pos)` 盒式投影得球面方向 `p`，
 现有系数照搬：小丘 ×0.92、大丘 ×0.82、山区 ×0.72 + 40% 岩石、
 不可逾越 ×0.6 + 80% 岩石（`C_ROCK`）。
 
-### ④ 未生成区域专用格
+### ④ 未生成区域 = 第 8 格 Ocean 备份（遥远深洋）
 
-图集第 8 格运行期画成纯色（`C_UNGENERATED` = 海洋蓝），
-未生成贴片的 UV2 指向它 → 视觉与现状一致（纯色死海），也保住单 draw call。
+覆盖率的语义 =「系统生成并管理的可玩范围」：区外没有地形数据、不可选中、
+不可探索——概念上就是围绕可玩世界边缘的遥远深洋。因此第 8 格不画纯色，
+而是再放一张 Ocean 卡（运行期重复打包同一张卡，零新资产），
+未生成贴片的 UV2 指向它：
+
+- 观感与已生成海域**逐像素一致**（同一格贴图 × 同一张 WorldMacro × 同一
+  全白调制器，宏观噪声按世界坐标连续）→ 覆盖区边界无缝，
+  不再出现「浅蓝死海」色块（初版纯色 `C_UNGENERATED` 实测对比过强，已废弃）；
+- 顶点色恰与生成海域的 `_tile_appearance(FLAT)`（全白不动色）同值，无亮度台阶；
+- 仍保住「已生成 + 未生成」1 次 draw call；
+- 已知后果：极区已生成海域会结冰（海冰 biome），区外永远是普通海面——
+  「冰只出现在被管理的水域」，符合区外无气候模拟的设定。
 
 ---
 
@@ -121,7 +131,7 @@ fragment 用 `normalize(world_pos)` 盒式投影得球面方向 `p`，
 1. **`biome_atlas.gd`（新，仿 `star_atlas.gd` 运行期打包风格）**
    - preload 7 张色卡 → 各缩到 256²（近纯色噪声，缩半无损观感）→
      打包成 4×2 图集，格间留 gutter（防 mipmap 串味）
-   - 第 8 格画纯色（未生成区专用）
+   - 第 8 格再放一份 Ocean 卡（未生成贴片 = 遥远深洋，与已生成海域同观感）
    - preload `WorldMacro.png`
    - 返回 { texture, cell_origins(每 biome 的格子原点 UV2), macro_texture }
    - 一次构建缓存，换种子不重做
@@ -172,7 +182,7 @@ fragment 用 `normalize(world_pos)` 盒式投影得球面方向 `p`，
 1. **headless 回归**（仿 `tools/test_starfield.gd`，新 `tools/test_planet_texture.gd`）：
    - 图集构建成功（尺寸、格子数 ≥ 8）
    - UV2 通道存在且逐片指向正确格子（抽查若干已知 biome 贴片）
-   - 未生成贴片指向纯色格
+   - 未生成贴片指向第 8 格（Ocean 备份格，内容与第 0 格逐位一致）
    - 同种子确定性不破坏（网格数组逐位对比，注意 UV2 也要比）
    - 现有 `tools/test_tile_hud.gd` 必须继续 PASS（HUD 只用 BIOME_NAMES）
 2. **视觉验证**：`tools/capture_final.gd` 三档距离截图逐轮调参：
