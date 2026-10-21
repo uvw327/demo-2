@@ -10,9 +10,9 @@ extends RefCounted
 #   ③ 每颗星原本的**固有大小**（8×8 ~ 20×20 px）与柔和的 alpha 衰减被完整保留 ——
 #      随机采样时天然就有「大小不一、软硬不一」的星，不用额外去造。
 #
-# 另外补一颗**程序化生成的柔光四芒星**：原版 RimWorld 的 64×64 星图是三颗四芒星，
-# 参考截图里最亮的那几颗正是这种带四道光芒的 ✦。这里现算一颗（软边，非硬边几何体），
-# 混进图集里，只给最亮的少数星用 —— 对应参考图「满屏细碎暗点 + 零星几颗带光芒的亮星」。
+# 图集里**只放原图切出来的真实精灵**，不掺任何程序化生成的形状 ——
+# 星星的形态一律来自 stars.png 本身（第 4 轮：此前追加过一颗程序化四芒星，
+# 已按需求移除：满屏 ✦ 十字是合成形状，与原版柔光星点不符）。
 #
 # 全部在运行期做（与项目「全代码动态构建」一致），不产生任何新资产文件。
 
@@ -99,59 +99,20 @@ static func extract_sprites(img: Image) -> Array[Sprite]:
 	return out
 
 
-# 程序化生成一颗**柔光四芒星**（RGBA8，白色 + alpha 衰减）。
-# 与原版 RimWorld 星图同形：中心亮核 + 四道光芒。
-# 关键是"柔"：全程 smoothstep 衰减，没有硬边 —— 硬边十字正是上一版被否掉的效果。
-#
-# 注意亮度配比：光芒必须**明显**弱于核心（这里 0.55 : 1.0），
-# 否则缩小后整颗星糊成一个白团，四芒的形状就消失了。
-static func make_four_point_star(size: int) -> Image:
-	var img := Image.create_empty(size, size, false, Image.FORMAT_RGBA8)
-	var c := float(size) * 0.5
-	for y in size:
-		for x in size:
-			var dx := (float(x) + 0.5 - c) / c
-			var dy := (float(y) + 0.5 - c) / c
-			var r := sqrt(dx * dx + dy * dy)
-			# 中心核：紧实的一小团，边缘快速收
-			var core := 1.0 - smoothstep(0.05, 0.30, r)
-			core = core * core
-			# 四道光芒：沿 ±x / ±y 轴的窄条，越远越弱。
-			# across = 到最近那条轴的**垂直**距离（= min），沿 = 沿轴的距离（= max）。
-			# （min/max 弄反的话光芒会塌成核心外一圈极窄的环，等于看不见。）
-			var across := minf(absf(dx), absf(dy))
-			var ray := 0.0
-			if across < 0.24 and r > 0.16:
-				ray = (1.0 - smoothstep(0.0, 0.24, across)) \
-						* (1.0 - smoothstep(0.16, 0.95, r))
-			var a := clampf(maxf(core, ray * 0.55), 0.0, 1.0)
-			img.set_pixel(x, y, Color(1.0, 1.0, 1.0, a))
-	return img
-
-
 # 把精灵打包成紧凑的网格图集。
 #
-# 三个关键处理：
+# 两个关键处理：
 #   ① **alpha 归一化**：每颗星裁出来单独归一化到峰值 1.0 ——
 #      这样「亮度」完全由 instance color 控制（原图各颗星自带的强弱差异
 #      会被归一化抹掉），符合需求里「随机采样后调整大小和亮度」的做法。
 #   ② **留足白边**：每格四周留一倍精灵尺寸的空白，
 #      mipmap 降采样时相邻格的星不会串味。
-#   ③ **追加一颗程序化四芒星**（见 make_four_point_star），
-#      排在最后，供最亮的星使用。
 #
 # 返回 { texture, uv_rects, sizes }：
 #   uv_rects[i] = 第 i 颗星在新图集里的归一化 UV 矩形（正好框住那颗星）
 #   sizes[i]    = 第 i 颗星的固有边长（像素），供上层按它做大小差异
 static func pack(img: Image, sprites: Array[Sprite]) -> Dictionary:
 	var sprites_all: Array[Sprite] = sprites.duplicate()
-	# 程序化四芒星：作为最后一位（最亮的星专用）
-	var four_size := 32
-	var four := Sprite.new()
-	four.rect = Rect2i(0, 0, four_size, four_size)
-	four.peak = 1.0
-	four.size = four_size
-	sprites_all.append(four)
 
 	var cols := int(ceil(sqrt(float(sprites_all.size()))))
 	var rows := int(ceil(float(sprites_all.size()) / float(cols)))
@@ -166,25 +127,17 @@ static func pack(img: Image, sprites: Array[Sprite]) -> Dictionary:
 	atlas.fill(Color(0, 0, 0, 0))
 	var uv_rects: Array[Rect2] = []
 	var sizes: Array[int] = []
-	var four_index := sprites_all.size() - 1
 	for i in sprites_all.size():
 		var s: Sprite = sprites_all[i]
 		var ox := (i % cols) * cell + int((cell - s.rect.size.x) * 0.5)
 		var oy := int(i / float(cols)) * cell + int((cell - s.rect.size.y) * 0.5)
-		if i == four_index:
-			# 程序化四芒星：直接贴整张（它本身就是一张完整贴图）
-			var four_img := make_four_point_star(four_size)
-			for y in four_size:
-				for x in four_size:
-					atlas.set_pixel(ox + x, oy + y, four_img.get_pixel(x, y))
-		else:
-			# 原图里的星：拷贝并按峰值归一化 alpha
-			var inv_peak := 1.0 / maxf(s.peak, 0.0001)
-			for y in s.rect.size.y:
-				for x in s.rect.size.x:
-					var c := img.get_pixel(s.rect.position.x + x, s.rect.position.y + y)
-					c.a = clampf(c.a * inv_peak, 0.0, 1.0)
-					atlas.set_pixel(ox + x, oy + y, c)
+		# 原图里的星：拷贝并按峰值归一化 alpha
+		var inv_peak := 1.0 / maxf(s.peak, 0.0001)
+		for y in s.rect.size.y:
+			for x in s.rect.size.x:
+				var c := img.get_pixel(s.rect.position.x + x, s.rect.position.y + y)
+				c.a = clampf(c.a * inv_peak, 0.0, 1.0)
+				atlas.set_pixel(ox + x, oy + y, c)
 		uv_rects.append(Rect2(
 			float(ox) / float(aw),
 			float(oy) / float(ah),

@@ -47,17 +47,12 @@ const STAR_SIZE_MAX := 0.0070
 # 暗星一律偏小、亮星允许更大：亮度与尺寸弱相关，视觉上更自然
 const DIM_SIZE_MAX := 0.0032
 const BRIGHT_SIZE_MIN := 0.0032
-# 四芒星（程序化生成）单独给尺寸：它是画面里唯一的「大而带芒」的星，
-# 要明显比普通星点大，原版截图里约 12~20px。
-const FOUR_POINT_SIZE := 0.0130
 # —— 图集取样 ——
 # 每颗星随机取图集里的一颗精灵（按面积加权 → 大星更容易被抽到），
 # 再乘一个随机大小系数 —— 于是「采样哪颗 + 抽到后多大」两层随机。
+# 所有星（含最亮的）都只从 stars.png 切出的精灵里采样，不掺程序化形状。
 const SAMPLE_JITTER_MIN := 0.75
 const SAMPLE_JITTER_MAX := 1.35
-# 四芒星（程序化，图集最后一位）的使用比例：只给最亮的少数星，
-# 对应原版截图「满屏细碎暗点 + 零星几颗带四芒光芒的亮星」。
-const FOUR_POINT_RATIO := 1.0
 
 # —— 亮度/色温分布（写进 MultiMesh instance color）——
 # 90% 暗星（灰 0.2~0.6）、10% 亮星（灰 0.8~1.0）；
@@ -168,9 +163,6 @@ func build(seed_value: int) -> void:
 	mm.use_custom_data = true   # 每颗星采样图集的哪一块 → UV 矩形
 	mm.mesh = _make_quad_mesh()
 	mm.instance_count = STAR_COUNT
-	var n_sprites := _atlas_uv_rects.size()
-	# 四芒星在图集里的位置（最后一位），只给最亮的少数星用
-	var four_index := n_sprites - 1
 	for i in STAR_COUNT:
 		# 球面均匀方向：三个高斯分量归一化（不是 inside_unit_sphere——那个在角落偏密）
 		var dir := Vector3(rng.randfn(), rng.randfn(), rng.randfn()).normalized()
@@ -187,26 +179,15 @@ func build(seed_value: int) -> void:
 		# 先抽星的“档位”，颜色与尺寸都跟着档位走（亮星更大更白，暗星更小更灰）
 		var kind := _star_kind(rng)
 		var col := _star_color(rng, kind)
-		# 采样图集里的哪一颗星（按面积加权）
+		# 采样图集里的哪一颗星（按面积加权）—— 只采 stars.png 切出的真实精灵
 		var si := _sample_sprite(rng)
-		# 最亮的少数星改用四芒星（程序化，图集最后一位）—— 原版截图里
-		# 「零星几颗带光芒的亮星」就是这种形态
-		var is_four := false
-		if kind == Kind.BRIGHT and rng.randf() < FOUR_POINT_RATIO:
-			si = four_index
-			is_four = true
 		# 抽到之后再乘一个随机大小系数 —— 「采样哪颗」+「抽到后多大」两层随机
 		var jitter := rng.randf_range(SAMPLE_JITTER_MIN, SAMPLE_JITTER_MAX)
 		# 精灵的**原生大小**也换算进屏幕尺寸：图集里 8×8 的小星就该比 20×20 的大星小。
-		# （四芒星是程序化生成的固定尺寸，单独给尺寸）
-		var rel := 0.0
-		if is_four:
-			rel = FOUR_POINT_SIZE * jitter
-		else:
-			var size_factor := 1.0
-			if si < _atlas_sizes.size():
-				size_factor = float(_atlas_sizes[si]) / _atlas_mean_size
-			rel = _star_size(rng, kind) * jitter * size_factor
+		var size_factor := 1.0
+		if si < _atlas_sizes.size():
+			size_factor = float(_atlas_sizes[si]) / _atlas_mean_size
+		var rel := _star_size(rng, kind) * jitter * size_factor
 		# QuadMesh 边长 2 → 缩放 s 得边长 2s；求边长 = rel×半径，故 scale = rel×半径/2
 		var edge := rel * DOME_RADIUS
 		xform_basis = xform_basis.scaled(Vector3(edge * 0.5, edge * 0.5, edge * 0.5))
@@ -215,7 +196,8 @@ func build(seed_value: int) -> void:
 		mm.set_instance_transform(i, _built[i])
 		mm.set_instance_color(i, col)
 		# UV 矩形（u0, v0, du, dv）经 INSTANCE_CUSTOM 传给 vertex()
-		var uv: Rect2 = _atlas_uv_rects[si] if n_sprites > 0 else Rect2(0, 0, 1, 1)
+		var uv: Rect2 = _atlas_uv_rects[si] if not _atlas_uv_rects.is_empty() \
+				else Rect2(0, 0, 1, 1)
 		mm.set_instance_custom_data(i, Color(uv.position.x, uv.position.y, uv.size.x, uv.size.y))
 	multimesh = mm
 

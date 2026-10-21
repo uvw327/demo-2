@@ -77,7 +77,7 @@ A 作为回退方案记录在案，但先不引入 Environment 这条新依赖�
 | --- | --- |
 | `starfield.gdshader`（新） | `shader_type spatial; render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;`；`ALBEDO = COLOR.rgb`（**顶点色 × instance color = 每颗星的亮度/色温**），`ALPHA = tex.a * COLOR.a`（只承载形状，不掺亮度）；**vertex() 里用 `INSTANCE_CUSTOM` 改写 UV** —— 逐实例采样图集里的不同一颗星（GL Compatibility 顶点阶段支持，已实测验证）；保持**深度测试开启**（靠远距自然被星球遮挡，这是与原版 `ZTest Off` 的有意差异——我们没有双相机，开深度反而更稳），深度写入关闭 |
 | `assets/stars.png`（新，从 RimWorld 提取） | **原版星点图集**：1024×1024 里散布着 22 颗独立的柔光星点精灵（8×8 ~ 20×20 px，峰值 alpha 0.15~0.95）。SHA256 与原版 `Stars #1196.png` 一致。**这是第 3 轮换掉「程序化造贴图」的关键** —— 原版真实的星点长这样，比自己造的像 |
-| `star_atlas.gd`（新） | 图集处理：① `extract_sprites()` 把 1024² 图集按连通域切成 22 颗独立精灵（记录包围盒/峰值 alpha）；② `make_four_point_star()` 程序化补一颗**柔光四芒星**（原版截图里最亮的那几颗带 ✦，图集里没有）；③ `pack()` 把 23 颗精灵紧凑打包成 320×320 网格图集（每格留一倍白边防 mipmap 串味），返回每颗的 UV 矩形。**全部运行期做，不产生新资产文件** |
+| `star_atlas.gd`（新） | 图集处理：① `extract_sprites()` 把 1024² 图集按连通域切成 22 颗独立精灵（记录包围盒/峰值 alpha）；② `pack()` 把这些精灵紧凑打包成网格图集（每格留一倍白边防 mipmap 串味），返回每颗的 UV 矩形。**图集只含原图切出的真实精灵，不含任何程序化形状**（第 4 轮移除了此前追加的程序化四芒星）。**全部运行期做，不产生新资产文件** |
 | `star_dome.gd`（新，`class_name StarDome extends MultiMeshInstance3D`） | ① 启动时 `_ensure_atlas()` 一次性切分+打包图集（结果缓存，换种子不重做）；② `build(seed)`：SeededRNG → 高斯均匀球面方向 × 16000 → 每 quad 一个 instance（切平面 basis + 随机绕法线旋转 + 随机尺寸 + 随机 instance color + 随机采样图集里的一颗星）；UV 矩形经 `INSTANCE_CUSTOM` 传给 vertex()；transform 进 `_built`、颜色进 `_built_colors`（冒烟可测）再提交 MultiMesh（dummy 渲染器读不回）；③ `_process`：仅做 `global_position = cam.global_position`；④ 种子变了才重建 |
 | `atmosphere.gdshader`（新，第 2 轮新增） | 星球大气辉光：包住星球的球壳（1.081× 半径），按「视线到球心的最近距离 d」算一条 `a = max(0, 1 - |(d-1)/0.08|)` 的带，`ALPHA = a³·intensity`，加法混合（对照原版 `Custom_PlanetGlow`） |
 | `planet.gd`（改，~10 行） | `_ready`：`add_child(_star_dome); _star_dome.build(0)`（菜单相位即有星空）；`_on_generate_requested` 换种子时 `build(seed)`；星球上线时 `_build_atmosphere()` 挂辉光球壳 |
@@ -105,7 +105,7 @@ Planet (Node3D)
 | `DIM_SIZE_MAX` / `BRIGHT_SIZE_MIN` | 0.0032 / 0.0032 | 暗星一律偏小、亮星允许更大：亮度与尺寸弱相关 → 少数「主角星」+ 满屏细碎噪点 |
 | `DIM_RATIO` | **0.92** | 92% 暗星（灰 0.18~0.55）、8% 亮星（灰 0.8~1.0）；亮星里 15% 染成极淡冷蓝/暖黄 |
 | `SAMPLE_JITTER_MIN / MAX` | 0.75 / 1.35 | 抽到精灵后再乘一层随机大小 → 「采样哪颗 + 抽到后多大」两层随机 |
-| `FOUR_POINT_SIZE` / `FOUR_POINT_RATIO` | 0.0200 / 0.10 | 程序化四芒星的尺寸与使用比例（只给最亮的少数星）。原版截图里最亮的那几颗带 ✦，而图集里没有 → 用程序化补一颗 |
+| （`FOUR_POINT_SIZE` / `FOUR_POINT_RATIO`） | 已移除 | 第 4 轮删除：曾用程序化四芒星充当亮星形态；现所有星（含最亮的）一律只采样 `stars.png` 切出的真实精灵，不掺程序化形状 |
 | `BACKGROUND` | `#10171E` | RadWorld 天空相机清色；写入 project.godot 的 default_clear_color |
 | `ATMOSPHERE_RADIUS`（`planet.gd`） | 1.081 | 大气辉光球壳半径 / 星球半径（= 原版 108.1/100） |
 | 辉光 `band_width` / `intensity` / `glow_color` | 0.095 / 0.42 / (0.42,0.60,1.0) | = 原版 `_GlowRadius` 8/100 略放宽；`a³` 三次方让带边缘迅速熄灭；**颜色往蓝里压**——原版截图的光晕是明确的「钢蓝」不是白色 |
@@ -268,12 +268,12 @@ Blend SrcAlpha One / ZTest Off / ZWrite Off
 
 ## 8. 一句话规划
 
-**一个种子驱动的 MultiMesh 星穹（8000 个带“四芒星”glyph 的 quad —— 一 quad 一颗星，
-各有各的随机亮度与色温，随机旋转缩放，挂在相机位置上静止不动）+ 一张运行期程序化生成的
-64×64 贴图 + 默认清屏色换成 #10171E + 星球外面一层蓝色大气辉光 ——
+**一个种子驱动的 MultiMesh 星穹（16000 个 quad —— 一 quad 一颗星，
+各有各的随机亮度与色温，随机旋转缩放，挂在相机位置上静止不动）+ 一张运行期从
+RimWorld 原版 Stars.png 切出的星点图集（只采真实精灵，无程序化形状）+ 默认清屏色换成 #10171E + 星球外面一层蓝色大气辉光 ——
 单 draw call、零视差、零光照依赖、同种子同星空。**
 
 > 与原版的唯一结构性差异：**原版 1 张贴图放 3 颗星 × 1500 quad**，
-> 本项目 **1 张贴图 1 颗星 × 8000 quad**。原因是 instance color 的粒度是「每 quad 一个」，
+> 本项目 **1 quad 1 颗星、逐星随机采样图集**。原因是 instance color 的粒度是「每 quad 一个」，
 > 原版那 3 颗星共享同一亮度，缩小后会糊成等亮的三胞胎（详见 §4.2 第 3 轮说明）。
-> 观感目标与原版一致：**深邃黑底 + 满屏细碎暗点 + 零星几颗带 ✦ 光芒的亮星**。
+> 观感目标与原版一致：**深邃黑底 + 满屏细碎暗点 + 零星几颗更亮更大的星**（第 4 轮起亮星形态同样只来自原版贴图，不再用程序化 ✦ 四芒星）。
