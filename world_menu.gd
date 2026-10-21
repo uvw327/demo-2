@@ -15,7 +15,7 @@ const TEXT := Color(0.94, 0.94, 0.94)
 
 # 自定义字形：font_baker 烘焙的字体子集（只含游戏实际用到的字形，无字体数据），
 # 字符清单由 tools/extract_chinese.js 汇总到 assets/chinese.txt。
-const UI_FONT := preload("res://assets/font/glyphs.tres")
+const UI_FONT := preload("res://assets/font/game-ui-han-sans-3500.otf")
 
 var _ui_theme: Theme  # 共享主题：把 UI_FONT 作为 default_font 传给整棵菜单 UI
 

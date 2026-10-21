@@ -10,8 +10,14 @@ const MANIFEST_FILE := "template.json"
 const COPYRIGHT_FILE := "GODOT_COPYRIGHT.txt"
 const SCHEMA_VERSION := 1
 const BRIDGE_ABI := 1
-const PROFILE := "2d_full"
 const TARGET := "release"
+## The plugin and its bundled engine always ship together, so the expected
+## engine profile is the one the bundled engine declares.  Reading it instead
+## of hardcoding a name is what lets an `engine/<name>` branch ship a
+## different engine cut without the plugin rejecting its own engine.
+const BUNDLED_MANIFEST_PATH := "res://addons/godot_mini_game/engine/template.json"
+
+static var _expected_profile := ""
 
 var source: String = "none"
 var root_dir: String = ""
@@ -27,6 +33,31 @@ var commit_verified := false
 var valid := false
 var error: String = ""
 var priority := 0
+
+
+static func expected_profile() -> String:
+	## The engine profile this plugin is built against.
+	##
+	## The bundled engine and the plugin travel together in the same package,
+	## so the bundled manifest is the authority.  A cached read keeps the
+	## export hot path cheap.
+	if not _expected_profile.is_empty():
+		return _expected_profile
+	_expected_profile = _read_manifest_profile(BUNDLED_MANIFEST_PATH)
+	return _expected_profile
+
+
+static func _read_manifest_profile(path: String) -> String:
+	if not FileAccess.file_exists(path):
+		return ""
+	var file := FileAccess.open(path, FileAccess.READ)
+	if not file:
+		return ""
+	var parsed: Variant = JSON.parse_string(file.get_as_text())
+	file.close()
+	if not parsed is Dictionary:
+		return ""
+	return str((parsed as Dictionary).get("profile", ""))
 
 
 static func normalize_version(value: String) -> String:
@@ -131,7 +162,7 @@ static func build_manifest(
 			"commit": normalize_commit(commit),
 		},
 		"emscriptenVersion": normalize_emscripten_version(emscripten_version),
-		"profile": PROFILE,
+		"profile": expected_profile(),
 		"target": TARGET,
 		"revision": max(1, revision),
 		"bridgeAbi": BRIDGE_ABI,
@@ -302,8 +333,9 @@ func _validate(editor_version: String, editor_commit: String) -> void:
 		error = "Template manifest requires a valid Emscripten version"
 		return
 
-	if str(manifest.get("profile", "")) != PROFILE:
-		error = "Template profile must be %s" % PROFILE
+	var expected := expected_profile()
+	if expected.is_empty() or str(manifest.get("profile", "")) != expected:
+		error = "Template profile must be %s" % expected
 		return
 	if str(manifest.get("target", "")) != TARGET:
 		error = "Template target must be %s" % TARGET

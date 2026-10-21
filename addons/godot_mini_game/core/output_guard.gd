@@ -295,7 +295,7 @@ static func _has_valid_metadata(manifest: Dictionary) -> bool:
 		or not _is_integer(template.get("bridge_abi", 0))
 		or int(template.get("bridge_abi", 0)) != TemplateBundle.BRIDGE_ABI
 		or not _is_positive_integer(template.get("revision", 0))
-		or str(template.get("profile", "")) != TemplateBundle.PROFILE
+		or str(template.get("profile", "")) != TemplateBundle.expected_profile()
 		or str(template.get("target", "")) != TemplateBundle.TARGET
 		or not source_artifacts_value is Dictionary
 	):

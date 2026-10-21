@@ -5,7 +5,7 @@
     "commit": "ed1daf0bf001b61586d9930840f2f1394092c079"
   },
   "emscriptenVersion": "4.0.11",
-  "profile": "2d_full",
+  "profile": "minigame",
   "target": "release",
   "revision": 3,
   "bridgeAbi": 1,
@@ -17,10 +17,10 @@
   },
   "artifacts": {
     "godot.js": {
-      "sha256": "ab78a80241c8caba34cb146dc681446994a03e9fd98687d8e0c03d55bd35f73a"
+      "sha256": "bca32de3355c8206eda6e590b8ad3f10a105b757507999be32eae2383dd1c7fc"
     },
     "godot.wasm.br": {
-      "sha256": "81043617bfc87432c0efde9dcafbaa21cdab9685d5368e6dce7b108850957090"
+      "sha256": "be3262e28f96688012de61e12a2f3b5e7e57d8b567a1ee9c06c3649bae7a198d"
     }
   }
 }

@@ -122,7 +122,7 @@ static func _template_store_destination(
 		or version_key.is_empty()
 		or commit_key.length() != 40
 		or emscripten_key.is_empty()
-		or profile != TemplateBundle.PROFILE
+		or profile != TemplateBundle.expected_profile()
 		or target != TemplateBundle.TARGET
 		or bridge_abi < 1
 		or revision < 1
@@ -166,7 +166,7 @@ static func _versioned_store_candidates(version_root_override: String = "") -> A
 			if emscripten_version.is_empty() or emsdk_dir != "emsdk-" + emscripten_version:
 				continue
 			var release_root := commit_root.path_join(emsdk_dir).path_join(
-				TemplateBundle.PROFILE).path_join(TemplateBundle.TARGET).path_join(
+				TemplateBundle.expected_profile()).path_join(TemplateBundle.TARGET).path_join(
 				"abi-%d" % TemplateBundle.BRIDGE_ABI)
 			if not DirAccess.dir_exists_absolute(release_root):
 				continue
@@ -390,7 +390,7 @@ func _import_template_zip_to_store(zip_path: String, store_root: String) -> Erro
 	if (
 		normalized_commit.length() != 40
 		or revision < 1
-		or str(incoming_manifest.get("profile", "")) != TemplateBundle.PROFILE
+		or str(incoming_manifest.get("profile", "")) != TemplateBundle.expected_profile()
 		or str(incoming_manifest.get("target", "")) != TemplateBundle.TARGET
 		or bridge_abi != TemplateBundle.BRIDGE_ABI
 	):
@@ -870,7 +870,7 @@ func _validate_output_manifest(output_dir: String, platform: String) -> Error:
 			str(template.get("emscripten_version", ""))).is_empty()
 		or int(template.get("bridge_abi", 0)) != TemplateBundle.BRIDGE_ABI
 		or int(template.get("revision", 0)) < 1
-		or str(template.get("profile", "")) != TemplateBundle.PROFILE
+		or str(template.get("profile", "")) != TemplateBundle.expected_profile()
 		or str(template.get("target", "")) != TemplateBundle.TARGET
 	):
 		_log("  [color=red]所有权清单模板身份无效[/color]")
