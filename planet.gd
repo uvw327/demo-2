@@ -40,8 +40,10 @@ const LEVEL := 6
 #const LEVEL := 6
 const SUBDIV := 1 << LEVEL # 每条棱的等分数 f
 const PLANET_RADIUS := 1.0
-# 大气光晕球壳半径 / 星球半径（1.081 → 壳比星球大 8.1%，光晕只出现在轮廓外缘）
-const ATMOSPHERE_RADIUS := 1.081
+# 大气光晕球壳半径 / 星球半径（1.12 → 壳比星球大 12%，光晕只出现在轮廓外缘；
+# 球壳要包住辉光带的整个外尾：ATMOSPHERE_RADIUS ≈ 1 + 0.9 × band_width，
+# 否则带的尾巴被壳剪影硬切出一圈亮边——band_width 调整时这里必须跟着动）
+const ATMOSPHERE_RADIUS := 1.12
 
 # —— 生成管线的分帧预算：墙钟制 ——
 # 旧方案“每帧固定处理 N 项”在所有刷新率下都得凑整帧：帧间隔里的空转
@@ -170,7 +172,7 @@ var _selection_material: ShaderMaterial   # 选中环材质（白光向内衰减
 var _hud: TileHud                         # 贴片信息 HUD：选中贴片时亮出，取消选中即隐藏
 var _star_dome: StarDome                  # 背景星空：代码构建（种子驱动，见 star_dome.gd）
 var _music: AudioStreamPlayer             # 背景音乐（These_Lands.ogg）：星球生成完毕后才开始播
-var _atmosphere: MeshInstance3D           # 星球大气光晕：半径 1.081× 的球壳（见 atmosphere.gdshader）
+var _atmosphere: MeshInstance3D           # 星球大气光晕：半径 1.12× 的球壳（见 atmosphere.gdshader）
 
 # —— 生态色卡图集（一次性运行期打包，见 biome_atlas.gd / docs/planet_textures_plan.md）——
 # 结果缓存：换种子重建星球只重铺网格，不重做图集。
