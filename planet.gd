@@ -27,6 +27,7 @@ const OrbitCameraScript := preload("res://orbit_camera.gd")
 const StarDomeScript := preload("res://star_dome.gd")
 const WorldMenuScript := preload("res://world_menu.gd")
 const SELECTION_RING_SHADER := preload("res://selection_ring.gdshader")
+const ATMOSPHERE_SHADER := preload("res://atmosphere.gdshader")
 # level：递归二分段数，f = 2^level → 贴片总数 = 10·4^level + 2
 # level=7 → f=128 → 163842 个贴片
 const LEVEL := 6
@@ -36,6 +37,8 @@ const LEVEL := 6
 #const LEVEL := 6
 const SUBDIV := 1 << LEVEL # 每条棱的等分数 f
 const PLANET_RADIUS := 1.0
+# 大气光晕球壳半径 / 星球半径（1.081 → 壳比星球大 8.1%，光晕只出现在轮廓外缘）
+const ATMOSPHERE_RADIUS := 1.081
 
 # —— 生成管线的分帧预算：墙钟制 ——
 # 旧方案“每帧固定处理 N 项”在所有刷新率下都得凑整帧：帧间隔里的空转
@@ -158,6 +161,7 @@ var _selection_material: ShaderMaterial   # 选中环材质（白光向内衰减
 var _hud: TileHud                         # 贴片信息 HUD：选中贴片时亮出，取消选中即隐藏
 var _star_dome: StarDome                  # 背景星空：代码构建（种子驱动，见 star_dome.gd）
 var _music: AudioStreamPlayer             # 背景音乐（These_Lands.ogg）：星球生成完毕后才开始播
+var _atmosphere: MeshInstance3D           # 星球大气光晕：半径 1.081× 的球壳（见 atmosphere.gdshader）
 
 
 func _ready() -> void:
@@ -211,6 +215,8 @@ func _on_generate_requested(params: Dictionary) -> void:
 	# 旧星球退场：二次生成时撤掉上一颗，避免叠在一起渲染
 	if _mesh_instance != null:
 		_mesh_instance.queue_free()
+	if _atmosphere != null:
+		_atmosphere.queue_free()
 	# 星球上线：材质固定，MeshInstance 装配后加入场景
 	_mesh_instance = MeshInstance3D.new()
 	_mesh_instance.mesh = mesh
@@ -218,6 +224,8 @@ func _on_generate_requested(params: Dictionary) -> void:
 	mat.shader = load("res://planet_surface.gdshader")
 	_mesh_instance.material_override = mat
 	add_child(_mesh_instance)
+	# 大气光晕：紧跟星球上线（星球边缘那圈柔和的蓝白光晕，见 atmosphere.gdshader）
+	_build_atmosphere()
 
 	# 生成完把画面交给玩家：镜头对准区域（球冠）中心——大陆正对着玩家，
 	# 北极朝上。focus_on 对准生成前就定好的 _region_center，
@@ -250,6 +258,27 @@ func _start_music() -> void:
 		return
 	if not _music.playing:
 		_music.play()
+
+
+# 星球大气光晕（Rim Glow）：半径 1.081× 星球半径的球壳，套在星球外面。
+# 纯代码构建（与项目“全代码动态构建”的风格一致），材质用 atmosphere.gdshader：
+# 按「视线到球心的最近距离」开一条带 + 加法混合 → 星球轮廓外一圈柔和的蓝白光晕。
+#
+# 它的作用不只是好看：亮边压住背景星空的相对亮度，
+# 星空因此显得更深邃（对应原版 RimWorld 的 WorldLayer_Glow）。
+func _build_atmosphere() -> void:
+	var sphere := SphereMesh.new()
+	sphere.radius = PLANET_RADIUS * ATMOSPHERE_RADIUS
+	sphere.height = PLANET_RADIUS * ATMOSPHERE_RADIUS * 2.0
+	sphere.radial_segments = 64
+	sphere.rings = 32
+	var mat := ShaderMaterial.new()
+	mat.shader = ATMOSPHERE_SHADER
+	_atmosphere = MeshInstance3D.new()
+	_atmosphere.mesh = sphere
+	_atmosphere.material_override = mat
+	# 星球在原点，球壳跟着在原点即可（与星球 mesh 同坐标系）
+	add_child(_atmosphere)
 
 
 # 生成时刻视口相机的世界朝向（相机沿本地 -Z 看）。
@@ -351,7 +380,7 @@ func _biome_color(elev: float, temp: float, humid: float) -> Color:
 # 陆地从海平面往上爬，按阈值逐级抬升为丘陵→山区；极高的尖峰不可逾越。
 # 冰盖/苔原是“群系颜色”维度的事，它们能不能走、好不好建依然由海拔说了算
 # ——想让冻土更难通行，把 HILL1_ELEV 往下调一档即可，不需要新逻辑。
-func _terrain_level(elev: float) -> int:
+func _terrain_level(elev: float) -> TerrainLevel:
 	if elev < HILL1_ELEV:
 		return TerrainLevel.FLAT # 海面（海底平原）与沿海平地都是平原
 	if elev < HILL2_ELEV:

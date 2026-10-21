@@ -67,13 +67,19 @@ A 作为回退方案记录在案，但先不引入 Environment 这条新依赖�
 > 的既有风格不一致；改为 `star_dome.gd` 内运行期程序化生成 64×64 Image 细化 alpha，
 > 公式与参数都在代码常量区，改观感零 import 成本。规划初稿的 M1（bake 工具）
 > 连同 `assets/starfield/stars.png` 退役。
+>
+> **第 2 轮调校（对标 RimWorld 原版截图）**：首版渲染出来是「巨大的硬边白色十字」，
+> 与原版差得远。原因有三：① 贴图是硬边几何体（实心菱形核 + 实心十字臂，无 AA）；
+> ② 星星全部纯白、毫无亮度变化（instance color 根本没生效）；
+> ③ 没有星球大气辉光来压制背景的相对亮度。修法见 §4.2 参数表与 §4.5。
 
 | 文件 | 职责 |
 | --- | --- |
-| `starfield.gdshader`（新） | `shader_type spatial; render_mode unshaded, cull_disabled, depth_draw_never;`；`ALBEDO = 白`，`ALPHA = tex.a`；保持**深度测试开启**（靠远距自然被星球遮挡，这是与原版 `ZTest Off` 的有意差异——我们没有双相机，开深度反而更稳），深度写入关闭 |
-| `star_dome.gd`（新，`class_name StarDome extends MultiMeshInstance3D`） | ① `_make_star_tex()`：运行期程序化烘焙 64×64「菱形核 + 细十字臂」三颗 glyph（纯白 RGB、只动 alpha）；② `build(seed)`：SeededRNG → 高斯均匀球面方向 × 1500 → 每 quad 一个 instance（切平面 basis + 随机绕法线旋转 + 随机尺寸），transform 先算进 GDScript 数组 `_built`（冒烟可测）再提交 MultiMesh（dummy 渲染器读不回）；③ `_process`：仅做 `global_position = cam.global_position`；④ 种子变了才重建 |
-| `planet.gd`（改，~10 行） | `_ready`：`add_child(_star_dome); _star_dome.build(0)`（菜单相位即有星空）；`_on_generate_requested` 换种子时 `build(seed)` |
-| `tools/test_starfield.gd`（新，冒烟护栏） | 数量/确定性（同 seed 逐位一致、换 seed 变化）/方向分布均匀/材质就绪/相机跟随，共 6 项 |
+| `starfield.gdshader`（新） | `shader_type spatial; render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;`；`ALBEDO = COLOR.rgb`（**顶点色 × instance color = 每颗星的亮度/色温**），`ALPHA = tex.a * COLOR.a`（只承载形状，不掺亮度）；保持**深度测试开启**（靠远距自然被星球遮挡，这是与原版 `ZTest Off` 的有意差异——我们没有双相机，开深度反而更稳），深度写入关闭 |
+| `star_dome.gd`（新，`class_name StarDome extends MultiMeshInstance3D`） | ① `_make_star_tex()`：运行期程序化烘焙 64×64「菱形核（pow 平滑衰减）+ 极细暗十字臂」三颗 glyph（纯白 RGB、只动 alpha），再过一遍 3×3 盒式模糊 + 峰值归一化；② `build(seed)`：SeededRNG → 高斯均匀球面方向 × 1500 → 每 quad 一个 instance（切平面 basis + 随机绕法线旋转 + 随机尺寸 + 随机 instance color），transform 先算进 GDScript 数组 `_built`、颜色进 `_built_colors`（冒烟可测）再提交 MultiMesh（dummy 渲染器读不回）；③ `_process`：仅做 `global_position = cam.global_position`；④ 种子变了才重建 |
+| `atmosphere.gdshader`（新，第 2 轮新增） | 星球大气辉光：包住星球的球壳（1.081× 半径），按「视线到球心的最近距离 d」算一条 `a = max(0, 1 - |(d-1)/0.08|)` 的带，`ALPHA = a³·intensity`，加法混合（对照原版 `Custom_PlanetGlow`） |
+| `planet.gd`（改，~10 行） | `_ready`：`add_child(_star_dome); _star_dome.build(0)`（菜单相位即有星空）；`_on_generate_requested` 换种子时 `build(seed)`；星球上线时 `_build_atmosphere()` 挂辉光球壳 |
+| `tools/test_starfield.gd`（新，冒烟护栏） | 数量/确定性（同 seed 逐位一致、换 seed 变化）/方向分布均匀/材质就绪/**亮度随机性（暗星占比 ~0.90、use_colors 已开）**/相机跟随，共 7 项 |
 
 装配后场景树（全部运行期代码构建，与现有风格一致）：
 
@@ -83,6 +89,7 @@ Planet (Node3D)
 ├── OrbitCamera (Camera3D)
 ├── WorldMenu
 ├── MeshInstance3D   ← 星球（半径 1）
+├── MeshInstance3D   ← 大气辉光球壳（半径 1.081）
 └── StarDome (MultiMeshInstance3D)   ← 星穹（半径 400，每帧贴相机位置）
 ```
 
@@ -92,13 +99,30 @@ Planet (Node3D)
 | --- | --- | --- |
 | `DOME_RADIUS` | 400 | 最远视距 10 的 40 倍，沉入 far(4000) 内 |
 | `STAR_COUNT` | 1500 | = 原版 StarsCount |
-| `STAR_SIZE_MIN / MAX` | 0.04 / 0.22 | 实体亮核视尺寸 ≈ 0.7°~4°。**规划初稿按原版比例取 0.10~0.38 是错的**——实测实体亮核会大到 4~10°，星桥连成白雾；应先定「实体亮核目标角尺寸」再反推 quad 比例 |
-| `GLYPHS` | 半箭长 8 / 3.5 / 3 px | 三颗星（中央大 + 右上/左下小） |
-| `GLYPH_RIM` | 0.5 | 菱形核：内半段全亮 + AA 过渡，防爆亮 |
-| `GLYPH_ARM_LEN / ARM_W` | 1.8 / 0.12 | 细长十字臂（✦ 的尖芒）；首版臂 1.0s/0.16 在屏幕上不可见 |
+| `STAR_SIZE_MIN / MAX` | **0.015 / 0.08** | 角尺寸 ≈ 0.86°~4.6°。**第 2 轮从 0.04/0.22 再砍一个数量级**——首版星点还是太大太扎眼；现在星星只占画面很小的面积，亮度交给 instance color 控制 |
+| `DIM_SIZE_MAX` / `BRIGHT_SIZE_MIN` | 0.045 / 0.03 | 暗星一律偏小、亮星允许更大：亮度与尺寸弱相关 → 少数「主角星」+ 满屏细碎噪点 |
+| `DIM_RATIO` | **0.90** | 90% 暗星（灰 0.2~0.6）、10% 亮星（灰 0.8~1.0）；亮星里 15% 染成极淡冷蓝/暖黄 |
+| `GLYPHS` | 半箭长 11 / 5 / 4.5 px | 三颗星（中央大 + 右上/左下小） |
+| `GLYPH_CORE_R` / `GLYPH_FALLOFF` | **0.45 / 3.0** | 菱形核 = 曼哈顿距离场经 `pow(1 - d/0.45, 3)` 平滑衰减：**中心亮、边缘快速变暗**（不再是实心硬边） |
+| `GLYPH_ARM_LEN / ARM_W` / `GLYPH_ARM_BRIGHT` | 1.6 / 0.09 / **0.10** | 十字臂：极细极暗，远看几乎不可见，拉近才隐约是 ✦ 的四芒 |
+| `TEX_SIZE` + 3×3 盒式模糊 + 峰值归一化 | 64 | 模糊抹掉硬锯齿；归一化把被模糊削掉的中心亮度补回来（否则整片星空偏暗） |
 | `BACKGROUND` | `#10171E` | RadWorld 天空相机清色；写入 project.godot 的 default_clear_color |
+| `ATMOSPHERE_RADIUS`（`planet.gd`） | 1.081 | 大气辉光球壳半径 / 星球半径（= 原版 108.1/100） |
+| 辉光 `band_width` / `intensity` | 0.08 / 0.45 | = 原版 `_GlowRadius` 8/100；`a³` 三次方让带边缘迅速熄灭 |
 
-glyph 直观角尺寸核算：quad 4.6°~21.5° 最差，实体亮核 = 0.25×quad 角宽（2·(1−RIM)·s / 64px 贴图边）≈ 0.7°~4°，小点星到大 sparkle，与原版选点页观感一致。
+第 2 轮调校的核心认识：**原版 RimWorld 的星星本身就是「暗色噪点 + 少数亮星」**，
+不是「一堆亮十字」。首版之所以完全不像，是因为亮度维度根本没参与——
+所有星星的 ALBEDO 都是纯白，唯一的区分手段是几何大小，于是只能靠放大来「显得有层次」，
+结果就是刺眼的硬边白十字。第 2 轮把层次从「几何大小」搬到「instance color 的亮度」，
+几何就可以缩到很小很碎，刺眼感自然消失。
+
+> **instance color 的一个坑（务必记住）**：`MultiMesh.set_instance_color()` 是
+> **乘在网格顶点色上**的（引擎文档原话：*multiplying* the mesh's existing vertex colors）。
+> 若底网格没有顶点色，`COLOR` 恒为白 → 每颗星亮度相同 → 随机性彻底失效。
+> 所以 `star_dome.gd` 的 `_make_quad_mesh()` 显式给了一份**白色顶点色**。
+> 这一点在 GL Compatibility 的 `scene.glsl` 里能直接看到：
+> `color_interp = color_attrib_input; color_interp *= instance_color;`（仅当 `COLOR_USED`）。
+
 
 ### 4.3 关键实现语义（对照原版逐条列）
 
@@ -119,6 +143,40 @@ glyph 直观角尺寸核算：quad 4.6°~21.5° 最差，实体亮核 = 0.25×qu
 - 星穹跟随相机后，`focus_on` / 拖拽 / 缩放全都不会引起视差滚动，不需要任何额外对齐逻辑。
 - 选区球冠、水面、选中环、HUD 均不感知星空，零耦合。
 
+### 4.5 星球大气辉光（Rim Glow，第 2 轮新增）
+
+原版 RimWorld 星球外有一层半径 108.1（星球 100）的辉光壳，片元算法是
+**「视线到球心的最近距离 d」上开一条带**，而不是菲涅尔：
+
+```
+a = max(0, 1 - |(d - 100) / 8|)      → 半径 100 上下 8 宽的一圈
+intensity = a³ · (0.28·sun² + 0.02)  → 三次方让带边缘迅速熄灭
+color = (0.706, 0.839, 1)             → 偏蓝白
+Blend SrcAlpha One / ZTest Off / ZWrite Off
+```
+
+本项目对应实现（`atmosphere.gdshader` + `planet.gd` 的 `_build_atmosphere()`）：
+
+| 原版 | 本项目 | 说明 |
+| --- | --- | --- |
+| 球壳半径 108.1 / 星球 100 | `ATMOSPHERE_RADIUS = 1.081` × `PLANET_RADIUS` | 比例 1:1 照搬 |
+| `a = max(0, 1 - \|(d-100)/8\|)` | `a = max(0, 1 - \|(d-1)/0.08\|)` | 归一化到星球半径 1 |
+| `a³` | `a*a*a` | 同 |
+| 颜色 (0.706, 0.839, 1) | 同 | 偏蓝白 |
+| `Blend SrcAlpha One` | `blend_add` | 加法混合 |
+| `ZTest Off / ZWrite Off` | `depth_draw_never`（深度测试仍开） | 我们是单相机，深度测试留着更稳：辉光壳不写深度，不影响别的物体 |
+| 日照侧更亮（`sun²`） | 固定 `intensity` | 本项目无太阳/昼夜概念，留一个常量 |
+| — | `cull_front` | 只画球壳远侧半球：一层就够，不重复叠加 |
+
+**为什么不用菲涅尔（`1 - dot(N, V)`）**：菲涅尔在球壳上恒等于「壳自己的剪影」，
+只能把光画在壳的轮廓上——实测出来是一圈**边缘生硬的蓝色甜甜圈**（像贴纸，不像大气）。
+原版的「距离带」把光锁在**星球剪影**那一圈、内外两侧都平滑衰减，才是 RimWorld 观感里
+那圈柔和的蓝白边。参考图 2 的星球边缘光晕正是这种形态。
+
+**附带作用**：亮边压住背景星空的相对亮度，星空因此显得更深邃（这正是需求里
+「缺少星球大气光晕 → 星空不够深邃」的补偿项）。
+
+
 ---
 
 ## 5. 分期与工作量
@@ -130,9 +188,15 @@ glyph 直观角尺寸核算：quad 4.6°~21.5° 最差，实体亮核 = 0.25×qu
 
 **第 2 期（可选，等 1 期观感拍板后议）**
 - 太阳：无贴图加法 quad + 径向衰减 shader（原版 §5 的 Godot 对应形）；
-- 大气 rim 辉光：半径 1.081 球壳 + 日照侧 Fresnel（贴片 unshaded 前提下的纯视觉件）；
 - 引入一个"虚拟太阳方向"全局量，作为将来昼夜/季节系统的锚点——这是原版
   "先定太阳向量，再让光/太阳/星空全部从它派生"的做法，值得提前定接口。
+
+**第 2 轮调校（已实施：对标 RimWorld 原版截图）**
+- 贴图柔化：菱形核改 `pow` 平滑衰减 + 十字臂调细调暗 + 3×3 盒式模糊 + 峰值归一化；
+- 尺寸：quad 角尺寸从 2.3°~12.6° 砍到 **0.86°~4.6°**（`STAR_SIZE_MIN/MAX` = 0.015/0.08）；
+- 亮度随机性：`MultiMesh.set_instance_color()` + 底网格显式白色顶点色（第 2 轮的坑，见 §4.2）；
+- 大气辉光：新增 `atmosphere.gdshader`（距离带算法，对照原版 `Custom_PlanetGlow`）；
+- 护栏：冒烟脚本新增「亮度随机性」断言（共 7 项）。
 
 **明确不做**（与原版对齐，写进了规划避免歧义）：
 - 星星闪烁（原版 shader 无时间项）；
@@ -152,16 +216,24 @@ glyph 直观角尺寸核算：quad 4.6°~21.5° 最差，实体亮核 = 0.25×qu
 | 微信端 MultiMesh 兼容 | 个别低端机因 instance 数多掉帧 | STAR_COUNT 可降位（750 也几乎看不出差异）；draw call 始终 1，实际风险约等于零 |
 | 配置文件非 ASCII 注释乱码（实施中实踩） | project.godot 里中文注释被编辑管线破坏，注释与下一行键名黏成非法键，设置静默失效 | **project.godot/export_presets.cfg 这类引擎配置文件保持 ASCII-only**，中文说明写进脚本注释或文档；拼写修复后需重启编辑器让游戏重新读取 |
 | 编辑器回写覆盖陷阱 | 编辑器内存态旧版 + 保存动作会把外部改动整块冲掉 | 改project.godot 前先关编辑器（实施流程：quit → 改文件 → 验证 → 重启） |
+| **instance color 乘在顶点色上（第 2 轮实踩）** | 底网格没有顶点色 → `COLOR` 恒白 → 每颗星亮度相同，随机性彻底失效（且**不报错，肉眼才发现**） | 底网格显式给白色顶点色（`_make_quad_mesh()`）；冒烟脚本加断言兜住（`use_colors` + 暗星占比 ~0.90） |
+| **菲涅尔画不出大气（第 2 轮实踩）** | `1 - dot(N,V)` 在球壳上恒等于壳的剪影 → 一圈边缘生硬的蓝色甜甜圈 | 改用原版的「距离带」算法（§4.5）；辉光强度靠 `intensity` 调，不靠形状 |
+| **`ImageTexture.create_from_image()` 只收 1 个参数** | 传 mipmaps 布尔 → Parse Error | 4.7 的签名是 `create_from_image(image)`；mipmaps 由 `Image` 自己带（`create_empty(..., use_mipmaps=true)` + `generate_mipmaps()`） |
+| **`MultiMesh.set_instance_custom_data()` 收 Color 不收 Vector4** | 传 Vector4 → Parse Error | 4.7 签名是 `set_instance_custom_data(instance, custom_data: Color)` |
 
 ---
 
 ## 7. 验收标准（沿用本项目护栏风格）
 
-1. **视觉**：godot-ai 窗口截图——星空铺满背景、星球清晰遮挡星星、星点带大小差异与旋转差异、无闪烁；拉远到 10 与拉近到 1.15 两档截图各一张；
+1. **视觉**：godot-ai 窗口截图——星空铺满背景、星球清晰遮挡星星、星点带大小差异与旋转差异、无闪烁；拉远到 10 与拉近到 1.15 两档截图各一张。
+   **第 2 轮追加**：① 画面必须是「深邃黑底 + 细碎暗色噪点 + 极少数亮星」，
+   **绝不能再出现「巨大白色十字到处飘」**；② 星球边缘有一圈柔和的蓝白光晕（不是硬边蓝环）；
+   ③ 1.15 / 2.05 / 5.0 / 10.0 四档缩放都要成立。
 2. **确定性**：headless 冒烟——同 seed 两次 `build()` 的 MultiMesh transform 数组逐位一致；种子变化 → 布局变化；
-3. **无耦合回归**：星球生成打点（④/⑤ 段耗时）与生成结果逐位不变；选中环/拖拽/缩放/菜单全程无异常、拾取不受星穹影响；
-4. **性能**：星穹生成 < 10ms（一次性）；窗口与微信端帧率无回归；
-5. **包体**：`godot.zip` 增量 < 10KB（仅一张 64×64 贴图）。
+3. **亮度随机性**（第 2 轮新增）：`use_colors` 已开、暗星占比 ≈ 0.90、存在亮星（防止 instance color 静默失效）；
+4. **无耦合回归**：星球生成打点（④/⑤ 段耗时）与生成结果逐位不变；选中环/拖拽/缩放/菜单全程无异常、拾取不受星穹影响；
+5. **性能**：星穹生成 < 10ms（一次性）；窗口与微信端帧率无回归；
+6. **包体**：`godot.zip` 增量 < 10KB（仅一张 64×64 贴图）。
 
 ---
 

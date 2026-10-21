@@ -47,6 +47,35 @@ func _initialize() -> void:
 		return
 	print("PASS: 换种子布局变化（首个差异在 #", _snap_diff(snap_a, snap_c), "）")
 
+	# 3.5) 亮度/色温随机性：instance color 必须真的写进 MultiMesh，
+	# 且分布符合「九成暗星（灰 0.2~0.6）、一成亮星（灰 0.8~1.0）」。
+	# 这条是「星空不再一片死白」的核心护栏：use_colors 没开 / 颜色没写进去
+	# 都会让所有星星同亮，回归时肉眼极难发现，必须有自动断言兜住。
+	var colors := dome.snapshot_colors()
+	var dim := 0
+	var bright := 0
+	for c in colors:
+		var lum := (c.r + c.g + c.b) / 3.0
+		if lum <= StarDome.DIM_GRAY_MAX + 0.001:
+			dim += 1
+		elif lum >= StarDome.BRIGHT_GRAY_MIN - 0.001:
+			bright += 1
+	var total := colors.size()
+	var dim_ratio := float(dim) / float(total)
+	if not dome.multimesh.use_colors:
+		print("FAIL: MultiMesh.use_colors 未开启 —— instance color 不会生效")
+		quit(1)
+		return
+	if dim_ratio < 0.85 or dim_ratio > 0.95:
+		print("FAIL: 暗星占比异常 =", dim_ratio, "（期望 ~0.90）")
+		quit(1)
+		return
+	if bright == 0:
+		print("FAIL: 没有一颗亮星 —— 亮度随机性丢失")
+		quit(1)
+		return
+	print("PASS: 亮度随机性（暗星 ", dim, " / 亮星 ", bright, "，use_colors 已开）")
+
 	# 4) 方向分布：球面均匀 → 三轴均值≈0、方差相等。以原图位置还原单位方向后统计。
 	var sx := 0.0
 	var sy := 0.0
