@@ -13,7 +13,10 @@ func _generate_and_count(coverage: float) -> Dictionary:
 	# 分帧管线内部 await process_frame，星球必须在场景树里
 	var planet: Node3D = add_child_autofree(PLANET.new())
 	planet._init_noise(SEED)
-	await planet._build_goldberg_mesh_async(coverage)
+	# 选区球冠的中心方向：取 +Y（北极方向）。生成管线用它切出「扰动球冠」
+	# 作为可交互区域 —— 覆盖率与球冠中心无关（中心只挪位置，不改面积），
+	# 所以这里固定 +Y 即可（与 _on_generate_requested 传入的 _region_center 同型）。
+	await planet._build_goldberg_mesh_async(coverage, Vector3.UP)
 	var generated := 0
 	for flag in planet._generated:
 		if flag == 1:

@@ -25,6 +25,7 @@ extends Node3D
 
 const OrbitCameraScript := preload("res://orbit_camera.gd")
 const StarDomeScript := preload("res://star_dome.gd")
+const SunQuadScript := preload("res://sun_quad.gd")
 const WorldMenuScript := preload("res://world_menu.gd")
 const BiomeAtlasScript := preload("res://biome_atlas.gd")
 const HillsAtlasScript := preload("res://hills_atlas.gd")
@@ -44,6 +45,9 @@ const PLANET_RADIUS := 1.0
 # 球壳要包住辉光带的整个外尾：ATMOSPHERE_RADIUS ≈ 1 + 0.9 × band_width，
 # 否则带的尾巴被壳剪影硬切出一圈亮边——band_width 调整时这里必须跟着动）
 const ATMOSPHERE_RADIUS := 1.12
+# 大气光晕的透明绘制优先级：必须高于太阳（sun_quad.gd 的 10），
+# 对应原版材质队列 辉光 3001 > 太阳 1001（见 _build_atmosphere 的注释）。
+const ATMOSPHERE_RENDER_PRIORITY := 20
 
 # —— 生成管线的分帧预算：墙钟制 ——
 # 旧方案“每帧固定处理 N 项”在所有刷新率下都得凑整帧：帧间隔里的空转
@@ -171,6 +175,11 @@ var _selection_ring: MeshInstance3D       # 选中环：独立实例，切换选
 var _selection_material: ShaderMaterial   # 选中环材质（白光向内衰减，无呼吸）
 var _hud: TileHud                         # 贴片信息 HUD：选中贴片时亮出，取消选中即隐藏
 var _star_dome: StarDome                  # 背景星空：代码构建（种子驱动，见 star_dome.gd）
+var _sun_quad: SunQuad                    # 太阳：相机相对 quad + 零贴图加法 shader（见 sun_quad.gd）
+# 太阳方向：**唯一数据源**（规划文档 §5）。期 1 只有太阳本体消费它；
+# 期 3 的昼夜联动（大气日照侧、地表明暗）也从这一个向量派生 ——
+# 与原版「先定 sunDir，再让光/太阳/星空全部从它派生」同构。
+var _sun_dir := Vector3.FORWARD
 var _music: AudioStreamPlayer             # 背景音乐（These_Lands.ogg）：星球生成完毕后才开始播
 var _atmosphere: MeshInstance3D           # 星球大气光晕：半径 1.12× 的球壳（见 atmosphere.gdshader）
 
@@ -308,6 +317,14 @@ func _ready() -> void:
 	add_child(_star_dome)
 	_star_dome.build(0)
 
+	# 太阳：菜单相位就建好（方向先取默认值），生成世界时按种子换向
+	#（见 _on_generate_requested）。注意菜单本身是不透明全屏面板、
+	# 玩家看不到它 —— 太阳的首次可见时刻是生成完成、菜单收起的那一刻。
+	_sun_dir = SunQuadScript.DEFAULT_DIRECTION
+	_sun_quad = SunQuadScript.new()
+	add_child(_sun_quad)
+	_sun_quad.set_direction(_sun_dir)
+
 	# 背景音乐（These_Lands.ogg）：不自动播，等星球生成完毕后再由代码开播。
 	# 曲子是长循环的 BGM，导入参数已开 loop；这里再兜一次底（换资源时不失效）。
 	_music = get_node_or_null("StartMusic") as AudioStreamPlayer
@@ -378,6 +395,15 @@ func _on_generate_requested(params: Dictionary) -> void:
 		if child is OrbitCamera:
 			child.focus_on(_region_center)
 
+	# 太阳方向：由种子派生，锚在「生成后首屏」的视线旁（见 sun_quad.derive_direction）。
+	# 取焦点落定后的**真实镜头视线**（focus_on 里俯仰夹在 ±77°，
+	# 极端经纬下视线与 -_region_center 会有微小偏差，所以这里直接读相机的实际朝向）。
+	# 太阳必定落在首屏视野内、且贴着星球轮廓外侧；不然 80% 的种子会「太阳不在画面里」。
+	# 它是一个**世界方向**：之后玩家转镜头时太阳像真的那样在天空里移动
+	#（视差由「相机相对定位」消除）。
+	_sun_dir = SunQuadScript.derive_direction(params["seed"], _camera_fwd_dir())
+	_sun_quad.set_direction(_sun_dir)
+
 	print("星球生成完毕：种子 ", params["seed"],
 			"，覆盖率 ", roundi(params["coverage"] * 100), "%，总耗时 ",
 			Time.get_ticks_msec() - t0, " ms")
@@ -418,6 +444,12 @@ func _build_atmosphere() -> void:
 	sphere.rings = 32
 	var mat := ShaderMaterial.new()
 	mat.shader = ATMOSPHERE_SHADER
+	# 透明层叠次序：星空(0) → 太阳(10) → 大气光晕(20)。
+	# 对应原版的材质队列 星空 1000 < 太阳 1001 < 辉光 3001（参考文档 §2.2）：
+	# 太阳的光晕压在星点之上，而星点又先于辉光出现。
+	# 用 render_priority 显式钉死这个次序，不依赖「按距离排序」的隐式结果
+	#（星穹节点原点贴着相机，按距离排会得到相反的结论）。
+	mat.render_priority = ATMOSPHERE_RENDER_PRIORITY
 	_atmosphere = MeshInstance3D.new()
 	_atmosphere.mesh = sphere
 	_atmosphere.material_override = mat
