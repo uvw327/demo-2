@@ -74,7 +74,7 @@ const C_ICE := Color(0.93, 0.95, 0.97)    # 冰盖
 # （Ocean 卡备份），贴图 × macro × 顶点色与已生成海域逐像素一致，覆盖区边界
 # 无缝，不再出现与海洋对比强烈的浅蓝死海块；逻辑上它仍属于“未生成”，
 # 没有地形数据也不可交互（见 is_tile_interactable）。
-# 注：第 8 格与第 0 格都是「水格」→ shader 里 WorldMacro 振荡同样被摊平，
+# 注：第 8 格与第 0 格都是「水格」→ shader 里同走深海净色（+贴岸近白噪带），
 #     两格处理一致，逐像素一致的不变量不受影响。
 
 # ---- 群系 id 表：颜色与 HUD 显示同源（_biome_id 判定，BIOME_NAMES/ COLORS 查表）----
@@ -131,6 +131,16 @@ const COAST_WIGGLE := 0.22 # key 半径的噪声扰动幅度：海岸犬牙的�
 const COAST_TRANS := 0.25  # 过渡带宽度 = 区域角距 θ 的比例
 const COAST_KILL := 0.08   # 完全水下的带宽 = θ 的比例
 const COAST_DEPTH := 0.06  # 压死后的海底深度（海平面再往下压这么多）
+
+# ---- 近岸白噪带（参考 24-OceanShoreNoise.md，实现见 docs/planet_textures_plan.md §3⑥）----
+# 原版近岸“白色噪声” = 贴岸一圈的「色卡细颗粒 × WorldMacro + 白抬升」，深海被权重混成
+# 常量深海。不照抄它的高程公式（E∈[-320,0]）：我们的覆盖率边界把最外圈强行压到
+# SEA_LEVEL−COAST_DEPTH 的海底，高程做白带会沿世界边缘出现一圈**假白环**，破坏刚做好的
+# 覆盖区无缝。改为**离岸距离场**：贴片图上从陆地贴片多源 BFS（只在开放水域传播，
+# 海冰既不算岸也不传播），逐角点取汇于该角 3 贴片的距离均值 → 归一化 shore∈[0,1]
+# （1=岸线，0=深海），由 ⑤c 写进水贴片顶点色 a。深海 shore=0 → 走净色纯色逐位不变；
+# 陆地 a 仍是岩石量，shader 用图集格号区分，两义互不污染。
+const SHORE_BAND_HOPS := 3.0 # 带宽（离岸格数）：1 格 ≈1.1°，3 格 ≈ 贴岸一圈细亮边
 
 var _elev_noise: FastNoiseLite   # 海拔噪声
 var _humid_noise: FastNoiseLite  # 湿度噪声（决定沙漠/森林）
@@ -588,12 +598,13 @@ func _terrain_level(elev: float) -> TerrainLevel:
 
 
 # —— 贴片外观：顶点色 = 色调制器（不再输出最终色）——
-# 最终色由 shader 里「生态贴图 × WorldMacro × 这里返回的调制器」合成：
+# 最终色由 shader 里「生态贴图 ×（水格另有净色/近岸带处理）× 这里返回的调制器」合成：
 #   rgb = 明暗乘数（越高级的地形越暗，玩家肉眼能读出「哪里翻不过去」）
 #   a   = 往基岩色压的比例（shader 里向 ROCK_COLOR lerp；山区对半、不可逾越几乎纯岩）
-# 平原/水域 = 全白不动色（贴图原色直出）；海洋贴片的海色来自 Ocean.png，
-# 与地形数据无关。
-# （WorldMacro 在水格上只保留均值、不留振荡 —— 海面摊平，见 planet_surface.gdshader）
+# 平原/水域 = 全白不动色；海洋贴片的海色由 shader 的 ocean_flat/近岸白噪带给出。
+# ⚠️ 水贴片例外：a 会被 ⑤c 改载「近岸 shore」∈[0,1]（离岸距离场，逐角点插值）
+# ——陆地 a 是岩石量、水 a 是 shore，shader 用图集格号（v_is_water）区分，
+# 两义互不污染；水贴片恒为 FLAT（dark=1、rock=0），改载无冲突。
 func _tile_appearance(level: int) -> Color:
 	var dark := 1.0 # 明暗乘数
 	var rock_mix := 0.0 # 往基岩色压的比例
@@ -903,14 +914,20 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 	mesh_uv2.resize(total_corners)
 	var mesh_indices := PackedInt32Array()
 	mesh_indices.resize(3 * (total_corners - 2 * total))
-	var vert_cursor := 0 # 已写满的角点数（同时是下一块贴片的顶点基址）
-	var idx_cursor := 0  # 已写满的索引数
+	# 每贴片输出暂存（⑤ 循环只攒数据；网格数组在 ⑤b 距离场算完后由 ⑤c 统一写）：
+	#   col/cell 逐片常量；poly_tris = 按方位角排序后的「角点 → 角三角号」
+	#   （⑤c 查该贴片各角点的离岸 shore 平均值要用，不能丢）。
+	var tile_cols := PackedColorArray()
+	var tile_cells := PackedVector2Array()
+	var poly_tris: Array[PackedInt32Array] = []
 	# 每贴片复用的环排序暂存（角点数 ≤6）：省掉每贴片 1 次 Array 分配 +
 	# 6 次 append + 1 次 PackedFloat resize 的固定开销
 	var ring_buf: Array[Vector3] = []
 	ring_buf.resize(6)
 	var ang_buf := PackedFloat32Array()
 	ang_buf.resize(6)
+	var tri_buf: Array[int] = [] # 与 ring_buf 同序的角三角号（排序时同步搬移）
+	tri_buf.resize(6)
 	for v in total:
 		var axis := verts[v] # 已是单位向量
 		# 收集该点周围一圈三角形的重心（对偶多边形的顶点，③ 阶段已算好存表）；
@@ -922,6 +939,7 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		for ti in vert_rings:
 			var c := tri_cents[ti]
 			ring_buf[kc] = c
+			tri_buf[kc] = ti
 			cent_sum += c
 			kc += 1
 		# 把相邻面重心按“绕 axis 的方位角”排序，才能连成不自交的多边形。
@@ -934,13 +952,16 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		for kk in range(1, n):
 			var ca := ang_buf[kk]
 			var cp: Vector3 = ring_buf[kk]
+			var ct: int = tri_buf[kk]
 			var j := kk - 1
 			while j >= 0 and ang_buf[j] > ca:
 				ang_buf[j + 1] = ang_buf[j]
 				ring_buf[j + 1] = ring_buf[j]
+				tri_buf[j + 1] = tri_buf[j]
 				j -= 1
 			ang_buf[j + 1] = ca
 			ring_buf[j + 1] = cp
+			tri_buf[j + 1] = ct
 		# 缓存贴片边界顶点（单位球面，顺序与方位角排序一致）：点击选中时
 		# 用它们生成高亮环；索引与 _topo_verts/_terrain 一致。每贴片要私有
 		# 数组，不能用复用缓冲，按 n 精确拷出
@@ -949,6 +970,11 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		for kk in n:
 			poly[kk] = ring_buf[kk]
 		_tile_polys.append(poly)
+		var pt := PackedInt32Array()
+		pt.resize(n)
+		for kk in n:
+			pt[kk] = tri_buf[kk]
+		poly_tris.append(pt)
 
 		# 贴片颜色：未生成 → 深洋观感（第 8 格 Ocean 卡备份），不做地形噪声采样
 		#（这些贴片没有地形）；
@@ -961,9 +987,10 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		_tile_centers.append(tile_dir) # 中心缓存：丘陵 quad 按它定位（与 _tile_polys 同序）
 		var level := TerrainLevel.NOT_GENERATED
 		# 顶点色 = 色调制器（不再是最终色，最终色由「贴图 × macro × 它」合成）：
-		# 未生成 → 全白不动色、a=0 无岩石混合——恰与生成海域的 _tile_appearance(FLAT)
+		# 未生成 → 全白不动色、a 占位 0——恰与生成海域的 _tile_appearance(FLAT)
 		# 同值（且第 8 格也是 Ocean 卡）→ 三件套全对齐，覆盖区边界无亮度台阶。
-		# ⚠️ 不能用 Color.WHITE——它的 a=1，会把 a 当岩石混合量的 shader 推成纯基岩色
+		# ⚠️ 不能用 Color.WHITE——它的 a=1。
+		# 水贴片（海洋0/未生成）的 a 由 ⑤c 逐角点改载「近岸 shore」（陆地 a 保持岩石量）
 		var col := Color(1.0, 1.0, 1.0, 0.0)
 		# 图集格子原点（UV2）：未生成 → 第 8 格（Ocean 卡备份 = 遥远深洋）；
 		# 已生成 → 该片 biome 的格子
@@ -985,25 +1012,13 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 			col = _tile_appearance(level)
 			cell = _biome_cell_origins[biome]
 		_terrain[v] = level
-
-		# 每个贴片用一组“独占”顶点（不与其他贴片共享）→ 顶点色插值后整片均匀
-		var base := vert_cursor
-		for k in poly.size():
-			mesh_verts[base + k] = poly[k] * PLANET_RADIUS
-			mesh_colors[base + k] = col
-			mesh_uv2[base + k] = cell
-		# 凸多边形扇形三角化（五/六边形都是凸的）
-		for i in range(1, n - 1):
-			mesh_indices[idx_cursor] = base
-			mesh_indices[idx_cursor + 1] = base + i
-			mesh_indices[idx_cursor + 2] = base + i + 1
-			idx_cursor += 3
-		vert_cursor += n
+		tile_cols.append(col)
+		tile_cells.append(cell)
 
 		# 让出线程：每 ~512 贴片结一次墙钟，本帧吃满才让（批内零查钟）
 		if v % SLICE_CHECK_STRIDE == SLICE_CHECK_STRIDE - 1 or v == total - 1:
 			if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
-				await _slice_yield(34.0 + 63.0 * float(v + 1) / total)
+				await _slice_yield(34.0 + 57.0 * float(v + 1) / total)
 
 	# —— 地形分布统计（顺手把五级各有多少贴片打到日志里，调参数时好对照）——
 	var counts := {}
@@ -1015,7 +1030,124 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 			parts.append("%s %d" % [TERRAIN_NAMES[lv], counts[lv]])
 	var ungenerated: int = counts.get(0, 0)
 	print("地形分布：", "，".join(parts), "（已生成 ", total - ungenerated, " / ", total, " 贴片）")
-	t_stage = _stage_mark("⑤对偶贴片+网格", t_stage)
+	t_stage = _stage_mark("⑤对偶贴片", t_stage)
+
+	# ===== ⑤b 近岸离岸距离场（参考 24-OceanShoreNoise.md，见 docs/planet_textures_plan.md §3⑥）=====
+	# 邻接不必另建搜索表：对偶贴片共享一条棱 ⇔ 共享两个角三角；而每个角三角恰有
+	# 3 个汇入贴片 → 建 [角三角 → 3 贴片] 平表（tri_tiles），BFS 逐角三角扫 3 邻居。
+	# 种子 = 已生成陆地贴片（biome≥2，海冰/冰盖之外都是岸线）；只在开放水域
+	# （海洋 0 / 未生成 BIOME_NONE）传播；海冰(1) 不传播 —— 冰缘不出白噪带。
+	# 距离单位 = 贴片跳数（Goldberg 贴片尺寸高度均匀，跳数 ≈ 角距）。
+	var tri_tiles := PackedInt32Array()
+	tri_tiles.resize(tris.size() * 3)
+	var tri_cnt := PackedInt32Array()
+	tri_cnt.resize(tris.size())
+	var fill_at := 0
+	while fill_at < total:
+		var fill_end := mini(fill_at + SLICE_CHECK_STRIDE * 8, total)
+		for w in range(fill_at, fill_end):
+			for ti in vert_faces[w]:
+				tri_tiles[3 * ti + tri_cnt[ti]] = w
+				tri_cnt[ti] += 1
+		fill_at = fill_end
+		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(91.0 + 1.0 * float(fill_at) / float(total))
+
+	var shore_dist := PackedFloat32Array()
+	shore_dist.resize(total)
+	shore_dist.fill(-1.0) # -1 = 未访问（被冰封死的孤立水域视为深海，不出带）
+	var bfs_q := PackedInt32Array()
+	var bfs_head := 0
+	for w in total:
+		if explored[w] == 1 and _tile_biome[w] >= 2:
+			shore_dist[w] = 0.0
+			bfs_q.append(w)
+	while bfs_head < bfs_q.size():
+		# 普通队列 BFS：等权跳数 → FIFO 出队序即最短序，首次到达即最终距离
+		var q_end := mini(bfs_head + SLICE_CHECK_STRIDE * 8, bfs_q.size())
+		while bfs_head < q_end:
+			var u := bfs_q[bfs_head]
+			bfs_head += 1
+			var du := shore_dist[u] + 1.0
+			for ti in vert_faces[u]:
+				for s in 3:
+					var w2 := tri_tiles[3 * ti + s]
+					var bw2: int = _tile_biome[w2]
+					if bw2 != 0 and bw2 != BIOME_NONE: # 海冰/其他非水不传播
+						continue
+					if shore_dist[w2] < 0.0:
+						shore_dist[w2] = du
+						bfs_q.append(w2)
+		if bfs_head < bfs_q.size() and Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(92.5)
+
+	# 角点平均 → 归一化 shore（逐角三角一次算完，⑤c 直接查表）：
+	#   陆地 dist=0 参与均值 → 贴岸角点 shore 恰拉满 1；海冰不参与平均（冰缘不出带）；
+	#   未访问水域按深海（=带宽）处理 → shore 0。
+	#   shore = clamp((BAND − avg) / (BAND − 1), 0, 1)：首圈 avg=1 → 1，avg≥BAND → 0。
+	var corner_shore := PackedFloat32Array()
+	corner_shore.resize(tris.size())
+	var corner_at := 0
+	while corner_at < tris.size():
+		var corner_end := mini(corner_at + SLICE_CHECK_STRIDE * 16, tris.size())
+		for ti in range(corner_at, corner_end):
+			var ssum := 0.0
+			var cnt := 0
+			for s in 3:
+				var w2 := tri_tiles[3 * ti + s]
+				if _tile_biome[w2] == 1: # 海冰不参与角点平均
+					continue
+				var dv := shore_dist[w2]
+				ssum += dv if dv >= 0.0 else SHORE_BAND_HOPS
+				cnt += 1
+			var shore := 0.0
+			if cnt > 0:
+				shore = clampf((SHORE_BAND_HOPS - ssum / float(cnt))
+						/ (SHORE_BAND_HOPS - 1.0), 0.0, 1.0)
+			corner_shore[ti] = shore
+		corner_at = corner_end
+		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(93.5)
+	t_stage = _stage_mark("⑤b离岸距离场", t_stage)
+
+	# ===== ⑤c 写网格数组（逐角点：水贴片 a = 近岸 shore，其余照旧）=====
+	_progress(94.0)
+	var vert_cursor := 0 # 已写满的角点数（同时是下一块贴片的顶点基址）
+	var idx_cursor := 0  # 已写满的索引数
+	var write_at := 0
+	while write_at < total:
+		var write_end := mini(write_at + SLICE_CHECK_STRIDE, total)
+		for v in range(write_at, write_end):
+			var poly: PackedVector3Array = _tile_polys[v]
+			var n: int = poly.size()
+			var cell: Vector2 = tile_cells[v]
+			var col: Color = tile_cols[v]
+			var bw: int = _tile_biome[v]
+			# 水贴片 = shader 的水格（海洋 0 / 未生成 BIOME_NONE）→ a 改载 shore；
+			# 海冰(1)/陆地贴片保持岩石量语义（_tile_appearance 已给出）
+			var shore_water: bool = bw == 0 or bw == BIOME_NONE
+			var pts: PackedInt32Array = poly_tris[v]
+			# 每贴片用一组“独占”顶点 → 角点 shore 片内线性插值、跨片连续：
+			# 共享角点由同一组汇入贴片平均得出，两片必同值 → 无缝渐变（非等高线环）。
+			var base := vert_cursor
+			for k in n:
+				mesh_verts[base + k] = poly[k] * PLANET_RADIUS
+				var c := col
+				if shore_water:
+					c.a = corner_shore[pts[k]]
+				mesh_colors[base + k] = c
+				mesh_uv2[base + k] = cell
+			# 凸多边形扇形三角化（五/六边形都是凸的）
+			for i in range(1, n - 1):
+				mesh_indices[idx_cursor] = base
+				mesh_indices[idx_cursor + 1] = base + i
+				mesh_indices[idx_cursor + 2] = base + i + 1
+				idx_cursor += 3
+			vert_cursor += n
+		write_at = write_end
+		if write_at < total and Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(94.0 + 3.0 * float(write_at) / float(total))
+	t_stage = _stage_mark("⑤c网格写入", t_stage)
 
 	# ===== ⑥ 收尾：组装 ArrayMesh（让 97% 先画出来再干最后一下）=====
 	_progress(97.0)

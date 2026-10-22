@@ -135,26 +135,63 @@ func _run() -> void:
 	print("PASS: UV2 格子映射全对（已生成 ", checked_generated,
 			" + 未生成 ", checked_ungenerated, " 片抽查）")
 
-	# —— 5) 顶点色调制器语义：rgb = 明暗（平原 1.0），a = 岩石量 ∈ {0,0.4,0.8} ——
+	# —— 5) 顶点色调制器语义：陆地 rgb 灰阶乘数 + a∈{0,0.4,0.8} 岩石量；
+	# 水贴片 a 改载「近岸 shore」∈[0,1]（离岸距离场：贴岸 →1、深海 →0）——
 	var bad_col := -1
-	for i in cols.size():
-		var c: Color = cols[i]
-		var alpha_ok: bool = is_equal_approx(c.a, 0.0) \
-				or is_equal_approx(c.a, 0.4) or is_equal_approx(c.a, 0.8)
-		# 调制器是乘数/混合量，不该出现 >1 或负值
-		if not alpha_ok or c.r < 0.0 or c.r > 1.0 \
-				or not is_equal_approx(c.r, c.g) or not is_equal_approx(c.g, c.b):
-			bad_col = i
+	var shore_verts := 0   # a>0 的水片顶点数（岸带只出现在贴岸一圈，不该过宽）
+	var water_verts := 0
+	var max_shore := 0.0   # 岸线角点由「陆地=0 距离」参与均值 → 应被拉满（>0.5）
+	var n_tiles5: int = planet._tile_polys.size()
+	var base5 := 0
+	for t in n_tiles5:
+		var n5: int = planet._tile_polys[t].size()
+		# 水贴片判定与 planet.gd ⑤c 同一套：海洋 0 / 未生成 BIOME_NONE（海冰不算）
+		var is_shore_water: bool = planet._tile_biome[t] == 0 \
+				or planet._tile_biome[t] == planet.BIOME_NONE
+		for k in n5:
+			var c: Color = cols[base5 + k]
+			# 调制器是乘数/混合量，不该出现 >1 或负值；rgb 必须是灰阶
+			if not is_equal_approx(c.r, c.g) or not is_equal_approx(c.g, c.b) \
+					or c.r < 0.0 or c.r > 1.0:
+				bad_col = base5 + k
+				break
+			if is_shore_water:
+				water_verts += 1
+				if not is_equal_approx(c.r, 1.0): # 水片 rgb 恒全白不动色
+					bad_col = base5 + k
+					break
+				if c.a < 0.0 or c.a > 1.0:
+					bad_col = base5 + k
+					break
+				if c.a > 0.0:
+					shore_verts += 1
+				max_shore = maxf(max_shore, c.a)
+			else:
+				var alpha_ok: bool = is_equal_approx(c.a, 0.0) \
+						or is_equal_approx(c.a, 0.4) or is_equal_approx(c.a, 0.8)
+				if not alpha_ok:
+					bad_col = base5 + k
+					break
+		if bad_col >= 0:
 			break
+		base5 += n5
 	if bad_col >= 0:
 		print("FAIL: 顶点色调制器异常 @", bad_col, " = ", cols[bad_col])
 		_quit(1)
 		return
-	print("PASS: 顶点色调制器语义正确（灰阶乘数 + a∈{0,0.4,0.8} 岩石量）")
+	var ok_band: bool = shore_verts > 0 and max_shore > 0.5 \
+			and float(shore_verts) / float(maxi(water_verts, 1)) < 0.5
+	if not ok_band:
+		print("FAIL: 近岸 shore 场异常（带内顶点 ", shore_verts, "/", water_verts,
+				"，峰值 ", max_shore, "）")
+		_quit(1)
+		return
+	print("PASS: 顶点色调制器语义正确（灰阶/岩石量 + 水片 a=shore：",
+			"带内 ", shore_verts, "/", water_verts, " 顶点，峰值 %.2f）" % max_shore)
 
 	# —— 5b) 水格判定：UV2 → 格号反推（与 shader 的 vertex() 同一套公式）——
-	# shader 靠它决定该贴片要不要摊平 WorldMacro；判据错位 = 海面/陆地摊反了，
-	# 而且是**静默**的视觉 bug（不报错、只是海面出现斑块）。这里把公式原样复刻一遍：
+	# shader 靠它分流「深海净色 / 近岸白噪带 / 陆地」三路；判据错位 = 海面/陆地
+	# 搞反，而且是**静默**的视觉 bug（不报错、只是海面错色）。这里把公式原样复刻一遍：
 	#   格原点 = (GUTTER + (i%COLS)*cell)/aw → (origin - gutter_uv)/格距 = 格号
 	var cell_uv_v: Vector2 = atlas["cell_uv"]
 	var gutter_uv_v: Vector2 = atlas["gutter_uv"]
