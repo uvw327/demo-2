@@ -9,24 +9,33 @@ extends Node3D
 # 从画面上看与“拖着星球转”完全等价，且表面图案（顶点色/shader）天然稳定不漂移。
 # 触屏设备上上面板双投递去重：touchscreen 可用时忽略模拟出来的鼠标事件，
 # 只处理真实触摸事件，避免一次手指动作被记成两次输入。
+# 手感模型：拖动增益按“相机到地表深度 / 焦距”换算 → 被抓住的地表点与光标 1:1 同速，
+# 拉远拉近拖同样距离、星球在屏幕上转过的幅度一致；输入经 ROTATE_SMOOTHING 平滑后
+# 再交给相机（松手即停，无惯性），让行星读起来“有重量”而不是轻飘飘。
 
 # 一次“点按而非拖拽”的有效点击（屏幕坐标），拾取方据此做贴片选择
 signal view_tapped(screen_position: Vector2)
 
 const MIN_DIST := 1.15  # 最近限制：贴近到离地约 1/7 半径，能看清贴片细节但不穿模
 const MAX_DIST := 10.0 # 最远限制：再远就看不清了
-const DRAG_SENS := 0.005        # 拖动灵敏度：弧度/像素（此前 0.01 偏灵敏，轻拖就晃过头）
 const WHEEL_ZOOM := 0.1        # 单格滚轮的缩放幅度（factor = 1±WHEEL_ZOOM）
 const CLICK_MAX_DRAG_PX := 10.0 # 按下→抬起累计位移小于它才算“点”
 const CLICK_MAX_TIME := 0.45    # 点按最长按住时长（秒）
-const ROTATE_START_PX := 26.0   # 旋转死区：累计位移超过它才开始旋转（跟手前有一段“空行程”）
+const ROTATE_START_PX := 10.0   # 旋转死区：与点按阈值对齐，越线后补转“累计−阈值”的超出量
 const PINCH_MIN_DIST := 8.0     # 两指距离小于该像素数不参与捏合（防抖）
+const MIN_GRAB_DEPTH := 0.1     # 抓取深度（相机到地表）下限：贴地时防止增益爆炸
+const ROTATE_SMOOTHING := 0.05  # 拖动→相机的平滑时间常数（秒），给星球“重量感”但不拖沓
+const FALLBACK_DRAG_SENS := 0.005 # 取不到视口/相机时的兜底灵敏度（弧度/像素）
 
 var target := Vector3.ZERO # 环绕中心
 var dist := 2.05           # 相机到中心的距离（生成完星球刚好贴近看大陆）
-var yaw := 0.0             # 水平环绕角（弧度）
-var pitch := 0.0           # 俯仰角（弧度，0 = 平视）
+var yaw := 0.0             # 水平环绕角（弧度，实际值：由 _target_yaw 平滑收敛而来）
+var pitch := 0.0           # 俯仰角（弧度，0 = 平视，实际值：由 _target_pitch 收敛）
+var planet_radius := 1.0   # 被环绕天体半径：拖动 1:1 增益按“相机到地表深度”换算要用
 var dragging := false      # 中键（桌面备用）是否按住
+
+var _target_yaw := 0.0     # 输入直写的目标水平角（平滑器每帧向 yaw 收敛）
+var _target_pitch := 0.0   # 输入直写的目标俯仰角（平滑器每帧向 pitch 收敛）
 
 var cam: Camera3D
 
@@ -43,6 +52,26 @@ func _ready() -> void:
 	cam = Camera3D.new()
 	add_child(cam)
 	_update_cam()
+
+
+func _process(delta: float) -> void:
+	if cam == null:
+		return
+	# 平滑器：目标角 → 实际角的帧率无关指数收敛（时间常数 ROTATE_SMOOTHING）。
+	# 只有“显示值”滞后输入一点点，松手后目标不再变，残余差在几十毫秒内收敛完，
+	# 不保留任何角速度 → 松手即停（无惯性、无滑行）。
+	var k := 1.0 - exp(-delta / ROTATE_SMOOTHING)
+	var next_yaw := lerpf(yaw, _target_yaw, k)
+	var next_pitch := lerpf(pitch, _target_pitch, k)
+	# 差值足够小就直接落位，避免指数尾巴永远差着 1e-6 收不完
+	if absf(_target_yaw - next_yaw) < 1e-5:
+		next_yaw = _target_yaw
+	if absf(_target_pitch - next_pitch) < 1e-5:
+		next_pitch = _target_pitch
+	if next_yaw != yaw or next_pitch != pitch:
+		yaw = next_yaw
+		pitch = next_pitch
+		_update_cam()
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -146,21 +175,54 @@ func _track_move(delta: Vector2) -> float:
 
 # —— 相机运动 ——
 
+# 拖动增益（弧度/像素）：1:1 抓取模型。
+# 屏幕上地表的位移 = 角速度 × (焦距/地表深度)，要让被抓住的地表点与光标同速，
+# 增益就必须 = 地表深度 / 焦距：
+#   · 焦距 focal = 0.5·视口高 / tan(fov/2)（与 planet.gd 里像素换算同一口径）；
+#   · 深度 depth = 相机到地表 = dist − planet_radius（贴地时远小于 dist，
+#     这正是旧版“固定 0.005 弧度/像素”近地超调十几倍、拉远又拖不动的根因）。
+# 效果：任何距离上拖 N 像素，屏幕中心的地表就移动 N 像素（大位移时球面投影
+# 自然向轮廓线饱和，属几何必然，非代码失控）。
+func _drag_gain() -> float:
+	if cam == null:
+		return FALLBACK_DRAG_SENS
+	var view := get_viewport()
+	if view == null:
+		return FALLBACK_DRAG_SENS
+	var vp_h := view.get_visible_rect().size.y
+	if vp_h <= 0.0:
+		return FALLBACK_DRAG_SENS
+	var focal := 0.5 * vp_h / tan(deg_to_rad(cam.fov) * 0.5)
+	if focal <= 0.0:
+		return FALLBACK_DRAG_SENS
+	var depth := maxf(dist - planet_radius, MIN_GRAB_DEPTH)
+	return depth / (focal * maxf(planet_radius, 0.001))
+
+
+# 等效“抓住表面拖动”：左右拖 → 水平环绕；往下拖 = 低头看北极。
+# 写的是目标角，实际角由 _process 的平滑器收敛（手感“有重量”但不拖沓）。
 func _orbit_rotate(delta_px: Vector2) -> void:
-	# 等效“抓住表面拖动”：左右拖 → 水平环绕；往下拖 = 低头看北极
-	yaw -= delta_px.x * DRAG_SENS
-	pitch += delta_px.y * DRAG_SENS
+	var gain := _drag_gain()
+	_target_yaw -= delta_px.x * gain
 	# 俯仰限制在 ±86° 左右：接近 ±90° 时 look_at 的“上方”参考会失效
-	pitch = clampf(pitch, -1.5, 1.5)
-	_update_cam()
+	_target_pitch = clampf(_target_pitch + delta_px.y * gain, -1.5, 1.5)
 
 
-# 旋转入口（带死区）：位移超过 ROTATE_START_PX 才真正转动。
-# 累计位移记账放在死区内也照常进行，保证“点/拖”判定与旋转节奏解耦。
+# 旋转入口（带死区）：累计位移超过 ROTATE_START_PX 才开始转，
+# 且越线当帧把“累计 − 阈值”的超出量按当帧方向补转——死区期间的位移不再被丢弃，
+# 越过阈值时无跳变、也不留“空拖一段才动”的脱手感。
+# 累计位移记账在死区内也照常进行，保证“点/拖”判定与旋转节奏解耦。
 func _rotate(delta_px: Vector2) -> void:
 	var moved := _track_move(delta_px)
-	if moved > ROTATE_START_PX:
-		_orbit_rotate(delta_px)
+	if moved <= ROTATE_START_PX:
+		return
+	var credit_px := moved - ROTATE_START_PX
+	var step_px := delta_px.length()
+	if step_px <= 0.0001:
+		return
+	# 只取本帧位移里“越线”的那一小段（已越线阶段会 clamp 到整段，行为不变）
+	var scale := clampf(credit_px / step_px, 0.0, 1.0)
+	_orbit_rotate(delta_px * scale)
 
 
 func _zoom(factor: float) -> void:
@@ -193,6 +255,9 @@ func _update_cam() -> void:
 # look_at 的上方向恒为 +Y，北极在画面上始终朝上。
 func focus_on(dir: Vector3) -> void:
 	var d := dir.normalized()
-	yaw = atan2(d.x, d.z)
-	pitch = clampf(asin(clampf(d.y, -1.0, 1.0)), -1.35, 1.35)
+	# 目标角与实际角一起落位：换镜头是一次性跳转，不走拖动平滑（否则会从旧角度慢慢扫过来）
+	_target_yaw = atan2(d.x, d.z)
+	_target_pitch = clampf(asin(clampf(d.y, -1.0, 1.0)), -1.35, 1.35)
+	yaw = _target_yaw
+	pitch = _target_pitch
 	_update_cam()

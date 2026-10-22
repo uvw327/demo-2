@@ -297,6 +297,8 @@ func _ready() -> void:
 	# 轨道相机控制器：桌面左键/中键拖拽 + 滚轮，触屏单指拖拽 + 双指捏合；
 	# 短按不动（点按）经 view_tapped 转发到这里做贴片拾取
 	_orbit = OrbitCameraScript.new()
+	# 半径传给相机：拖动 1:1 增益按“相机到地表深度”换算（见 orbit_camera._drag_gain）
+	_orbit.planet_radius = PLANET_RADIUS
 	add_child(_orbit)
 	_orbit.view_tapped.connect(_on_view_tapped)
 
