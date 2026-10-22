@@ -347,12 +347,13 @@ func _on_generate_requested(params: Dictionary) -> void:
 	# 区域中心 = 生成这一刻镜头正对的方向：球冠围着玩家看到的半球长
 	#（贴镜头、天然不落在极点），生成后镜头对准同一方向，零校准。
 	_region_center = _camera_fwd_dir()
-	# 太阳方向：由种子派生，锚在「生成后首屏」的视线旁（见 sun_quad.derive_direction）。
+	# 太阳方向：由种子派生，锚在「生成后首屏」的视线**背后**（见 sun_quad.derive_direction）。
 	# 锚点用 focus_on(_region_center) 之后镜头的真实朝向（forward_after_focus
 	# 与 focus_on 共用同一套夹取逻辑，逐位一致）——这样即使玩家在生成过程中
 	# 拖动镜头，首屏构图也不受影响。
 	# 它是一个**世界方向**：之后玩家转镜头时太阳像真的那样在天空里移动
-	#（视差由「相机相对定位」消除）。
+	#（视差由「相机相对定位」消除）。首屏它整个在视锥之外 —— 画面干净，
+	# 玩家绕到星球另一侧才会看到它从边缘升出来。
 	_sun_dir = SunQuadScript.derive_direction(
 			params["seed"], _orbit.forward_after_focus(_region_center))
 	# 星空：同种子同星图（换种子生成才会重铺；同种子短路时星穹保持不动）。

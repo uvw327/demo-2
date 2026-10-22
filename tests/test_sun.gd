@@ -4,8 +4,8 @@ extends GutTest
 # 2) 尺寸不脱钩——quad 边长 = 距离 × 比例（原版 SunDrawSize 死常量陷阱的教训）；
 # 3) 相机相对——每帧位置 = 相机位置 + 方向 × 距离（角尺寸恒定、无视差）；
 # 4) 方向确定性——同种子同方向、换种子换方向；
-# 5) 取景——太阳必须落在**屏幕内**（NDC 判据，不是「3D 夹角 vs 竖直半 FOV」
-#    这种错口径），且不被星球整个挡住；
+# 5) 取景——太阳必须**藏在首屏镜头后面**（NDC 判据，不是「3D 夹角 vs 竖直半 FOV」
+#    这种错口径），但转镜头后必须能找到它（且不被星球整个挡住）；
 # 6) 零耦合——太阳不进拾取（纯数学射线只与单位球求交）。
 #
 # 投影全部在测试里独立重算（手写「视线 → NDC」），不复用实现里的公式，避免自证。
@@ -18,8 +18,6 @@ const DOME := preload("res://star_dome.gd")
 # 相机参数：与 orbit_camera 一致（Camera3D 默认 fov 75，project.godot 视口 16:9）
 const FOV_DEG := 75.0
 const ASPECT := 1280.0 / 720.0
-# 生成后镜头的默认距离（orbit_camera.dist 初值 2.05）
-const DEFAULT_DIST := 2.05
 # 星球最远视距（orbit_camera.MAX_DIST）+ 星球半径（planet.gd.PLANET_RADIUS）
 const MAX_PLANET_REACH := 10.0 + 1.0
 
@@ -39,26 +37,80 @@ func _to_ndc(dir_world: Vector3, fwd: Vector3) -> Vector2:
 	return Vector2(dir_world.dot(right) / z / tan_h, dir_world.dot(up) / z / tan_v)
 
 
-# 取景保证：① 太阳落在首屏画面内；② 不被星球整个挡住（此时星球只挡住一部分光晕）。
-func test_sun_direction_is_on_screen_and_clear_of_planet() -> void:
-	var fwd := Vector3(0.0, 0.0, -1.0)  # 生成后镜头的视线方向
-	# 星球在首屏的视角半径（球心角半径）：默认距离下约 29°
-	var planet_ang := rad_to_deg(asin(PLANET.PLANET_RADIUS / DEFAULT_DIST))
+# 取景保证（期 3 的用户诉求）：**首屏画面里看不到太阳**。
+# 太阳是纯加法混合的强光源，开局就怼在画面里会晃眼、抢走
+# 「星球才是主角」的注意力 → 藏在镜头正后方，玩家转镜头才能找到。
+#
+# 判据：太阳方向与首屏视线的夹角必须 **大于视锥半对角**（≈54°），
+# 即整个太阳（连光晕）都在画面外，而不是「勉强卡在边缘」。
+func test_sun_is_hidden_behind_camera_in_opening_frame() -> void:
+	var fwd := Vector3(0.0, 0.0, -1.0)  # 生成后首屏的视线方向
+	# 视锥半对角：16:9 下水平半视场 tan(tan(37.5°)*16/9) → 水平半角
+	var half_h := rad_to_deg(atan(tan(deg_to_rad(FOV_DEG) * 0.5) * ASPECT))
+	var half_v := FOV_DEG * 0.5
+	# 角半径 = 太阳方片的角半径（光晕可见圆盘边缘）
+	var disc_ang := rad_to_deg(atan((SUN.SUN_QUAD_SIZE * 0.5) / SUN.SUN_DIST))
 	for seed_value: int in [1, 42, 4242, 90210, 2026]:
 		var d: Vector3 = SUN.derive_direction(seed_value, fwd)
 		assert_almost_eq(d.length(), 1.0, 0.0001,
 				"太阳方向应是单位向量（seed=%d）" % seed_value)
-		# ① 屏幕内：NDC 必须在 ±1 内
-		var ndc := _to_ndc(d, fwd)
-		assert_lt(absf(ndc.x), 1.0,
-				"太阳必须横向落在画面内（seed=%d，ndc.x=%.2f）" % [seed_value, ndc.x])
-		assert_lt(absf(ndc.y), 1.0,
-				"太阳必须纵向落在画面内（seed=%d，ndc.y=%.2f）" % [seed_value, ndc.y])
-		# ② 星球挡不住整个太阳：太阳中心与视线的夹角 > 星球视角半径
+		# ① 太阳整个在画面外：中心与视线的夹角 > 视锥半对角 + 光晕角半径
 		var ang := rad_to_deg(d.angle_to(fwd))
-		assert_gt(ang, planet_ang,
-				"太阳不能正落在星球后面（seed=%d，%.1f° vs 星球 %.1f°）"
-				% [seed_value, ang, planet_ang])
+		var limit := maxf(half_h, half_v) + disc_ang
+		assert_gt(ang, limit,
+				"首屏必须看不到太阳（seed=%d，夹角 %.1f°，需 > %.1f°）"
+				% [seed_value, ang, limit])
+		# ② 太阳在镜头**背后**（不是被星球挡住，而是在视锥外）
+		assert_lt(d.dot(fwd), 0.0,
+				"太阳必须位于镜头后方（seed=%d）" % seed_value)
+
+
+# 但它必须「转得到」——否则就是永远找不到了，那才是真的藏没了。
+#
+# 这里**如实建模真实的绕轨相机**（不是假想的自由视角）：
+#   相机始终位于星球中心外 dist 处、**永远看向星球中心**，
+#   所以视线方向 f = -normalize(cam_pos)，而 cam_pos 由 (yaw, pitch) 决定。
+# 太阳是**世界方向固定**的（太阳方片贴在相机前方 SUN_DIST 处），
+# 于是它相对视线的夹角 = angle(d, f)，随玩家绕轨而扫过整个天空。
+#
+# 「能看见太阳」的判据（两个都要满足）：
+#   ① 在画面内：NDC ∈ ±1；
+#   ② 没被星球挡住：angle(d, f) > 星球角半径 asin(R/dist)。
+# 注意②意味着：镜头**正对**太阳时，星球恰好挡在中间 → 全食，
+# 只能看到一圈日冕（这正是原版世界视图的常态）。真正能看见日面的，
+# 是绕到星球另一侧、太阳从边缘「升起来」的那一段。
+func test_sun_becomes_visible_when_camera_turns_toward_it() -> void:
+	var fwd := Vector3(0.0, 0.0, -1.0)
+	var dist := 2.05                       # orbit_camera.dist 初值（最坏情况：星球最大）
+	var planet_ang := rad_to_deg(asin(PLANET.PLANET_RADIUS / dist))
+	for seed_value: int in [1, 42, 4242, 90210, 2026]:
+		var d: Vector3 = SUN.derive_direction(seed_value, fwd)
+		var found := false
+		var found_off := 0.0
+		# 扫真实相机的 (yaw, pitch) 参数空间（orbit_camera 的俯仰上限 ≈ ±86°）
+		for yaw_deg: int in range(0, 360, 2):
+			for pitch_deg: float in [-77.0, -45.0, -20.0, 0.0, 20.0, 45.0, 77.0]:
+				var yaw := deg_to_rad(float(yaw_deg))
+				var pitch := deg_to_rad(pitch_deg)
+				# 与 orbit_camera._update_cam 同一套球坐标公式
+				var cam_pos := Vector3(cos(pitch) * sin(yaw), sin(pitch), cos(pitch) * cos(yaw))
+				var cam_fwd := -cam_pos.normalized()   # 始终看向星球中心
+				var off := rad_to_deg(cam_fwd.angle_to(d))
+				if off <= planet_ang:
+					continue                          # 被星球挡住
+				var ndc := _to_ndc(d, cam_fwd)
+				if absf(ndc.x) < 1.0 and absf(ndc.y) < 1.0:
+					found = true
+					found_off = off
+					break
+			if found:
+				break
+		assert_true(found,
+				"转镜头必须能找到太阳（seed=%d：绕轨一圈没有任何朝向能同时满足「在画面内」与「不被星球挡住」）"
+				% seed_value)
+		# 找到时它应当是个「立得住」的太阳：离视轴 30°~54°，亮核露在星球外
+		assert_gt(found_off, planet_ang,
+				"找到太阳时它不能还在星球背后（seed=%d，%.1f°）" % [seed_value, found_off])
 
 
 # 同种子 → 同方向（确定性）；换种子 → 方向变化

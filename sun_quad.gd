@@ -40,20 +40,23 @@ const SUN_QUAD_SIZE := SUN_DIST * SUN_SIZE_RATIO
 # 用 render_priority 显式压住星穹。数值越大越晚绘制（= 越靠上）。
 const SUN_RENDER_PRIORITY := 10
 
-# —— 取景参数：太阳相对「首屏视线」的偏角 ——
-# 方位角：±33°~45°（左右由种子随机）。下限必须大于星球圆面的视角半径
-# （默认距离 2.05 下约 29°），否则白色亮核会被星球整个挡住；上限受
-# 16:9 水平半视场（约 54°）约束，再远就出画。
-const AZIM_MIN := 33.0
-const AZIM_MAX := 45.0
-# 仰角：8°~22°——把太阳抬到画面上方，别贴着星球轮廓。
-const ELEV_MIN := 8.0
-const ELEV_MAX := 22.0
+# —— 取景参数：太阳藏在镜头后面 ——
+# 首屏（生成完成的第一帧）**看不到**太阳：玩家必须转动镜头到对应方向才能找到它。
+# 理由：太阳是纯加法混合的强光源，开局就怼在画面里会晃眼、抢走
+# 「星球才是主角」的注意力；藏起来则成了玩家主动探索才能发现的彩蛋。
+#
+# 基准 = 首屏视线的**正后方**（方位角 180°）→ 太阳整个在视锥之外，
+# 连一丝光晕都漏不进画面。左右再加 ±22° 随机：不同世界的太阳藏在
+# 不同侧后方，转镜头去找它的手感不一样。
+const HIDE_AZIM := 180.0        # 基准方位角（相对首屏视线；180 = 正后方）
+const AZIM_JITTER := 22.0       # ±22° 方位抖动
+const ELEV_JITTER := 18.0       # ±18° 仰角抖动
 # 种子异或常量："SUN1" → 独立随机流（不碰星球噪声/星穹的随机流）
 const SEED_XOR := 0x53554e31
-# 菜单相位（还没生成星球）的默认方向：相对默认镜头（前视 -Z）右偏 40°、上抬 15°。
-# 也就是「菜单背后那片天空里有一颗太阳」，生成世界后再按种子换成新方向。
-const DEFAULT_DIRECTION := Vector3(0.621, 0.259, -0.740)
+# 菜单相位（还没生成星球）的默认方向：相对默认镜头（前视 -Z）**正后方**偏 ~21°。
+# 菜单本身是不透明全屏面板、玩家看不到天空，但保持「太阳不抢戏」的一致性，
+# 且菜单相位的星空收缩区也跟着躲在背后。
+const DEFAULT_DIRECTION := Vector3(0.30, 0.21, 0.93)
 
 # —— 期 2：光晕圆盘内的星星缩小（原版 WorldLayer_Stars.cs:63-68）——
 # 原版判据：dot(starDir, sunDir) > 0.8 → size *= LerpDouble(0.8,1,1,0.35,dot)
@@ -147,24 +150,31 @@ func follow(cam_pos: Vector3) -> void:
 	global_position = cam_pos + direction * SUN_DIST
 
 
-# 种子 → 太阳方向：落在「首屏视线」旁的取景里。
-# view_fwd = 生成后镜头的视线方向（focus_on(_region_center) 之后，
+# 种子 → 太阳方向：**藏在首屏镜头后面**。
+# view_fwd = 生成后首屏的视线方向（focus_on(_region_center) 之后，
 # 视线 = -_region_center，见 planet.gd）。
+# 方位角 180°±22°（= 视线的正后方）、仰角 ±18° → 太阳整个在视锥之外
+# （实测夹角 140°~180°，而视锥半对角才 ~54°），首屏一帧不露；
+# 玩家转动镜头到对应方向才会找到。
 # 确定性：同一 seed 永远得到同一方向（独立随机流，不碰星球噪声）。
+#
+# ★ 关键几何（已实测）：太阳是**世界方向固定**的，而相机永远看向星球中心。
+#   于是「太阳离视轴多远」只取决于玩家绕到哪一边：
+#     · 相机在太阳这一侧 → 太阳在镜头背后（首屏状态，完全看不见）；
+#     · 相机正对太阳   → 星球恰好挡在中间 → 全食，只见一圈日冕；
+#     · 相机绕到侧后方 → 太阳偏出星球边缘，日面完整可见（就是「找到它」那一刻）。
+#   「可见窗口」= 视线与太阳夹角 ∈ (星球角半径 ~29°, 视锥半角 ~54°)。
+#   这与原版世界视图同构：太阳是远处的固定光源，绕轨过去才能看见它。
 static func derive_direction(seed_value: int, view_fwd: Vector3) -> Vector3:
 	var rng := RandomNumberGenerator.new()
 	rng.seed = seed_value ^ SEED_XOR
-	var az := rng.randf_range(AZIM_MIN, AZIM_MAX)
-	if rng.randf() < 0.5:
-		az = -az
-	var el := rng.randf_range(ELEV_MIN, ELEV_MAX)
+	var az := deg_to_rad(HIDE_AZIM + rng.randf_range(-AZIM_JITTER, AZIM_JITTER))
+	var el := deg_to_rad(rng.randf_range(-ELEV_JITTER, ELEV_JITTER))
 	var f := view_fwd.normalized()
 	# 视线的「屏幕右 / 屏幕上」基（f 与竖直轴共线时换参考轴，避免退化）
 	var up_ref := Vector3.UP if absf(f.dot(Vector3.UP)) < 0.99 else Vector3.RIGHT
 	var right := f.cross(up_ref).normalized()
 	var up := right.cross(f).normalized()
-	var az_r := deg_to_rad(az)
-	var el_r := deg_to_rad(el)
-	return (f * cos(el_r) * cos(az_r)
-			+ right * cos(el_r) * sin(az_r)
-			+ up * sin(el_r)).normalized()
+	return (f * cos(el) * cos(az)
+			+ right * cos(el) * sin(az)
+			+ up * sin(el)).normalized()
