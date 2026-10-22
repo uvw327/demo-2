@@ -140,7 +140,7 @@ const COAST_DEPTH := 0.06  # 压死后的海底深度（海平面再往下压这
 # 海冰既不算岸也不传播），逐角点取汇于该角 3 贴片的距离均值 → 归一化 shore∈[0,1]
 # （1=岸线，0=深海），由 ⑤c 写进水贴片顶点色 a。深海 shore=0 → 走净色纯色逐位不变；
 # 陆地 a 仍是岩石量，shader 用图集格号区分，两义互不污染。
-const SHORE_BAND_HOPS := 3.0 # 带宽（离岸格数）：1 格 ≈1.1°，3 格 ≈ 贴岸一圈细亮边
+const SHORE_BAND_HOPS := 4.0 # 带宽（离岸格数）：1 格 ≈1.1°，4 格 ≈4.4° ≈ 参考图雾斑宽度（仍够不到覆盖区强制浅滩外缘，无假白环）
 
 var _elev_noise: FastNoiseLite   # 海拔噪声
 var _humid_noise: FastNoiseLite  # 湿度噪声（决定沙漠/森林）

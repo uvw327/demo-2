@@ -6,9 +6,9 @@ shader_type spatial;
 //        陆地/海冰/冰盖全保留；深海不带（净色，ocean_macro 调节档），
 //        近岸带内按 shore_macro 打折，见下方近岸白噪带）
 //   × ③ 顶点色调制器（贴片级地形明暗 + 山体基岩混合；水格的 a 另载近岸 shore）
-//   ＋ ④ 近岸白噪带（只有水格：贴岸一圈「海色提亮去饱和 × 带内云斑 +
-//        白抬升·程序化 foam 碎粒」，数据由 planet.gd ⑤b 的离岸距离场给出，
-//        写在水贴片顶点色 a 里；参考 24-OceanShoreNoise.md，
+//   ＋ ④ 近岸白噪带（只有水格：贴岸一圈软雾状白色云斑，fBm 值噪声云调制
+//        向浅蓝白的 mix、外缘随云撕裂；数据由 planet.gd ⑤b 的离岸距离场给出，
+//        写在水贴片顶点色 a 里；参考 24-OceanShoreNoise.md 与用户贴图，
 //        见 docs/planet_textures_plan.md §3⑥）
 // unshaded：颜色全部由上面三层给出，不受场景光照影响。
 // cull_disabled：双面渲染（沿用原实现——放大穿进去看时内壁也有颜色）。
@@ -60,27 +60,27 @@ uniform vec3 ocean_flat = vec3(0.2328, 0.2765, 0.3590);
 // —— 近岸白噪带（参考 24-OceanShoreNoise.md，实现见 docs/planet_textures_plan.md §3⑥）——
 // 数据侧（planet.gd ⑤b）：离岸距离场 BFS → 归一化 shore∈[0,1] 写进水贴片
 // 顶点色 a（1=岸线，0=深海，逐顶点插值、跨片连续）；深海 a=0 走净色纯色逐位
-// 不变，带只在贴岸一圈出现。带内三层配方：海色提亮/去饱和 × 带内宏观云斑 +
-// 白抬升（含程序化 foam 碎粒）。
-// 白抬升最大量（岸线处）：三通道等量相加 → 提亮去饱和的「感知白」，
-// 不是纯白 RGB。原版同值 0.07 —— 我们 0.11：碎粒只存在带内，默认值按
-// 2026-10-22 游戏内调参截图（band_coast_hot.png，白点清晰、深海不脏）定。
-uniform float shore_lift = 0.11;
-// foam 碎粒强度：每颗碎粒在白抬升上的随机提亮倍数（0 = 只剩均匀白基座，
-// 1 = 碎粒峰值约 1.45×）。碎粒是 3D 格 hash 程序化圆点（见 fragment 水格分支）；
-// 默认 1.4 同上轮调参。
-uniform float shore_speck = 1.4;
+// 不变，带只在贴岸一圈出现。带内配方：fBm 软雾云斑（云状亮度调制 + 外缘
+// 撕裂）+ 带内宏观云斑，整体向浅蓝白 PALE_TINT 做 mix 白抬升。
+// 白雾强度上限：岸线处向浅蓝白 PALE_TINT 的 mix 比例（0=不加白，1=岸线满白）。
+// 默认 0.85 由游戏内热调对齐参考图（mist_tune_C_strong 截图，雾块斑驳不刺眼）定稿。
+uniform float shore_lift = 0.85;
+// 云斑频率（作用在球面方向 n 上的 fBm 基频）：特征 ≈57.3/freq 度/格，freq 12 ≈
+// 4.8°，随 3 octave 减半 → 最细 ~1.2° ≈ 贴片一格以内（撕裂感来源）。
+uniform float shore_cloud_freq = 12.0;
+// 外缘撕裂幅度：0 = 平滑圆环渐隐，1 = 云完全接管边缘（局部向海伸出）。
+// 只调制 s>0 区域；s=0（深海/覆盖率边界外）恒归零，无缝不变量不受影响。
+uniform float cloud_edge = 0.9;
+// 云斑对比度：对 fBm 输出做 (c-0.5)*k+0.5 拉伸——1 = 原始柔和，
+// >1 边界更撕裂、明暗更斑驳（参考图那种雾块感靠它，定稿 3.0）。
+uniform float cloud_contrast = 3.0;
 // 带内 WorldMacro 权重：低频云斑让白带呈泡沫状明暗（0 = 只剩均匀细颗粒）。
 // 只作用在带内，深海照旧净色 —— 与 ocean_macro 的全局旋钮互不相干。
 uniform float shore_macro = 0.6;
 // 总开关：0 = 关掉整条岸带（海面回到纯净色）。现场可调，零改码。
 uniform float shore_strength = 1.0;
-// foam 碎粒的 3D 格频（立方体面每 1 单位 [0,1] 里的碎点格数 → 每面 ~176 格）。
-// 先粗算：贴片 ≈1°，面 ≈90° → 1 格 ≈ 90/176 ≈ 0.5° ≈ 陆地贴片半格 —— 海面
-// 碎粒比陆地岩点更细，读作泡沫碎粒而非网格。
-const float GRAIN_FREQ = 176.0;
-// 白抬升沿带衰减的曲线指数：越大 → 亮边越窄越贴岸线（原版近似 2）。
-const float SHORE_LIFT_GAMMA = 2.0;
+// 白雾的目标色：参考图那种去饱和的浅蓝灰白（不是纯白 RGB）。
+const vec3 PALE_TINT = vec3(0.66, 0.70, 0.76);
 
 // 顶点色 = 色调制器：rgb = 明暗乘数（1.0 = 原亮度），a = 岩石混合量。
 varying vec4 v_tile_color;
@@ -122,12 +122,40 @@ vec2 box_project(vec3 n) {
 	return n.xy / a.z;
 }
 
-// 3D 格 hash → [0,1)：foam 碎粒的随机源。作用在 box 投影坐标上，跨切轴/
-// 贴片边界天然无缝（标准 hash13，无第三方依赖）。
+// 3D 格 hash → [0,1)：软雾云斑噪声的随机源。作用在球面方向坐标上，
+// 跨切轴/贴片边界天然无缝（标准 hash13，无第三方依赖）。
 float hash13(vec3 c) {
 	c = fract(c * 0.1031);
 	c += dot(c, c.zyx + 31.32);
 	return fract((c.x + c.y) * c.z);
+}
+
+// 三线性插值值噪声（smoothstep 插值八角点）→ 连续软云的基础砖。
+float vnoise(vec3 x) {
+	vec3 i = floor(x);
+	vec3 f = fract(x);
+	f = f * f * (3.0 - 2.0 * f);
+	float n000 = hash13(i);
+	float n100 = hash13(i + vec3(1.0, 0.0, 0.0));
+	float n010 = hash13(i + vec3(0.0, 1.0, 0.0));
+	float n110 = hash13(i + vec3(1.0, 1.0, 0.0));
+	float n001 = hash13(i + vec3(0.0, 0.0, 1.0));
+	float n101 = hash13(i + vec3(1.0, 0.0, 1.0));
+	float n011 = hash13(i + vec3(0.0, 1.0, 1.0));
+	float n111 = hash13(i + vec3(1.0, 1.0, 1.0));
+	return mix(mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+			mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y), f.z);
+}
+
+// 3 octave fBm → 归一到约 [0,1]：低频云块 + 中频斑驳 + 高频碎边。
+// 频率缩放用 2.03/2.01（非整数倍）避免八度对齐成规则网格。
+float fbm3(vec3 x) {
+	float r = 0.5 * vnoise(x);
+	x = x * 2.03 + 11.7;
+	r += 0.25 * vnoise(x);
+	x = x * 2.01 + 3.9;
+	r += 0.125 * vnoise(x);
+	return r * (1.0 / 0.875);
 }
 
 void fragment() {
@@ -155,33 +183,32 @@ void fragment() {
 	// 但水格的 a 载的是「近岸 shore」（离岸距离场），岩石混合只对陆地生效。
 	float rock = v_tile_color.a * (1.0 - v_is_water);
 	vec3 tinted = mix(base * v_tile_color.rgb, ROCK_COLOR, rock);
-	// —— 水格：深海净色 + 近岸白噪带（有意偏离原版，见 docs/planet_textures_plan.md §3⑤⑥）——
+	// —— 水格：深海净色 + 近岸软雾白噪带（有意偏离原版，见 docs/planet_textures_plan.md §3⑤⑥）——
 	// 深海 = ocean_flat × macro_water（现状净色，ocean_macro 旋钮照旧有效）。
-	// 近岸带（顶点色 a 载 shore，1=岸线）三层配方：
-	//   ① 海色提亮/去饱和（原版 t^1.5 权重曲线 + k=1−0.2t），
-	//   ② 带内宏观云斑（shore_macro 权重，泡沫状低频明暗），
-	//   ③ 白抬升 + 程序化碎粒 foam 斑点（岸线最大、沿带宽衰减）。
-	// 碎粒不走色卡：Ocean 卡只有 256²，高平铺 + mip 会把细颗粒抹成一阶常数 tint
-	// （实测 shore_grain 2.5→8.0 截图无差异）；原版是 2048² 卡才撑得住 20× 细颗粒。
-	// 这里改 3D 格 hash 圆点（box 投影坐标跨切轴/贴片无缝，深海 s→0 全归零）。
+	// 近岸带（顶点色 a 载 shore，1=岸线）配方：
+	//   ① fBm 软雾云斑（球面方向 n 上 3 octave 值噪声，连续无圆点）——
+	//      既调制白量（云状明暗），也撕裂有效带宽外缘（局部向海伸出/收回）；
+	//   ② 带内宏观云斑（shore_macro 权重，大陆尺度明暗）；
+	//   ③ 向浅蓝白 PALE_TINT 的 mix 白抬升（岸线权重 pow(s,2)，云调制）。
+	// 安全性：深海/覆盖率边界外 s=0 → s_eff=0 → gain=0 → 净色逐位回归。
 	vec3 macro_water = MACRO_MEAN + (macro - MACRO_MEAN) * mix(1.0, ocean_macro, v_is_water);
 	if (v_is_water > 0.5 && v_tile_color.a > 0.001) {
 		float s = clamp(v_tile_color.a * shore_strength, 0.0, 1.0);
-		// — foam 碎粒：3D 格 hash → 每格一颗随机大小圆点（约半数格子出现），再
-		//   乘 1/8 尺度的疏密云斑 → 读作“成片泡沫”而非均匀网点。
-		//   用 n（单位球方向）而非 p：p 是 2 盒投影 uv，3D 格 lattices 要 3D 坐标。
-		vec3 gp = n * GRAIN_FREQ;
-		float h1 = hash13(floor(gp));
-		float rp = 0.16 + 0.26 * fract(h1 * 419.0); // 圆点半径（格尺度，约点域 3/8）
-		float dd = length(fract(gp) - 0.5);
-		float speck = step(0.45, h1) * (1.0 - smoothstep(rp - 0.1, rp, dd));
-		speck *= 0.55 + 0.45 * hash13(floor(gp * 0.125) + 7.0); // 疏密云斑
-		float t = pow(1.0 - s, 1.5); // 深海权重（原版 u^1.5：岸线 0 → 深海 1）
-		float k = 1.0 - 0.2 * t;     // 原版：深海边缘把贴图再压到 0.8×
-		float foam = 0.35 + speck * shore_speck; // 均匀白基座 + 随机碎粒提亮
-		ALBEDO = t * (ocean_flat * macro_water)
-				+ (1.0 - t) * k * (ocean_flat * mix(MACRO_MEAN, macro, shore_macro))
-				+ pow(s, SHORE_LIFT_GAMMA) * shore_lift * foam;
+		// 软雾云斑：连续 [0,1]；n = 单位球方向，跨切轴/贴片天然无缝
+		float cloud = fbm3(n * shore_cloud_freq);
+		float c2 = clamp((cloud - 0.5) * cloud_contrast + 0.5, 0.0, 1.0); // 对比拉伸
+		// 外缘撕裂：云调制“有效带宽”——s=0 处恒 0（无缝不变量），只让
+		// s>0 区域局部伸缩（0.3..1.35 倍幅度，按 cloud_edge 配比）
+		float s_eff = clamp(s * (1.0 - cloud_edge + cloud_edge * 1.5 * c2), 0.0, 1.0);
+		float t = pow(1.0 - s_eff, 1.5); // 深海权重（原版 u^1.5：岸线 0 → 深海 1）
+		float k = 1.0 - 0.2 * t;         // 原版：深海边缘把贴图再压到 0.8×
+		vec3 band_water = t * (ocean_flat * macro_water)
+				+ (1.0 - t) * k * (ocean_flat * mix(MACRO_MEAN, macro, shore_macro));
+		// 白抬升 = 向浅蓝白去饱和的 mix；ramp 沿带饱满（带中即起量），
+		// 云调制 → 斑驳雾块 + 局部探出（参考图观感）
+		float ramp = smoothstep(0.04, 0.85, s_eff);
+		float gain = ramp * shore_lift * (0.25 + 0.75 * c2);
+		ALBEDO = mix(band_water, PALE_TINT, gain);
 	} else {
 		ALBEDO = tinted * macro_water;
 	}
