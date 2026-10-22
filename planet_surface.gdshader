@@ -3,7 +3,7 @@ shader_type spatial;
 //   ① 生态色卡贴图（原版手绘低对比噪声，逐片按 UV2 定位图集格子；
 //        **水格不采色卡**——底色换成 Ocean 卡的均色纯色，见 ocean_flat 说明）
 //   × ② WorldMacro 宏观噪声（大陆尺度斑块，全星球共享，打散平铺重复感；
-//        陆地/海冰/冰盖与水格全保留，海陆之间宏斑块连续）
+//        陆地/海冰/冰盖全保留；水格不带（纯色海面，ocean_macro 调节档））
 //   × ③ 顶点色调制器（贴片级地形明暗 + 山体基岩混合）
 // unshaded：颜色全部由上面三层给出，不受场景光照影响。
 // cull_disabled：双面渲染（沿用原实现——放大穿进去看时内壁也有颜色）。
@@ -39,9 +39,12 @@ const float MACRO_TILING = 1.5;
 // 实测（assets/WorldMacro.png 全部 65536 texel，逐通道字节平均）：
 //   (0.90036, 0.89907, 0.90036)，逐通道标准差 6.33/255 → 乘数范围 0.801~0.969。
 const vec3 MACRO_MEAN = vec3(0.90036, 0.89907, 0.90036);
-// 水格保留的 WorldMacro 振荡比例：1 = 与陆地同款（默认），0 = 净色（海面完全平）。
-// 现场可调（set_shader_parameter("ocean_macro", x)），零改码。
-uniform float ocean_macro = 1.0;
+// 水格保留的 WorldMacro 振荡比例：0 = 净色（默认，海面就是平滑深蓝纯色），
+// 1 = 与陆地同款（大陆尺度宏观噪声）。现场可调（set_shader_parameter("ocean_macro",
+// x)），零改码。默认 0 的依据：宏观噪声乘在纯色底上呈大片脏斑（2026-10 用户实测
+// 反馈「看着有点脏」），净色档 σ≈1.9e-13 完美均匀；平均亮度与 1 档完全一致
+//（宏观噪声的均值恰为 MACRO_MEAN）。
+uniform float ocean_macro = 0.0;
 // 海面纯色底 = Ocean 色卡 256² 的逐通道均值（biome_atlas.gd 打包时实测回填；
 // 兜底值 = 手测 (59,70,92)/255）。为什么水格不采色卡：色卡自带「细颗粒 + 低频
 // 亮斑」，被 fract(p*TILING) 平铺 16×16 次/立方体面后呈**规则点阵**（2026-10
@@ -66,7 +69,7 @@ void vertex() {
 	// 格原点 = (GUTTER + (i%COLS)*cell) / aw → (origin - gutter_uv) / 格距 = 格号（整数）。
 	// 格距 = cell_uv + 2*gutter_uv（含 gutter 的整格步距）。
 	// 图集布局 4 列 × 2 行：格 0 = Ocean（海洋/内陆湖），格 7 = 未生成深洋备份
-	//（覆盖率外的"不可探索区域"）。这两格就是全部的水 → 海面纯色底 × WorldMacro。
+	//（覆盖率外的"不可探索区域"）。这两格就是全部的水 → 净色纯色海面（ocean_flat）。
 	// 改 biome_atlas 的 COLS/ROWS 时，这里的两个格号判据要同步改。
 	vec2 pitch = cell_uv + 2.0 * gutter_uv;
 	vec2 ij = round((v_cell_origin - gutter_uv) / pitch);
@@ -112,14 +115,15 @@ void fragment() {
 	vec3 macro = texture(macro_tex, p * MACRO_TILING).rgb;
 	// ③ 顶点色：rgb 明暗乘数（丘陵压暗），a 岩石混合（山区往基岩色压）。
 	vec3 tinted = mix(base * v_tile_color.rgb, ROCK_COLOR, v_tile_color.a);
-	// —— 水格：纯色底 × 完整 WorldMacro（有意偏离原版，见 docs/planet_textures_plan.md §3⑤）——
-	// 原版海面 = Ocean 卡 × WorldMacro；但色卡内容平铺 16×16 次/立方体面会呈规则
-	// 点阵（宏观噪声一旦摊平就失去掩蔽）。现改为纯色底、宏观噪声全保留：
-	//   · 细颗粒消失，海面只剩大陆尺度低频斑块（宏观自身周期 1 格=60°，超大到
-	//     视野内无重复感）
-	//   · 海陆之间宏斑块连续（摊平版的「海岸线 macro 断开」副作用随之消失）
-	//   · 平均亮度不变：宏观的均值恰为 MACRO_MEAN，均色 × 均值 = 旧海面均值
-	// ocean_macro=0 → 连宏观噪声也净掉（海面完全均匀的纯色球面）；=1 → 陆地同款。
+	// —— 水格：净色纯色（有意偏离原版，见 docs/planet_textures_plan.md §3⑤）——
+	// 原版海面 = Ocean 卡 × WorldMacro。这里水格“色卡 × 宏观噪声”全都不乘：
+	//   · 色卡内容平铺 16×16 次/立方体面会呈规则点阵（摊平版实测自相关尖峰
+	//     r=0.447 恰在平铺周期）→ 底色换纯色常数，点阵从数学上消失；
+	//   · 宏观噪声乘在纯色底上呈大片低频脏斑（用户实测「海面看着有点脏」）
+	//     → 默认也关掉，海面就是平滑深蓝纯色；
+	//   · 平均亮度不变：ocean_macro=0 时乘 MACRO_MEAN（=宏观噪声的均值），与
+	//     全强度档的平均亮度完全一致，海陆之间无亮度台阶。
+	// ocean_macro=1 → 回到「纯色底 × 完整 WorldMacro」（大陆尺度低频斑块）。
 	vec3 macro_final = MACRO_MEAN + (macro - MACRO_MEAN) * mix(1.0, ocean_macro, v_is_water);
 	ALBEDO = tinted * macro_final;
 	// 故意不写 ALPHA：保持不透明渲染管线（biome 边界不能出现半透明缝）。
