@@ -1,8 +1,9 @@
 shader_type spatial;
 // 星球地表三层质感（见 docs/planet_textures_plan.md）：
-//   ① 生态色卡贴图（原版手绘低对比噪声，逐片按 UV2 定位图集格子）
+//   ① 生态色卡贴图（原版手绘低对比噪声，逐片按 UV2 定位图集格子；
+//        **水格不采色卡**——底色换成 Ocean 卡的均色纯色，见 ocean_flat 说明）
 //   × ② WorldMacro 宏观噪声（大陆尺度斑块，全星球共享，打散平铺重复感；
-//        **水格只保留它的均值**——海面摊平，见下方「水格摊平」说明）
+//        陆地/海冰/冰盖与水格全保留，海陆之间宏斑块连续）
 //   × ③ 顶点色调制器（贴片级地形明暗 + 山体基岩混合）
 // unshaded：颜色全部由上面三层给出，不受场景光照影响。
 // cull_disabled：双面渲染（沿用原实现——放大穿进去看时内壁也有颜色）。
@@ -29,7 +30,7 @@ const vec3 ROCK_COLOR = vec3(0.45, 0.42, 0.39);
 const float TILING = 8.0;
 // WorldMacro 每面平铺次数（照抄原版 1.5 → 大陆尺度斑块）。
 const float MACRO_TILING = 1.5;
-// WorldMacro 的**原始字节空间**均值 —— 水格摊平后乘在海面上的常数。
+// WorldMacro 的**原始字节空间**均值 —— ocean_macro 调节档的基准常数。
 // ⚠️ 为什么不是 sRGB→线性后的均值（0.78902…）：本工程的色卡/宏观噪声在 shader 里
 // 取到的就是 PNG 原字节值（source_color 未再解码），显示端也不二次编码 ——
 // 实测「海面像素 = 色卡原值 × 乘数」逐位成立：
@@ -37,11 +38,17 @@ const float MACRO_TILING = 1.5;
 //   用线性均值时 0.2728 × 0.78902 = 0.2153 ≈ 实测 0.2131（海面暗 12.5%）。
 // 实测（assets/WorldMacro.png 全部 65536 texel，逐通道字节平均）：
 //   (0.90036, 0.89907, 0.90036)，逐通道标准差 6.33/255 → 乘数范围 0.801~0.969。
-// 摊平到均值而不是 1.0：海面平均亮度分毫不动，也不与陆地之间产生亮度台阶。
 const vec3 MACRO_MEAN = vec3(0.90036, 0.89907, 0.90036);
-// 水格保留的 WorldMacro 振荡比例：0 = 完全摊平（默认），1 = 与陆地同款。
+// 水格保留的 WorldMacro 振荡比例：1 = 与陆地同款（默认），0 = 净色（海面完全平）。
 // 现场可调（set_shader_parameter("ocean_macro", x)），零改码。
-uniform float ocean_macro = 0.0;
+uniform float ocean_macro = 1.0;
+// 海面纯色底 = Ocean 色卡 256² 的逐通道均值（biome_atlas.gd 打包时实测回填；
+// 兜底值 = 手测 (59,70,92)/255）。为什么水格不采色卡：色卡自带「细颗粒 + 低频
+// 亮斑」，被 fract(p*TILING) 平铺 16×16 次/立方体面后呈**规则点阵**（2026-10
+// 实测三证据：自相关峰恰在平铺周期 115px@dist2.5 且 r=0.447、TILING 8→16 峰位
+// 115→57 严格反比、采常数 UV 则 sd=0.000000）。格子 0 与 7 底色同为一常数 →
+// 未生成深洋与已生成海域逐像素一致，覆盖区边界无缝的性质不变。
+uniform vec3 ocean_flat = vec3(0.2328, 0.2765, 0.3590);
 
 // 顶点色 = 色调制器：rgb = 明暗乘数（1.0 = 原亮度），a = 岩石混合量。
 varying vec4 v_tile_color;
@@ -59,7 +66,7 @@ void vertex() {
 	// 格原点 = (GUTTER + (i%COLS)*cell) / aw → (origin - gutter_uv) / 格距 = 格号（整数）。
 	// 格距 = cell_uv + 2*gutter_uv（含 gutter 的整格步距）。
 	// 图集布局 4 列 × 2 行：格 0 = Ocean（海洋/内陆湖），格 7 = 未生成深洋备份
-	//（覆盖率外的"不可探索区域"）。这两格就是全部的水 → 水格摊平 WorldMacro。
+	//（覆盖率外的"不可探索区域"）。这两格就是全部的水 → 海面纯色底 × WorldMacro。
 	// 改 biome_atlas 的 COLS/ROWS 时，这里的两个格号判据要同步改。
 	vec2 pitch = cell_uv + 2.0 * gutter_uv;
 	vec2 ij = round((v_cell_origin - gutter_uv) / pitch);
@@ -95,21 +102,24 @@ void fragment() {
 	// 平铺 1 单位 = 1 格 = 256px（与 biome_atlas.gd 的 SPRITE 对应）→ 图素足迹；
 	// 下限 1 → 放大时 lod=0 采原图，不被 log2 负值带偏。
 	float lod = log2(max(sn * jac * TILING * 256.0, 1.0));
-	vec3 base = textureLod(biome_atlas, v_cell_origin + fract(p * TILING) * cell_uv,
-			lod).rgb;
+	vec2 uv_card = v_cell_origin + fract(p * TILING) * cell_uv;
+	// 水格：底色换成 Ocean 卡均色常数（见 ocean_flat 注释——色卡平铺 16×16 次/
+	// 立方体面后细颗粒+亮斑呈规则点阵，纯色底让点阵从数学上消失）。陆地路径不变。
+	vec3 base = mix(textureLod(biome_atlas, uv_card, lod).rgb, ocean_flat, v_is_water);
 	// 宏观斑块：整张 WorldMacro 低频平铺，全星球连续（相邻生态共享同一批斑块 → 边界被洗软）。
 	// WorldMacro 导入未开 mip（mipmaps/generate=false）→ texture() 恒采 base 层，
 	// 切轴处导数突跳不产生混色伪影；若日后开 mip 需换成同款手算 LOD。
 	vec3 macro = texture(macro_tex, p * MACRO_TILING).rgb;
 	// ③ 顶点色：rgb 明暗乘数（丘陵压暗），a 岩石混合（山区往基岩色压）。
 	vec3 tinted = mix(base * v_tile_color.rgb, ROCK_COLOR, v_tile_color.a);
-	// —— 水格摊平（有意偏离原版，见 docs/planet_textures_plan.md §3⑤）——
-	// 原版 RimWorld 的海洋也是 Ocean × WorldMacro；但那层大陆尺度斑块落在
-	// 近纯色的海面上毫无遮挡地裸露（实测：海面亮度 σ 的 85~91% 方差来自它，
-	// 与其自身波动的理论值逐位吻合），观感就是"海面有噪声纹理"。
-	// 这里把水格上的 macro 振荡抹平、只留均值：海面平均亮度分毫不动
-	// （乘 MACRO_MEAN 而非 1.0），也不与陆地之间多出一道亮度台阶。
-	// ocean_macro=0 → 完全平；=1 → 回到原样（现场可调）。
+	// —— 水格：纯色底 × 完整 WorldMacro（有意偏离原版，见 docs/planet_textures_plan.md §3⑤）——
+	// 原版海面 = Ocean 卡 × WorldMacro；但色卡内容平铺 16×16 次/立方体面会呈规则
+	// 点阵（宏观噪声一旦摊平就失去掩蔽）。现改为纯色底、宏观噪声全保留：
+	//   · 细颗粒消失，海面只剩大陆尺度低频斑块（宏观自身周期 1 格=60°，超大到
+	//     视野内无重复感）
+	//   · 海陆之间宏斑块连续（摊平版的「海岸线 macro 断开」副作用随之消失）
+	//   · 平均亮度不变：宏观的均值恰为 MACRO_MEAN，均色 × 均值 = 旧海面均值
+	// ocean_macro=0 → 连宏观噪声也净掉（海面完全均匀的纯色球面）；=1 → 陆地同款。
 	vec3 macro_final = MACRO_MEAN + (macro - MACRO_MEAN) * mix(1.0, ocean_macro, v_is_water);
 	ALBEDO = tinted * macro_final;
 	// 故意不写 ALPHA：保持不透明渲染管线（biome 边界不能出现半透明缝）。

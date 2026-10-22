@@ -5,8 +5,8 @@ extends RefCounted
 # 第 8 格 = Ocean 卡的备份：未生成贴片（覆盖率外 = 遥远的不可探索深洋）的
 # UV2 指向它，与已生成海域逐像素同观感（同一贴图 × 同一 macro 处理 × 同一全白
 # 调制器 → 覆盖区边界无缝），仍是 1 次 draw call。
-# 注：两格都是"水格"→ shader 里 WorldMacro 的振荡被摊平（只留均值），
-#     两格处理完全一致，逐像素一致的不变量仍然成立。
+# 注：两格都是"水格"→ shader 里底色都换成 ocean_flat（Ocean 卡均色实测，
+#     见下面 build()）→ 两格处理完全一致，逐像素一致的不变量仍然成立。
 #
 # 为什么打包成一张图集（而不是照抄原版「一个 biome 一个材质」）：
 #   原版 7+ 个 biome 各一个 subMesh/材质 → 7+ 次 draw call；
@@ -54,6 +54,7 @@ const MACRO_TEXTURE := preload("res://assets/WorldMacro.png")
 #   cell_uv      → Vector2，单格有效区的 UV 尺寸（shader 里乘 fract 平铺坐标）
 #   gutter_uv    → Vector2，单格 gutter 的 UV 尺寸（shader 里从 UV2 反推格号：
 #                  (origin - gutter_uv) / (cell_uv + 2*gutter_uv) = 格号）
+#   ocean_flat   → Color，Ocean 卡 256² 的逐通道均值（海面纯色底，回填 shader）
 static func build() -> Dictionary:
 	var cell := SPRITE + GUTTER * 2
 	var aw := COLS * cell
@@ -66,12 +67,22 @@ static func build() -> Dictionary:
 	#  同尺寸 resize 是 no-op、内容不变，两格 blit 结果逐位一致）
 	var pack: Array = BIOME_TEXTURES + [BIOME_TEXTURES[0]]
 	var cell_origins: Array[Vector2] = []
+	# 海面纯色底 = Ocean 卡 256² 的逐通道均值（渲染采的就是 resize 后的这张）。
+	# 只在 i==0（Ocean 第一次进图集）时实测；兜底值 = 手测 (59,70,92)/255。
+	var ocean_flat := Color(0.2328, 0.2765, 0.3590)
 	for i in pack.size():
 		var src: Image = pack[i].get_image()
 		if src.get_format() != Image.FORMAT_RGBA8:
 			src.convert(Image.FORMAT_RGBA8)
 		# 512 → 256：色卡是近纯色低对比噪声，缩半后颗粒感不变
 		src.resize(SPRITE, SPRITE, Image.INTERPOLATE_LANCZOS)
+		if i == 0:
+			var sum := Color(0.0, 0.0, 0.0, 1.0)
+			for py in SPRITE:
+				for px in SPRITE:
+					sum += src.get_pixel(px, py)
+			ocean_flat = Color(sum.r / float(SPRITE * SPRITE),
+					sum.g / float(SPRITE * SPRITE), sum.b / float(SPRITE * SPRITE), 1.0)
 		var ox := (i % COLS) * cell + GUTTER
 		var oy := int(i / float(COLS)) * cell + GUTTER
 		atlas.blit_rect(src, Rect2i(0, 0, SPRITE, SPRITE), Vector2i(ox, oy))
@@ -85,6 +96,7 @@ static func build() -> Dictionary:
 		"cell_origins": cell_origins,
 		"cell_uv": Vector2(float(SPRITE) / float(aw), float(SPRITE) / float(ah)),
 		"gutter_uv": Vector2(float(GUTTER) / float(aw), float(GUTTER) / float(ah)),
+		"ocean_flat": ocean_flat,
 	}
 
 

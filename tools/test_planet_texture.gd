@@ -184,15 +184,23 @@ func _run() -> void:
 	var ok_mat: bool = false
 	var cv := Vector2.ZERO
 	var gv := Vector2.ZERO
+	var of := Color(0, 0, 0, 0)
 	if mat != null:
 		var t0 = mat.get_shader_parameter("biome_atlas")
 		var t1 = mat.get_shader_parameter("macro_tex")
 		cv = mat.get_shader_parameter("cell_uv")
 		gv = mat.get_shader_parameter("gutter_uv")
+		var o = mat.get_shader_parameter("ocean_flat")
+		of = o if o is Color else Color(0, 0, 0, 0)
 		ok_mat = t0 is Texture2D and t1 is Texture2D and cv.x > 0.0 and cv.y > 0.0 \
-				and gv.x > 0.0 and gv.y > 0.0
-	print(bin_if(ok_mat, "材质 uniform 装配齐全（atlas/macro/cell_uv=%s/gutter_uv=%s）" \
-			% [str(cv), str(gv)]))
+				and gv.x > 0.0 and gv.y > 0.0 \
+				and of.r > 0.0 and of.g > 0.0 and of.b > 0.0
+	# ocean_flat 应为 Ocean 卡 256² 的逐通道均值（±2/255 内）：手测 (59,70,92)/255
+	ok_mat = ok_mat and absf(of.r - 59.37 / 255.0) < 0.008 \
+			and absf(of.g - 70.50 / 255.0) < 0.008 \
+			and absf(of.b - 91.55 / 255.0) < 0.008
+	print(bin_if(ok_mat, "材质 uniform 装配齐全（atlas/macro/cell_uv=%s/gutter_uv=%s/ocean_flat=%s）" \
+			% [str(cv), str(gv), str(of)]))
 	_quit(0 if (ok_grid and ok_mat) else 1)
 
 

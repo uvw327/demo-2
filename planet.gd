@@ -389,8 +389,10 @@ func _on_generate_requested(params: Dictionary) -> void:
 	mat.set_shader_parameter("biome_atlas", atlas["texture"])
 	mat.set_shader_parameter("macro_tex", atlas["macro"])
 	mat.set_shader_parameter("cell_uv", atlas["cell_uv"])
-	# gutter 尺寸：shader 从 UV2（格子原点）反推格号 → 判定水格（摊平 WorldMacro）
+	# gutter 尺寸：shader 从 UV2（格子原点）反推格号 → 判定水格（海面纯色化）
 	mat.set_shader_parameter("gutter_uv", atlas["gutter_uv"])
+	# 海面纯色底 = Ocean 卡均色（水格不采色卡，只乘 WorldMacro；见 shader ocean_flat 注释）
+	mat.set_shader_parameter("ocean_flat", atlas["ocean_flat"])
 	_mesh_instance.material_override = mat
 	add_child(_mesh_instance)
 	# 大气光晕：紧跟星球上线（星球边缘那圈柔和的蓝白光晕，见 atmosphere.gdshader）
