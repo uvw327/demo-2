@@ -240,12 +240,29 @@ func _current_pinch_distance() -> float:
 
 func _update_cam() -> void:
 	# 球坐标 → 直角坐标：yaw 绕竖直轴，pitch 决定相机高度，dist 是半径
-	var pos := target
-	pos.x += dist * cos(pitch) * sin(yaw)
-	pos.y += dist * sin(pitch)
-	pos.z += dist * cos(pitch) * cos(yaw)
+	var pos := target + _sph_dir(yaw, pitch) * dist
 	cam.position = pos
 	cam.look_at(target, Vector3.UP)
+
+
+# 球坐标 → 单位方向向量。_update_cam 与 forward_after_focus 共用，
+# 保证「预测的视线」与「实际落位后的视线」逐位一致。
+static func _sph_dir(yaw_value: float, pitch_value: float) -> Vector3:
+	return Vector3(
+		cos(pitch_value) * sin(yaw_value),
+		sin(pitch_value),
+		cos(pitch_value) * cos(yaw_value))
+
+
+# focus_on(dir) 之后镜头会朝的方向（**不移动镜头**）。
+# 生成流程需要在真正 focus_on 之前就知道「首屏视线」：太阳的取景偏置与
+# 「光晕内星星缩小」都锚在它上面。与 focus_on 共用同一套 yaw/pitch 夹取，
+# 避免两处各写一份而漂移。
+func forward_after_focus(dir: Vector3) -> Vector3:
+	var d := dir.normalized()
+	var y := atan2(d.x, d.z)
+	var p := clampf(asin(clampf(d.y, -1.0, 1.0)), -1.35, 1.35)
+	return -_sph_dir(y, p)
 
 
 # 把镜头对准 dir 方向（星球生成完后对准大陆质心那面）。

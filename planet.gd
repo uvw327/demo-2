@@ -311,12 +311,6 @@ func _ready() -> void:
 	add_child(_orbit)
 	_orbit.view_tapped.connect(_on_view_tapped)
 
-	# 背景星空：菜单页就有（菜单背后不是死灰底）；种子等到生成请求时才填，
-	# 菜单相位先用 0 号种子铺一层，玩家感知只是“星空早就挂在那了”
-	_star_dome = StarDomeScript.new()
-	add_child(_star_dome)
-	_star_dome.build(0)
-
 	# 太阳：菜单相位就建好（方向先取默认值），生成世界时按种子换向
 	#（见 _on_generate_requested）。注意菜单本身是不透明全屏面板、
 	# 玩家看不到它 —— 太阳的首次可见时刻是生成完成、菜单收起的那一刻。
@@ -324,6 +318,13 @@ func _ready() -> void:
 	_sun_quad = SunQuadScript.new()
 	add_child(_sun_quad)
 	_sun_quad.set_direction(_sun_dir)
+
+	# 背景星空：菜单页就有（菜单背后不是死灰底）；种子等到生成请求时才填，
+	# 菜单相位先用 0 号种子铺一层，玩家感知只是“星空早就挂在那了”。
+	# 太阳方向一并传入：缩掉的星永远就是**当前这颗太阳**旁边的那批。
+	_star_dome = StarDomeScript.new()
+	add_child(_star_dome)
+	_star_dome.build(0, _sun_dir)
 
 	# 背景音乐（These_Lands.ogg）：不自动播，等星球生成完毕后再由代码开播。
 	# 曲子是长循环的 BGM，导入参数已开 loop；这里再兜一次底（换资源时不失效）。
@@ -343,12 +344,22 @@ func _on_generate_requested(params: Dictionary) -> void:
 	_init_noise(params["seed"])
 	_rain_shift = params["rainfall"] * RAIN_SHIFT
 	_temp_shift = params["temperature"] * TEMP_SHIFT
-	# 星空：同种子同星图（换种子生成才会重铺；同种子短路时星穹保持不动）。
-	# 成本几毫秒级，不值得为它分帧。
-	_star_dome.build(params["seed"])
 	# 区域中心 = 生成这一刻镜头正对的方向：球冠围着玩家看到的半球长
 	#（贴镜头、天然不落在极点），生成后镜头对准同一方向，零校准。
 	_region_center = _camera_fwd_dir()
+	# 太阳方向：由种子派生，锚在「生成后首屏」的视线旁（见 sun_quad.derive_direction）。
+	# 锚点用 focus_on(_region_center) 之后镜头的真实朝向（forward_after_focus
+	# 与 focus_on 共用同一套夹取逻辑，逐位一致）——这样即使玩家在生成过程中
+	# 拖动镜头，首屏构图也不受影响。
+	# 它是一个**世界方向**：之后玩家转镜头时太阳像真的那样在天空里移动
+	#（视差由「相机相对定位」消除）。
+	_sun_dir = SunQuadScript.derive_direction(
+			params["seed"], _orbit.forward_after_focus(_region_center))
+	# 星空：同种子同星图（换种子生成才会重铺；同种子短路时星穹保持不动）。
+	# 成本几毫秒级，不值得为它分帧。
+	# 顺带把太阳方向传进去：落在太阳光晕圆盘内的星星按原版规则缩小
+	# （原版 WorldLayer_Stars.cs:63-68）——缩掉的正是**这颗太阳**周围的那批星。
+	_star_dome.build(params["seed"], _sun_dir)
 
 	var t0 := Time.get_ticks_msec()
 	# 先让出一帧，让进度条状态先画到屏幕上，再开始第一段比较重的同步计算
@@ -395,13 +406,9 @@ func _on_generate_requested(params: Dictionary) -> void:
 		if child is OrbitCamera:
 			child.focus_on(_region_center)
 
-	# 太阳方向：由种子派生，锚在「生成后首屏」的视线旁（见 sun_quad.derive_direction）。
-	# 取焦点落定后的**真实镜头视线**（focus_on 里俯仰夹在 ±77°，
-	# 极端经纬下视线与 -_region_center 会有微小偏差，所以这里直接读相机的实际朝向）。
+	# 太阳方向在生成一开始就定好了（见 _on_generate_requested 开头）：
+	# 星空缩星与太阳本体必须用**同一个**方向，否则缩掉的星不是太阳旁边那批。
 	# 太阳必定落在首屏视野内、且贴着星球轮廓外侧；不然 80% 的种子会「太阳不在画面里」。
-	# 它是一个**世界方向**：之后玩家转镜头时太阳像真的那样在天空里移动
-	#（视差由「相机相对定位」消除）。
-	_sun_dir = SunQuadScript.derive_direction(params["seed"], _camera_fwd_dir())
 	_sun_quad.set_direction(_sun_dir)
 
 	print("星球生成完毕：种子 ", params["seed"],

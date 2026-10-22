@@ -55,6 +55,37 @@ const SEED_XOR := 0x53554e31
 # 也就是「菜单背后那片天空里有一颗太阳」，生成世界后再按种子换成新方向。
 const DEFAULT_DIRECTION := Vector3(0.621, 0.259, -0.740)
 
+# —— 期 2：光晕圆盘内的星星缩小（原版 WorldLayer_Stars.cs:63-68）——
+# 原版判据：dot(starDir, sunDir) > 0.8 → size *= LerpDouble(0.8,1,1,0.35,dot)
+# 那个 0.8 **不是魔数**：它恰好等于原版太阳「光晕可见圆盘」的边缘 ——
+# 方片半宽 7.5 @ 距离 10 → atan(7.5/10) = 36.87° → cos = 0.8。
+# 语义是「落在光晕里的星星缩小」（被光晕淹没 → 缩小以免抢戏）。
+#
+# 我们的光晕比原版小（比例 0.8 而非 1.5 → 半宽 6 @ 距离 15 → 21.8°，
+# cos ≈ 0.928），所以**不能照抄 0.8**：那会让光晕外一圈星星无故变小。
+# 阈值必须由我们自己的光晕几何导出 —— 见 glow_disc_cos()。
+const STAR_SHRINK_MIN := 0.35  # 正对太阳时缩到原尺寸的 0.35 倍（原版常量）
+
+
+# 太阳「光晕可见圆盘」的边缘余弦 —— 判据的**唯一来源**。
+# 光晕亮度包络 a = max(0, 1-2d) 在 UV 半径 0.5 处归零，即方片半宽处；
+# 该半径相对相机的张角 = atan(半宽 / 距离)，故 cos 即阈值。
+# 改 SUN_SIZE_RATIO / SUN_DIST 时阈值自动跟着走（缩星范围永远等于光晕范围）。
+static func glow_disc_cos() -> float:
+	return cos(atan((SUN_QUAD_SIZE * 0.5) / SUN_DIST))
+
+
+# 缩星系数：与原版 LerpDouble(0.8, 1, 1, 0.35, dot) 同构，
+# 只是把硬编码的 0.8 换成我们自己的光晕边缘 cos。
+# dot ≤ 阈值 → 1.0（不缩）；dot = 1（正对太阳）→ 0.35。
+static func star_shrink_factor(dot_value: float) -> float:
+	var edge := glow_disc_cos()
+	if dot_value <= edge:
+		return 1.0
+	# t: 0（在光晕边缘）→ 1（正对太阳）
+	var t := (dot_value - edge) / (1.0 - edge)
+	return 1.0 + (STAR_SHRINK_MIN - 1.0) * t
+
 # 太阳方向（世界空间单位向量，指向太阳）。由 planet.gd 的单一数据源写入。
 var direction := DEFAULT_DIRECTION
 

@@ -27,6 +27,9 @@ const STAR_SHADER := preload("res://starfield.gdshader")
 # 图集分析器（用 preload 而非 class_name：跟 planet.gd 的依赖风格一致，
 # 且不依赖编辑器的全局类名注册缓存 —— headless 冒烟与 CI 下更稳）
 const StarAtlasScript := preload("res://star_atlas.gd")
+# 太阳模块（期 2：光晕内星星缩小）。用 preload 而非 class_name 引用，
+# 与 StarAtlasScript 同款依赖风格（不依赖编辑器全局类名缓存）。
+const SunQuadScript := preload("res://sun_quad.gd")
 # 从 RimWorld 原版提取的星点图集（assets/stars.png，1024×1024）：
 # 里面散布着 22 颗独立的柔光星点精灵（8×8 ~ 20×20 px 不等）。
 const STAR_ATLAS := preload("res://assets/stars.png")
@@ -147,7 +150,7 @@ func _process(_delta: float) -> void:
 
 # 按 seed 重建星穹。确定性保证：独立 RandomNumberGenerator（不碰星球噪声的随机流），
 # 同一个 seed 永远得到同一片星空。触发语义参考原版 ShouldRegenerate：种子变了才重铺。
-func build(seed_value: int) -> void:
+func build(seed_value: int, sun_dir: Vector3 = Vector3.ZERO) -> void:
 	star_seed = seed_value
 	_ensure_material()
 	_ensure_atlas()
@@ -155,6 +158,11 @@ func build(seed_value: int) -> void:
 	rng.seed = seed_value
 	_built.clear()
 	_built_colors.clear()
+	# 期 2：太阳方向有效时，落在太阳光晕圆盘内的星星按原版规则缩小
+	# （原版 WorldLayer_Stars.cs:63-68）。零向量 = 菜单相位等「还没有太阳」
+	# 的场合 → 不缩（阈值判据见 sun_quad.glow_disc_cos 的注释）。
+	var has_sun := sun_dir.length_squared() > 0.0001
+	var sun_unit := sun_dir.normalized() if has_sun else Vector3.ZERO
 	# —— 提交渲染：单 MultiMesh，1 个 draw call ——
 	# use_colors / use_custom_data 必须在 instance_count 之前打开（之后设会清空缓冲）。
 	var mm := MultiMesh.new()
@@ -188,6 +196,13 @@ func build(seed_value: int) -> void:
 		if si < _atlas_sizes.size():
 			size_factor = float(_atlas_sizes[si]) / _atlas_mean_size
 		var rel := _star_size(rng, kind) * jitter * size_factor
+		# 期 2：靠近太阳的星星缩小（原版 §6.4）。
+		# 判据 = 「方向落在太阳光晕可见圆盘内」，阈值由 sun_quad.glow_disc_cos()
+		# 从我们自己的光晕几何导出（不照抄原版的常数 0.8 —— 那是原版
+		# 自己的光晕边缘，我们的光晕更小，照抄会多缩一圈）。
+		# 只改尺寸、不改亮度/位置：原版就是缩 quad 的绘制尺寸。
+		if has_sun:
+			rel *= SunQuadScript.star_shrink_factor(dir.dot(sun_unit))
 		# QuadMesh 边长 2 → 缩放 s 得边长 2s；求边长 = rel×半径，故 scale = rel×半径/2
 		var edge := rel * DOME_RADIUS
 		xform_basis = xform_basis.scaled(Vector3(edge * 0.5, edge * 0.5, edge * 0.5))

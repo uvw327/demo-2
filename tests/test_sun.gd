@@ -13,6 +13,7 @@ extends GutTest
 const SUN := preload("res://sun_quad.gd")
 const ORBIT := preload("res://orbit_camera.gd")
 const PLANET := preload("res://planet.gd")
+const DOME := preload("res://star_dome.gd")
 
 # 相机参数：与 orbit_camera 一致（Camera3D 默认 fov 75，project.godot 视口 16:9）
 const FOV_DEG := 75.0
@@ -88,6 +89,105 @@ func test_quad_size_is_derived_from_distance_and_ratio() -> void:
 	assert_almost_eq(SUN.SUN_QUAD_SIZE, SUN.SUN_DIST * SUN.SUN_SIZE_RATIO, 0.0001,
 			"quad 边长必须由「距离 × 比例」导出")
 	assert_gt(SUN.SUN_SIZE_RATIO, 0.0, "尺寸比例必须为正（否则太阳退化成一个点）")
+
+
+# —— 期 2：光晕内的星星缩小（原版 WorldLayer_Stars.cs:63-68）——
+
+# 缩星阈值必须等于「太阳光晕可见圆盘的边缘」，而不是原版的常数 0.8。
+# 原版的 0.8 恰好是它自己的光晕边缘（半宽 7.5 @ 距离 10 → atan(7.5/10)=36.87°
+# → cos=0.8）；我们的光晕更小，照抄 0.8 会多缩一圈光晕外的星星。
+func test_shrink_threshold_equals_our_own_glow_disc_edge() -> void:
+	var half_edge := SUN.SUN_QUAD_SIZE * 0.5
+	var expect := cos(atan(half_edge / SUN.SUN_DIST))
+	assert_almost_eq(SUN.glow_disc_cos(), expect, 0.000001,
+			"缩星阈值必须由我们自己的光晕几何导出")
+	# 光晕边缘处不缩，正对太阳时缩到 0.35×
+	assert_almost_eq(SUN.star_shrink_factor(SUN.glow_disc_cos()), 1.0, 0.000001,
+			"光晕边缘的星星不该缩小")
+	assert_almost_eq(SUN.star_shrink_factor(1.0), SUN.STAR_SHRINK_MIN, 0.000001,
+			"正对太阳的星星必须缩到 0.35×")
+
+
+# 缩星系数必须单调递减（越靠近太阳越小），且光晕外恒为 1.0
+func test_shrink_factor_is_monotonic_and_bounded() -> void:
+	var edge := SUN.glow_disc_cos()
+	assert_almost_eq(SUN.star_shrink_factor(edge - 0.01), 1.0, 0.000001,
+			"光晕外的星星不该缩小")
+	var prev := 2.0
+	for i in 20:
+		var dot_v := lerpf(edge, 1.0, float(i) / 19.0)
+		var f := SUN.star_shrink_factor(dot_v)
+		assert_lte(f, prev + 0.000001, "缩星系数必须随接近太阳而单调不增")
+		assert_gte(f, SUN.STAR_SHRINK_MIN - 0.000001, "缩星系数不得小于 0.35×")
+		prev = f
+
+
+# 端到端：星穹按太阳方向缩星 —— 太阳方向上的星确实更小，
+# 且「缩掉的正是太阳旁边那批」（不是随机某一群）。
+func test_star_dome_shrinks_stars_near_the_sun() -> void:
+	var dome: StarDome = DOME.new()
+	add_child_autofree(dome)
+	var sun_dir := Vector3(0.0, 0.0, 1.0)
+	# 同一 seed 建两次：一次带太阳方向、一次不带 → 逐位对比每颗星的尺寸
+	dome.build(4242, sun_dir)
+	var with_sun := dome.snapshot_transforms()
+	dome.build(4242)
+	var without_sun := dome.snapshot_transforms()
+	assert_eq(with_sun.size(), without_sun.size(), "两次构建的星数应相同")
+	var shrunk := 0
+	var checked := 0
+	for i in with_sun.size():
+		var a: Transform3D = with_sun[i]
+		var b: Transform3D = without_sun[i]
+		var edge_a := a.basis.get_scale().x
+		var edge_b := b.basis.get_scale().x
+		if edge_a >= edge_b:
+			continue  # 没被缩（判定边界外）
+		shrunk += 1
+		checked += 1
+		# 被缩的这颗：方向必须确实靠近太阳
+		var star_dir := a.origin.normalized()
+		var dot_v := star_dir.dot(sun_dir)
+		assert_gt(dot_v, SUN.glow_disc_cos(),
+				"被缩的星必须落在太阳光晕圆盘内（dot=%.3f）" % dot_v)
+		# 缩小比例必须等于公式值
+		var expect := SUN.star_shrink_factor(dot_v)
+		assert_almost_eq(edge_a / edge_b, expect, 0.0001,
+				"缩星比例必须符合公式（dot=%.3f）" % dot_v)
+	assert_gt(shrunk, 0, "必须有星被缩小（否则缩星逻辑没生效）")
+	# 绝大多数星不该被缩（光晕只占天球一小块）
+	assert_lt(float(shrunk) / float(with_sun.size()), 0.25,
+			"被缩的星占比应很小（光晕只覆盖天球一角），实际 %d/%d"
+			% [shrunk, with_sun.size()])
+
+
+# 没有太阳方向时（零向量）不缩任何星 —— 菜单相位等场合的兜底
+func test_star_dome_without_sun_does_not_shrink() -> void:
+	var dome: StarDome = DOME.new()
+	add_child_autofree(dome)
+	dome.build(4242, Vector3.ZERO)
+	var a := dome.snapshot_transforms()
+	dome.build(4242, Vector3(0.0, 0.0, 1.0))
+	var b := dome.snapshot_transforms()
+	for i in a.size():
+		assert_almost_eq(a[i].basis.get_scale().x, b[i].basis.get_scale().x, 0.000001,
+				"无太阳时不该缩星（#%d）" % i)
+		break  # 抽样 1 颗即可：构造与实现同源，逐位相等是必然的
+
+
+# forward_after_focus 必须与 focus_on 之后镜头的**真实**朝向逐位一致 ——
+# 太阳的取景锚点全靠它（锚错了，缩掉的星就不是太阳旁边那批）。
+func test_forward_after_focus_matches_real_camera() -> void:
+	var orbit: OrbitCamera = add_child_autofree(ORBIT.new())
+	orbit.planet_radius = 1.0
+	orbit.dist = 2.05
+	for dir: Vector3 in [Vector3(0.0, 0.0, 1.0), Vector3(0.3, 0.4, 0.5).normalized(),
+			Vector3(0.0, 0.9, 0.4).normalized(), Vector3(0.0, -0.99, 0.1).normalized()]:
+		var predicted := orbit.forward_after_focus(dir)
+		orbit.focus_on(dir)
+		var actual := -orbit.cam.global_transform.basis.z
+		assert_almost_eq(predicted.distance_to(actual), 0.0, 0.000001,
+				"预测视线必须与 focus_on 后的真实视线一致（dir=%s）" % str(dir))
 
 
 # 相机相对：位置恒为「相机位置 + 方向 × 距离」→ 角尺寸恒定、无视差

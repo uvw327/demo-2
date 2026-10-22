@@ -4,10 +4,12 @@
 > `Custom_Sun.shader` / `GenCelestial` 太阳方向数学与昼夜联动的完整逆向），
 > 交叉核对 `WorldMapTexturePaths.md`。
 > 本文档回答三个问题：原版太阳的机制是什么、在本项目里怎么落地、需不需要贴图。
-> **状态：期 1 已实现（太阳本体）。**
+> **状态：期 1（太阳本体）+ 期 2（星星避让）已实现；期 3（昼夜联动）待议。**
 > 已落地文件：`sun.gdshader`（零贴图加法 shader）、`sun_quad.gd`（相机相对 quad）、
-> `planet.gd`（`_sun_dir` 单一数据源 + 装配）、`tests/test_sun.gd`（GUT 7 项）。
-> 期 2（星星避让）、期 3（昼夜联动）见 §6，尚未实现。
+> `planet.gd`（`_sun_dir` 单一数据源 + 装配）、`star_dome.gd`（期 2 缩星）、
+> `orbit_camera.gd`（`forward_after_focus` 预测首屏视线）、
+> `tests/test_sun.gd`（GUT 12 项）。
+> 期 3（昼夜联动）见 §6，尚未实现（观感大改，需单独拍板）。
 
 ---
 
@@ -120,7 +122,9 @@ A 记录在案但先不引入 Environment 这条新依赖；C/D 否决。
 | `sun.gdshader`（新） | `render_mode unshaded, blend_add, depth_draw_never, cull_disabled;`；fragment 抄 §4.4 公式（`d/core/rgb` 三行），**ALPHA 恒 1，靠 RGB 自身衰减淡出**（§4.7 的暗框坑）；`core_color`（默认 `(1, 0.847, 0)`）、`intensity` 做成 uniform——原版硬编码，文档 §7.3 建议复刻时留成属性，调参零改码。**颜色空间**：公式常量是线性值（§4.5「RGB 为线性值近似，未做 sRGB 转换」），Godot 的 ALBEDO 同样是线性值、由引擎输出时做 sRGB 编码 —— 两边一致，**不做任何手工 gamma 转换**（与本项目 `atmosphere.gdshader` 的同款约定）。注意 Godot 4.7 着色语言**没有** `srgb_to_linear()` 内置函数，别写 |
 | `sun_quad.gd`（新，`class_name SunQuad extends MeshInstance3D`） | ① `_ready` 装配 `QuadMesh(SUN_QUAD_SIZE)` + ShaderMaterial；② 持 `direction: Vector3`（太阳方向，**一次赋值、多次消费**的接口）；③ `_process`：`global_position = cam.global_position + direction * SUN_DIST`（相机相对，等效原版顶点加相机位置）；basis 用切平面基一次对齐（quad 面 ⟂ 方向，含 UP 退化保护，不用 `look_at`）——径向渐变旋转不变，每帧只写 position，零重建；④ `static func derive_direction(seed, view_fwd)`：种子 → 首屏视线旁的取景方向 |
 | `planet.gd`（改，~25 行） | ① `_ready` 创建太阳节点（菜单相位即有，与星空同哲学）；② `_sun_dir` 数据源：默认方向给菜单相位，`_on_generate_requested` 里由 `seed` 派生新方向并传给节点；③ 大气辉光材质加 `render_priority = 20` 以钉死透明层叠次序；④ 期 3 起把同一向量喂给大气/地表 shader |
-| `tests/test_sun.gd`（新，GUT） | 结构断言 + 确定性 + 取景判据 + 拾取零耦合回归（见 §8），7 项全绿 |
+| `star_dome.gd`（改） | ① `build(seed, sun_dir)` 增加太阳方向入参；② 逐星 `rel *= sun_quad.star_shrink_factor(dir·sun_dir)` —— 落在太阳光晕可见圆盘内的星按原版规则缩小（**只改尺寸**，不改位置/亮度/数量 → 星空布局与确定性不变） |
+| `orbit_camera.gd`（改） | 新增 `forward_after_focus(dir)`：预测 `focus_on(dir)` 之后镜头的真实朝向（**不移动镜头**），与 `focus_on` 共用同一套 yaw/pitch 夹取（`_sph_dir` 抽出共用）。生成流程靠它在 focus_on 之前就知道「首屏视线」——太阳取景与缩星都锚在它上面 |
+| `tests/test_sun.gd`（新，GUT） | 结构断言 + 确定性 + 取景判据 + 缩星规则 + 拾取零耦合回归（见 §8），12 项全绿 |
 
 装配后场景树：
 
@@ -160,15 +164,17 @@ Planet (Node3D)
 | 双相机挡太阳 | 深度测试 | 文档 §7.4 明确勿搬双相机 |
 | `Blend SrcAlpha One` + alpha=1 | `blend_add` + `ALPHA = 1` | Godot `blend_add` = `SRC_ALPHA, ONE`，alpha=1 时即 `dst + rgb`，与原版等价 |
 | 太阳方向 = 时间/季节公式 | seed 派生的静态方向（期 1）；§7.5 公式存档（期 3） | 项目无时间系统；`sun_dir` 接口先立 |
-| 星星靠近太阳缩小 0.35× | 期 2 可选：`build()` 传入 `sun_dir`，`dot > 0.8` 缩小 | 静态星空 + 静态太阳，构建时一次算完即可 |
+| 星星靠近太阳缩小 0.35× | ✅ 期 2：`star_dome.build(seed, sun_dir)` 传入太阳方向，逐星 `rel *= star_shrink_factor(dir·sun_dir)` | 缩的判据是「落在**光晕可见圆盘**内」，阈值由 `glow_disc_cos()` 从我们自己的光晕几何导出（**不照抄**原版常数 0.8 —— 那是原版自己的光晕边缘，我们的光晕更小）；只改尺寸不改亮度/位置，与原版一致 |
+| 原版星空层随太阳旋转（`Rotation = LookRotation(sunPos)`） | 不旋转：星穹固定在世界坐标，太阳方向也是固定世界方向 | 无昼夜系统（期 3 才引入），星空不需要跟着转；且**点积与旋转无关** —— 原版在图层局部系算 `dot(starLocal, forward)`，我们算世界系 `dot(starWorld, sunDir)`，两者等价（旋转保内积） |
 | 无方向光 | 不加灯 | 全 unshaded 不变 |
 
 ### 4.4 与现有系统的耦合边界
 
 - 拾取：纯数学只对单位球求交，太阳 quad 永远不会被点中（零改动、零回归）；
 - 拖拽/缩放：太阳每帧贴相机位置，与星穹一致，无视差滚动；
-- 二次生成：换 seed → 只改 `direction`，不重建网格（方向是数据不是几何）；
-- 大气/星空/HUD/菜单：期 1 完全不感知太阳，零改动。
+- 二次生成：换 seed → 重铺星穹（`build()` 会重算缩星）+ 改 `direction`；
+- 大气/星空/HUD/菜单：期 1 不感知太阳；期 2 起星穹**消费**太阳方向（只缩星点尺寸，
+  不改星点位置/亮度/数量 → 星空布局与确定性完全不变）。
 
 ---
 
@@ -210,10 +216,24 @@ sun_dir = normalize(v)
 3. ✅ `planet.gd` 接线：`_sun_dir`（菜单默认 + seed 派生）+ 建节点 + 大气优先级；
 4. ✅ GUT 结构测试 7 项 + 截图调参（四档 dist + 转向/遮挡构图各一张）。
 
-**期 2（可选，观感增强）**
-- 星星避让：`dot(starDir, sunDir) > 0.8` → 0.35×（构建时一次算完，
-  参照 `WorldLayer_Stars.cs:63-68`）；
-- （透明排序已在期 1 用 `render_priority` 钉死，无需额外调优。）
+**期 2（已完成）：星星避让（光晕内的星缩小）**
+- ✅ 语义照搬原版 `WorldLayer_Stars.cs:63-68`：`dot(starDir, sunDir)` 超过阈值
+  → 星点尺寸按 `1 + (0.35-1)·t` 线性缩小（正对太阳 0.35×，光晕边缘 1.0×）。
+- ✅ **阈值不照抄原版的常数 0.8**。那个 0.8 不是魔数：它恰好等于原版太阳
+  「光晕可见圆盘」的边缘（方片半宽 7.5 @ 距离 10 → atan(7.5/10)=36.87° → cos=0.8），
+  语义是「**落在光晕里的星星缩小**」。我们的光晕更小（比例 0.8 → 半宽 6 @ 距离 15
+  → 21.8° → cos≈0.928），照抄 0.8 会让光晕外一圈星星无故变小。
+  阈值改由 `sun_quad.glow_disc_cos()` 从**我们自己的光晕几何**导出 ——
+  改 `SUN_SIZE_RATIO` / `SUN_DIST` 时阈值自动跟着走，缩星范围永远等于光晕范围。
+- ✅ 实现落点：`star_dome.build(seed, sun_dir)` 增加太阳方向入参，逐星算
+  `rel *= sun_quad.star_shrink_factor(dir·sun_dir)`（**只改尺寸**，不改亮度/位置，
+  与原版一致 —— 原版缩的是 quad 的绘制尺寸）。
+- ✅ 方向一致性：太阳方向在生成流程**开头**定一次（`_sun_dir`），星空缩星与
+  太阳本体共用同一个值 —— 否则缩掉的不是这颗太阳旁边那批星。
+  锚点用 `orbit.forward_after_focus(_region_center)`（与 `focus_on` 共用同一套
+  俯仰夹取，逐位一致，且不受生成过程中玩家拖动镜头的影响）。
+- ✅ GUT 4 项 + 实测（种子 4242）：光晕圆盘内 620 颗星中 610 颗被缩，
+  远端 15380 颗一颗未动；截图对比可见光晕区星点明显变小、远空依旧细碎。
 
 **期 3（可选，昼夜联动——观感大改，单独拍板）**
 - 大气日照侧提亮（原版 `0.28·sun²+0.02` 公式）；
@@ -240,6 +260,9 @@ sun_dir = normalize(v)
 | WebGL2 填充率 | 光晕覆盖约 58% 屏高 → 朝太阳看时是较大面积的加法 pass | 公式极简（无采样），实测无感；若低端机掉帧先调小 `SUN_SIZE_RATIO` | ✅ 实测无感 |
 | 菜单相位差异 | 原版菜单无太阳，我们在菜单建了太阳节点 | 有意差异：本项目菜单背后本就是星空层（太阳同属"天空"）。**但菜单是不透明全屏面板，玩家实际看不到它** —— 太阳的首次可见时刻是生成完成、菜单收起时 | ✅ 已实现 |
 | seed 派生把太阳放进星球背后首屏 | 开场构图看不到太阳 | 偏置采样限定在首屏视线旁（§4.2），GUT 用 **NDC 判据**断言太阳落在画面内 | ✅ 已断言 |
+| 缩星阈值照抄原版常数 0.8 | 光晕外多出一圈无故变小的星星（我们的光晕比原版小） | 阈值由 `sun_quad.glow_disc_cos()` 从**我们自己的光晕几何**导出（0.928 ↔ 21.8°）；原版的 0.8 是它自己光晕边缘的 cos | ✅ 已断言（阈值=自身光晕边缘） |
+| 缩星与太阳方向不一致 | 缩掉的不是这颗太阳旁边那批星 | 太阳方向在生成流程开头定一次（`_sun_dir`），缩星与太阳本体共用；锚点 `forward_after_focus` 与 `focus_on` 共用夹取逻辑 | ✅ GUT 断言预测视线 == 真实视线 |
+| 原版星空层随太阳旋转 | 误以为必须旋转星穹才对得上原版 | 点积与旋转无关：原版在局部系算 `dot(starLocal, forward)`，我们算世界系 `dot(starWorld, sunDir)`，等价 | ✅ 已验证（实测 620/610 颗命中） |
 
 ---
 
@@ -251,18 +274,24 @@ sun_dir = normalize(v)
    ④ 太阳在星球背后 → 中心被遮、轮廓外光晕 + 大气边缘共存 ✅
    （拉远到 10 时是标准的"逆光日冕"观感）；⑤ 菜单相位太阳节点已存在
    （用默认方向），但菜单本身是**不透明全屏面板**、玩家看不到它 ——
-   玩家第一次看见太阳是生成完成、菜单收起的那一刻（方向已换成种子派生的）。
+   玩家第一次看见太阳是生成完成、菜单收起的那一刻（方向已换成种子派生的）；
+   ⑥ 期 2 缩星：光晕圆盘内的星明显变小、远空星点依旧细碎 ✅（截图 A/B 对比）。
 2. **确定性**：同 seed 两次派生 `_sun_dir` 逐位一致；换 seed 方向变化 ✅；
    首屏方向落在画面内 ✅（NDC ±1 判据）。
-3. **结构断言**（GUT 7 项全绿）：`SUN_DIST > MAX_DIST + PLANET_RADIUS` ✅；
+3. **结构断言**（GUT 12 项全绿）：`SUN_DIST > MAX_DIST + PLANET_RADIUS` ✅；
    quad 尺寸 = `SUN_DIST × SUN_SIZE_RATIO` 生效 ✅；quad 平面 ⟂ 太阳方向 ✅；
-   相机相对位置 ✅；方向单位化 ✅；拾取零耦合 ✅。
+   相机相对位置 ✅；方向单位化 ✅；拾取零耦合 ✅；
+   缩星阈值 == 自身光晕边缘 ✅；缩星系数单调且有界 ✅；
+   星穹确实按太阳方向缩星（端到端逐星比对）✅；无太阳时不缩 ✅；
+   `forward_after_focus` == 真实镜头视线 ✅。
 4. **零贴图**：太阳相关新资产 = 0（仅 2 个代码文件 + `.uid`）；包体增量 < 10KB ✅。
-5. **无耦合回归**：orbit_camera 8/8、test_sun 7/7、**test_coverage 2/2**
-   （本轮顺带修好了它遗留的 `_build_goldberg_mesh_async` 缺参数问题）→ 全套 17/17 绿 ✅；
+5. **无耦合回归**：orbit_camera 8/8、test_sun 12/12、**test_coverage 2/2**
+   （本轮顺带修好了它遗留的 `_build_goldberg_mesh_async` 缺参数问题）→ 全套 22/22 绿 ✅；
+   `tools/test_starfield.gd` 冒烟 9 项全 PASS ✅；
    lint 诊断数与改动前基线一致（7 errors + 2 warnings，均为 `star_atlas.gd` /
    `bake_glyphs.gd` 的既有问题）✅。
 6. **性能**：太阳 1 quad / 1 draw call；每帧一次 transform 赋值 ✅；
+
    运行期日志 353 行零 error / 零 warning ✅。
 
 ---
