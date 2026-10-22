@@ -152,16 +152,47 @@ func _run() -> void:
 		return
 	print("PASS: 顶点色调制器语义正确（灰阶乘数 + a∈{0,0.4,0.8} 岩石量）")
 
+	# —— 5b) 水格判定：UV2 → 格号反推（与 shader 的 vertex() 同一套公式）——
+	# shader 靠它决定该贴片要不要摊平 WorldMacro；判据错位 = 海面/陆地摊反了，
+	# 而且是**静默**的视觉 bug（不报错、只是海面出现斑块）。这里把公式原样复刻一遍：
+	#   格原点 = (GUTTER + (i%COLS)*cell)/aw → (origin - gutter_uv)/格距 = 格号
+	var cell_uv_v: Vector2 = atlas["cell_uv"]
+	var gutter_uv_v: Vector2 = atlas["gutter_uv"]
+	var pitch_v: Vector2 = cell_uv_v + 2.0 * gutter_uv_v
+	var bad_water := -1
+	for i in origins.size():
+		var ij := Vector2(round((origins[i].x - gutter_uv_v.x) / pitch_v.x),
+				round((origins[i].y - gutter_uv_v.y) / pitch_v.y))
+		# 反推格号必须等于图集布局的格号（4 列 × 2 行）
+		if ij != Vector2(float(i % 4), float(floori(float(i) / 4.0))):
+			bad_water = i
+			break
+		# 只有格 0（Ocean）与格 7（未生成深洋备份）判为水
+		var is_water: bool = (ij - Vector2(0.0, 0.0)).length() < 0.5 \
+				or (ij - Vector2(3.0, 1.0)).length() < 0.5
+		if is_water != (i == 0 or i == 7):
+			bad_water = i
+			break
+	if bad_water >= 0:
+		print("FAIL: 格 ", bad_water, " 的水格判定/格号反推与布局不符")
+		_quit(1)
+		return
+	print("PASS: 水格判定正确（格号反推 = 布局格号；仅格0 Ocean 与格7 未生成深洋判为水）")
+
 	# —— 6) 材质 uniform 装配 ——
 	var mat: ShaderMaterial = planet._mesh_instance.material_override
 	var ok_mat: bool = false
 	var cv := Vector2.ZERO
+	var gv := Vector2.ZERO
 	if mat != null:
 		var t0 = mat.get_shader_parameter("biome_atlas")
 		var t1 = mat.get_shader_parameter("macro_tex")
 		cv = mat.get_shader_parameter("cell_uv")
-		ok_mat = t0 is Texture2D and t1 is Texture2D and cv.x > 0.0 and cv.y > 0.0
-	print(bin_if(ok_mat, "材质 uniform 装配齐全（atlas/macro/cell_uv=%s）" % str(cv)))
+		gv = mat.get_shader_parameter("gutter_uv")
+		ok_mat = t0 is Texture2D and t1 is Texture2D and cv.x > 0.0 and cv.y > 0.0 \
+				and gv.x > 0.0 and gv.y > 0.0
+	print(bin_if(ok_mat, "材质 uniform 装配齐全（atlas/macro/cell_uv=%s/gutter_uv=%s）" \
+			% [str(cv), str(gv)]))
 	_quit(0 if (ok_grid and ok_mat) else 1)
 
 

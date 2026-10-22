@@ -1,19 +1,26 @@
 shader_type spatial;
 // 星球地表三层质感（见 docs/planet_textures_plan.md）：
 //   ① 生态色卡贴图（原版手绘低对比噪声，逐片按 UV2 定位图集格子）
-//   × ② WorldMacro 宏观噪声（大陆尺度斑块，全星球共享，打散平铺重复感）
+//   × ② WorldMacro 宏观噪声（大陆尺度斑块，全星球共享，打散平铺重复感；
+//        **水格只保留它的均值**——海面摊平，见下方「水格摊平」说明）
 //   × ③ 顶点色调制器（贴片级地形明暗 + 山体基岩混合）
 // unshaded：颜色全部由上面三层给出，不受场景光照影响。
 // cull_disabled：双面渲染（沿用原实现——放大穿进去看时内壁也有颜色）。
 render_mode unshaded, cull_disabled;
 
-// 生态色卡图集（biome_atlas.gd 运行期打包：4×2 共 8 格，第 8 格=未生成纯色）。
-// 采样坐标经 fract() 折进本格，不依赖 repeat；mipmap 由打包时 generate_mipmaps 提供。
+// 生态色卡图集（biome_atlas.gd 运行期打包：4×2 共 8 格，第 8 格=未生成深洋的
+// Ocean 卡备份）。采样坐标经 fract() 折进本格，不依赖 repeat；mipmap 由打包时
+// generate_mipmaps 提供。
 uniform sampler2D biome_atlas : source_color, filter_linear_mipmap;
 // 全局宏观噪声（整张平铺，低频）——UV 超出 [0,1]，必须 repeat。
 uniform sampler2D macro_tex : source_color, filter_linear_mipmap, repeat_enable;
 // 单格有效区 UV 尺寸（不含 gutter），由 planet.gd 从图集打包结果回填。
 uniform vec2 cell_uv = vec2(0.2222, 0.4444);
+// 单格 gutter（四边）的 UV 尺寸，由 planet.gd 从图集打包结果回填。
+// 用途：从 UV2（格子原点）反推格号 → 判定该贴片是不是水格（见 vertex）。
+// 默认值 = 打包常量算出的真值（GUTTER=64, aw=4*384=1536, ah=2*384=768）：
+//   gutter_uv = (64/1536, 64/768) = (0.0416667, 0.0833333)
+uniform vec2 gutter_uv = vec2(0.0416667, 0.0833333);
 
 // 山体基岩色：与 planet.gd 的 C_ROCK 同值，顶点色 a（岩石混合量）向它 lerp。
 const vec3 ROCK_COLOR = vec3(0.45, 0.42, 0.39);
@@ -22,17 +29,43 @@ const vec3 ROCK_COLOR = vec3(0.45, 0.42, 0.39);
 const float TILING = 8.0;
 // WorldMacro 每面平铺次数（照抄原版 1.5 → 大陆尺度斑块）。
 const float MACRO_TILING = 1.5;
+// WorldMacro 的**原始字节空间**均值 —— 水格摊平后乘在海面上的常数。
+// ⚠️ 为什么不是 sRGB→线性后的均值（0.78902…）：本工程的色卡/宏观噪声在 shader 里
+// 取到的就是 PNG 原字节值（source_color 未再解码），显示端也不二次编码 ——
+// 实测「海面像素 = 色卡原值 × 乘数」逐位成立：
+//   改前 0.2728 × 0.90036 = 0.2456 ≈ 实测 0.2437；
+//   用线性均值时 0.2728 × 0.78902 = 0.2153 ≈ 实测 0.2131（海面暗 12.5%）。
+// 实测（assets/WorldMacro.png 全部 65536 texel，逐通道字节平均）：
+//   (0.90036, 0.89907, 0.90036)，逐通道标准差 6.33/255 → 乘数范围 0.801~0.969。
+// 摊平到均值而不是 1.0：海面平均亮度分毫不动，也不与陆地之间产生亮度台阶。
+const vec3 MACRO_MEAN = vec3(0.90036, 0.89907, 0.90036);
+// 水格保留的 WorldMacro 振荡比例：0 = 完全摊平（默认），1 = 与陆地同款。
+// 现场可调（set_shader_parameter("ocean_macro", x)），零改码。
+uniform float ocean_macro = 0.0;
 
 // 顶点色 = 色调制器：rgb = 明暗乘数（1.0 = 原亮度），a = 岩石混合量。
 varying vec4 v_tile_color;
 // UV2 = 图集格子原点（贴片内全部顶点同值 → 插值无损，逐片恒定）。
 varying vec2 v_cell_origin;
+// 水格标记（1 = 该贴片是海面），逐片恒定（由 UV2 反推格号得到）。
+varying float v_is_water;
 // 世界坐标（vertex 算一次，fragment 归一化后做盒式投影）。
 varying vec3 v_world_pos;
 
 void vertex() {
 	v_tile_color = COLOR;
 	v_cell_origin = UV2;
+	// —— 水格标记：从 UV2（格子原点）反推格号 ——
+	// 格原点 = (GUTTER + (i%COLS)*cell) / aw → (origin - gutter_uv) / 格距 = 格号（整数）。
+	// 格距 = cell_uv + 2*gutter_uv（含 gutter 的整格步距）。
+	// 图集布局 4 列 × 2 行：格 0 = Ocean（海洋/内陆湖），格 7 = 未生成深洋备份
+	//（覆盖率外的"不可探索区域"）。这两格就是全部的水 → 水格摊平 WorldMacro。
+	// 改 biome_atlas 的 COLS/ROWS 时，这里的两个格号判据要同步改。
+	vec2 pitch = cell_uv + 2.0 * gutter_uv;
+	vec2 ij = round((v_cell_origin - gutter_uv) / pitch);
+	float d_ocean = length(ij - vec2(0.0, 0.0)); // 第 0 格
+	float d_deep = length(ij - vec2(3.0, 1.0));  // 第 7 格
+	v_is_water = clamp((1.0 - step(0.5, d_ocean)) + (1.0 - step(0.5, d_deep)), 0.0, 1.0);
 	v_world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
 }
 
@@ -70,6 +103,14 @@ void fragment() {
 	vec3 macro = texture(macro_tex, p * MACRO_TILING).rgb;
 	// ③ 顶点色：rgb 明暗乘数（丘陵压暗），a 岩石混合（山区往基岩色压）。
 	vec3 tinted = mix(base * v_tile_color.rgb, ROCK_COLOR, v_tile_color.a);
-	ALBEDO = tinted * macro;
+	// —— 水格摊平（有意偏离原版，见 docs/planet_textures_plan.md §3⑤）——
+	// 原版 RimWorld 的海洋也是 Ocean × WorldMacro；但那层大陆尺度斑块落在
+	// 近纯色的海面上毫无遮挡地裸露（实测：海面亮度 σ 的 85~91% 方差来自它，
+	// 与其自身波动的理论值逐位吻合），观感就是"海面有噪声纹理"。
+	// 这里把水格上的 macro 振荡抹平、只留均值：海面平均亮度分毫不动
+	// （乘 MACRO_MEAN 而非 1.0），也不与陆地之间多出一道亮度台阶。
+	// ocean_macro=0 → 完全平；=1 → 回到原样（现场可调）。
+	vec3 macro_final = MACRO_MEAN + (macro - MACRO_MEAN) * mix(1.0, ocean_macro, v_is_water);
+	ALBEDO = tinted * macro_final;
 	// 故意不写 ALPHA：保持不透明渲染管线（biome 边界不能出现半透明缝）。
 }

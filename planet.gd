@@ -74,6 +74,8 @@ const C_ICE := Color(0.93, 0.95, 0.97)    # 冰盖
 # （Ocean 卡备份），贴图 × macro × 顶点色与已生成海域逐像素一致，覆盖区边界
 # 无缝，不再出现与海洋对比强烈的浅蓝死海块；逻辑上它仍属于“未生成”，
 # 没有地形数据也不可交互（见 is_tile_interactable）。
+# 注：第 8 格与第 0 格都是「水格」→ shader 里 WorldMacro 振荡同样被摊平，
+#     两格处理一致，逐像素一致的不变量不受影响。
 
 # ---- 群系 id 表：颜色与 HUD 显示同源（_biome_id 判定，BIOME_NAMES/ COLORS 查表）----
 const BIOME_NONE := 255 # 未生成贴片没有群系
@@ -387,6 +389,8 @@ func _on_generate_requested(params: Dictionary) -> void:
 	mat.set_shader_parameter("biome_atlas", atlas["texture"])
 	mat.set_shader_parameter("macro_tex", atlas["macro"])
 	mat.set_shader_parameter("cell_uv", atlas["cell_uv"])
+	# gutter 尺寸：shader 从 UV2（格子原点）反推格号 → 判定水格（摊平 WorldMacro）
+	mat.set_shader_parameter("gutter_uv", atlas["gutter_uv"])
 	_mesh_instance.material_override = mat
 	add_child(_mesh_instance)
 	# 大气光晕：紧跟星球上线（星球边缘那圈柔和的蓝白光晕，见 atmosphere.gdshader）
@@ -587,6 +591,7 @@ func _terrain_level(elev: float) -> TerrainLevel:
 #   a   = 往基岩色压的比例（shader 里向 ROCK_COLOR lerp；山区对半、不可逾越几乎纯岩）
 # 平原/水域 = 全白不动色（贴图原色直出）；海洋贴片的海色来自 Ocean.png，
 # 与地形数据无关。
+# （WorldMacro 在水格上只保留均值、不留振荡 —— 海面摊平，见 planet_surface.gdshader）
 func _tile_appearance(level: int) -> Color:
 	var dark := 1.0 # 明暗乘数
 	var rock_mix := 0.0 # 往基岩色压的比例

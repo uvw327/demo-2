@@ -3,8 +3,10 @@ extends RefCounted
 # 生态色卡图集：把 7 张原版生态色卡（512²，见 docs/planet_textures_plan.md §2）
 # 各缩到 256²，打包成 4×2 网格图集，供 planet_surface.gdshader 逐贴片按 UV2 采样。
 # 第 8 格 = Ocean 卡的备份：未生成贴片（覆盖率外 = 遥远的不可探索深洋）的
-# UV2 指向它，与已生成海域逐像素同观感（同一贴图 × 同一 macro × 同一全白
+# UV2 指向它，与已生成海域逐像素同观感（同一贴图 × 同一 macro 处理 × 同一全白
 # 调制器 → 覆盖区边界无缝），仍是 1 次 draw call。
+# 注：两格都是"水格"→ shader 里 WorldMacro 的振荡被摊平（只留均值），
+#     两格处理完全一致，逐像素一致的不变量仍然成立。
 #
 # 为什么打包成一张图集（而不是照抄原版「一个 biome 一个材质」）：
 #   原版 7+ 个 biome 各一个 subMesh/材质 → 7+ 次 draw call；
@@ -50,6 +52,8 @@ const MACRO_TEXTURE := preload("res://assets/WorldMacro.png")
 #   macro        → WorldMacro 纹理
 #   cell_origins → Array[Vector2]，8 个格子有效区左上角的 UV（写进网格 UV2）
 #   cell_uv      → Vector2，单格有效区的 UV 尺寸（shader 里乘 fract 平铺坐标）
+#   gutter_uv    → Vector2，单格 gutter 的 UV 尺寸（shader 里从 UV2 反推格号：
+#                  (origin - gutter_uv) / (cell_uv + 2*gutter_uv) = 格号）
 static func build() -> Dictionary:
 	var cell := SPRITE + GUTTER * 2
 	var aw := COLS * cell
@@ -80,6 +84,7 @@ static func build() -> Dictionary:
 		"macro": MACRO_TEXTURE,
 		"cell_origins": cell_origins,
 		"cell_uv": Vector2(float(SPRITE) / float(aw), float(SPRITE) / float(ah)),
+		"gutter_uv": Vector2(float(GUTTER) / float(aw), float(GUTTER) / float(ah)),
 	}
 
 
