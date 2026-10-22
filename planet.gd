@@ -41,10 +41,15 @@ const LEVEL := 6
 #const LEVEL := 6
 const SUBDIV := 1 << LEVEL # 每条棱的等分数 f
 const PLANET_RADIUS := 1.0
-# 大气光晕球壳半径 / 星球半径（1.12 → 壳比星球大 12%，光晕只出现在轮廓外缘；
+# 大气光晕球壳半径 / 星球半径（1.06 → 壳比星球大 6%，光晕只出现在轮廓外缘；
 # 球壳要包住辉光带的整个外尾：ATMOSPHERE_RADIUS ≈ 1 + 0.9 × band_width，
 # 否则带的尾巴被壳剪影硬切出一圈亮边——band_width 调整时这里必须跟着动）
-const ATMOSPHERE_RADIUS := 1.12
+#
+# 取 1.06 的依据：band_width = 0.065（atmosphere.gdshader），带的数学外沿在
+# d = 1.065，壳取 1 + 0.9×0.065 = 1.0585 ≈ 1.06 —— 刚好收住带的尾巴
+#（尾巴处 a = 0.1 → a³ = 0.001，切口不可见），同时球壳尽量小（透明球壳是
+# 大面积加法 pass，壳越小越省填充率）。
+const ATMOSPHERE_RADIUS := 1.06
 # 大气光晕的透明绘制优先级：必须高于太阳（sun_quad.gd 的 10），
 # 对应原版材质队列 辉光 3001 > 太阳 1001（见 _build_atmosphere 的注释）。
 const ATMOSPHERE_RENDER_PRIORITY := 20
@@ -438,9 +443,9 @@ func _start_music() -> void:
 		_music.play()
 
 
-# 星球大气光晕（Rim Glow）：半径 1.081× 星球半径的球壳，套在星球外面。
+# 星球大气光晕（Rim Glow）：半径 1.06× 星球半径的球壳，套在星球外面。
 # 纯代码构建（与项目“全代码动态构建”的风格一致），材质用 atmosphere.gdshader：
-# 按「视线到球心的最近距离」开一条带 + 加法混合 → 星球轮廓外一圈柔和的蓝白光晕。
+# 按「视线到球心的最近距离」开一条带 + 加法混合 → 星球轮廓外一圈**纤细的白色**光晕。
 #
 # 它的作用不只是好看：亮边压住背景星空的相对亮度，
 # 星空因此显得更深邃（对应原版 RimWorld 的 WorldLayer_Glow）。

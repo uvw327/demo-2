@@ -79,7 +79,7 @@ A 作为回退方案记录在案，但先不引入 Environment 这条新依赖�
 | `assets/stars.png`（新，从 RimWorld 提取） | **原版星点图集**：1024×1024 里散布着 22 颗独立的柔光星点精灵（8×8 ~ 20×20 px，峰值 alpha 0.15~0.95）。SHA256 与原版 `Stars #1196.png` 一致。**这是第 3 轮换掉「程序化造贴图」的关键** —— 原版真实的星点长这样，比自己造的像 |
 | `star_atlas.gd`（新） | 图集处理：① `extract_sprites()` 把 1024² 图集按连通域切成 22 颗独立精灵（记录包围盒/峰值 alpha）；② `pack()` 把这些精灵紧凑打包成网格图集（每格留一倍白边防 mipmap 串味），返回每颗的 UV 矩形。**图集只含原图切出的真实精灵，不含任何程序化形状**（第 4 轮移除了此前追加的程序化四芒星）。**全部运行期做，不产生新资产文件** |
 | `star_dome.gd`（新，`class_name StarDome extends MultiMeshInstance3D`） | ① 启动时 `_ensure_atlas()` 一次性切分+打包图集（结果缓存，换种子不重做）；② `build(seed)`：SeededRNG → 高斯均匀球面方向 × 16000 → 每 quad 一个 instance（切平面 basis + 随机绕法线旋转 + 随机尺寸 + 随机 instance color + 随机采样图集里的一颗星）；UV 矩形经 `INSTANCE_CUSTOM` 传给 vertex()；transform 进 `_built`、颜色进 `_built_colors`（冒烟可测）再提交 MultiMesh（dummy 渲染器读不回）；③ `_process`：仅做 `global_position = cam.global_position`；④ 种子变了才重建 |
-| `atmosphere.gdshader`（新，第 2 轮新增） | 星球大气辉光：包住星球的球壳（1.081× 半径），按「视线到球心的最近距离 d」算一条 `a = max(0, 1 - |(d-1)/0.08|)` 的带，`ALPHA = a³·intensity`，加法混合（对照原版 `Custom_PlanetGlow`） |
+| `atmosphere.gdshader`（新，第 2 轮新增） | 星球大气辉光：包住星球的球壳（1.06× 半径），按「视线到球心的最近距离 d」算一条 `a = max(0, 1 - |(d-1)/0.065|)` 的带，`ALPHA = a³·intensity`，加法混合（对照原版 `Custom_PlanetGlow`） |
 | `planet.gd`（改，~10 行） | `_ready`：`add_child(_star_dome); _star_dome.build(0)`（菜单相位即有星空）；`_on_generate_requested` 换种子时 `build(seed)`；星球上线时 `_build_atmosphere()` 挂辉光球壳 |
 | `tools/test_starfield.gd`（新，冒烟护栏） | 数量/确定性（同 seed 逐位一致、换 seed 变化）/方向分布均匀/材质就绪/**亮度随机性（暗星占比 ~0.92、use_colors 已开）**/**星点密度（切出的精灵数 ≥ 4、quad 数下限）**/相机跟随，共 8 项 |
 
@@ -91,7 +91,7 @@ Planet (Node3D)
 ├── OrbitCamera (Camera3D)
 ├── WorldMenu
 ├── MeshInstance3D   ← 星球（半径 1）
-├── MeshInstance3D   ← 大气辉光球壳（半径 1.081）
+├── MeshInstance3D   ← 大气辉光球壳（半径 1.06）
 └── StarDome (MultiMeshInstance3D)   ← 星穹（半径 400，每帧贴相机位置）
 ```
 
@@ -107,8 +107,8 @@ Planet (Node3D)
 | `SAMPLE_JITTER_MIN / MAX` | 0.75 / 1.35 | 抽到精灵后再乘一层随机大小 → 「采样哪颗 + 抽到后多大」两层随机 |
 | （`FOUR_POINT_SIZE` / `FOUR_POINT_RATIO`） | 已移除 | 第 4 轮删除：曾用程序化四芒星充当亮星形态；现所有星（含最亮的）一律只采样 `stars.png` 切出的真实精灵，不掺程序化形状 |
 | `BACKGROUND` | `#10171E` | RadWorld 天空相机清色；写入 project.godot 的 default_clear_color |
-| `ATMOSPHERE_RADIUS`（`planet.gd`） | 1.081 | 大气辉光球壳半径 / 星球半径（= 原版 108.1/100） |
-| 辉光 `band_width` / `intensity` / `glow_color` | 0.095 / 0.42 / (0.42,0.60,1.0) | = 原版 `_GlowRadius` 8/100 略放宽；`a³` 三次方让带边缘迅速熄灭；**颜色往蓝里压**——原版截图的光晕是明确的「钢蓝」不是白色 |
+| `ATMOSPHERE_RADIUS`（`planet.gd`） | **1.06** | 大气辉光球壳半径 / 星球半径。= 1 + 0.9 × `band_width`（球壳要收住带的尾巴，否则尾巴被壳剪影硬切出亮边）；带收薄后壳也跟着缩，小壳省填充率 |
+| 辉光 `band_width` / `intensity` / `glow_color` | **0.065** / 0.42 / **(1, 1, 1) 纯白** | `a³` 三次方让带边缘迅速熄灭。⚠️ **后两项与第 2 轮不同**：第 2 轮按原版截图把颜色「往蓝里压」((0.42,0.60,1.0))、带宽放宽到 0.095；后来实测评判为**太蓝 + 太厚** —— 深色太空背景上那一圈蓝边像霓虹描边、还把星球轮廓糊掉了。改成**纯白 + 收薄到 0.065**（约一半）：白边读作「空气散射」，画面里唯一的彩色留给星球本身（海洋/植被） |
 
 第 2 轮调校的核心认识：**原版 RimWorld 的星星本身就是「暗色噪点 + 少数亮星」**，
 不是「一堆亮十字」。首版之所以完全不像，是因为亮度维度根本没参与——
@@ -134,6 +134,10 @@ Planet (Node3D)
 2. **辉光往蓝里压**：原版截图里星球光晕是明确的「钢蓝」，不是白色；
    `glow_color` 从原版的 (0.706,0.839,1.0) 压到 (0.42,0.60,1.0)。
    蓝味足了才压得住背景星空的相对亮度，星空才显得更深邃。
+   > ⚠️ **后来被推翻**：这条是照着原版截图做的，但实测评判为「太蓝 + 太厚」——
+   > 深色背景上那一圈蓝边像霓虹描边，而不是大气。现已改成**纯白 + 带宽收薄到
+   > 0.065**（见 §4.2 参数表）。压住星空相对亮度这件事仍然成立，只是靠
+   > 亮度而非蓝味。
 
 > **instance color 的一个坑（务必记住）**：`MultiMesh.set_instance_color()` 是
 > **乘在网格顶点色上**的（引擎文档原话：*multiplying* the mesh's existing vertex colors）。
@@ -178,10 +182,10 @@ Blend SrcAlpha One / ZTest Off / ZWrite Off
 
 | 原版 | 本项目 | 说明 |
 | --- | --- | --- |
-| 球壳半径 108.1 / 星球 100 | `ATMOSPHERE_RADIUS = 1.081` × `PLANET_RADIUS` | 比例 1:1 照搬 |
-| `a = max(0, 1 - \|(d-100)/8\|)` | `a = max(0, 1 - \|(d-1)/0.08\|)` | 归一化到星球半径 1 |
+| 球壳半径 108.1 / 星球 100 | `ATMOSPHERE_RADIUS = 1.06` × `PLANET_RADIUS` | **有意偏离**：壳按 `1 + 0.9×band_width` 跟带宽联动（带收薄 → 壳跟着缩），不再是原版的 1.081 |
+| `a = max(0, 1 - \|(d-100)/8\|)` | `a = max(0, 1 - \|(d-1)/0.065\|)` | 归一化到星球半径 1；带宽比原版的 0.08 **更窄**（原版照搬后实测「太厚」） |
 | `a³` | `a*a*a` | 同 |
-| 颜色 (0.706, 0.839, 1) | 同 | 偏蓝白 |
+| 颜色 (0.706, 0.839, 1) | **(1, 1, 1) 纯白** | **有意偏离**：原版的偏蓝白实测「太蓝」，像霓虹描边不像大气 |
 | `Blend SrcAlpha One` | `blend_add` | 加法混合 |
 | `ZTest Off / ZWrite Off` | `depth_draw_never`（深度测试仍开） | 我们是单相机，深度测试留着更稳：辉光壳不写深度，不影响别的物体 |
 | 日照侧更亮（`sun²`） | 固定 `intensity` | 本项目无太阳/昼夜概念，留一个常量 |
@@ -223,6 +227,8 @@ Blend SrcAlpha One / ZTest Off / ZWrite Off
 - 尺寸再缩：`STAR_SIZE_MIN/MAX` = 0.015/0.08 → **0.010/0.05**（原版截图的星是几像素的小点）；
 - 辉光往蓝里压：`glow_color` (0.706,0.839,1.0) → **(0.42,0.60,1.0)**，`intensity` 0.38 → 0.42，
   `band_width` 0.08 → 0.095（更柔）；
+  > ⚠️ 后续（大气调校轮）这两项又被改回：**纯白 (1,1,1)** + `band_width` **0.065**，
+  > 球壳 1.081 → **1.06**。原因见 §4.2 参数表与上面第 2 条的提示。
 - 暗星占比 0.90 → 0.92（暗星上限 0.55，亮星更少更集中）；
 - 护栏：冒烟脚本新增「星点密度」断言（共 8 项）；
 - 实测：屏幕星点密度 ~480 个/百万像素、402 FPS、3 个 draw call、星穹 build() 13ms。
