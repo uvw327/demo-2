@@ -5,6 +5,7 @@
 > 主要关联文件：`planet.gd`、`planet_surface.gdshader`、`planet_hills.gdshader`
 > 一期结论：**先算水网数据，再用独立河流 mesh + 独立 shader 画固定宽度线带**；一期走贴片中心线，二期可切换为贴片边界线。
 > 渲染决策：**河流压住低丘（SmallHills/LargeHills），但被高山（Mountainous/Impassable）压住**；目标平台是**移动端 GL Compatibility**；选中环最终应在河流之上，本期先不改选中环，河流暂时盖住它也可接受。
+> 下一步：**§20 河流渲染第二阶段（河宽分级 + 链式 ribbon 已落地，见 §20.14；配色仍待定）**。
 
 ---
 
@@ -1472,3 +1473,416 @@ A 相对一期现状（湿/热）：
 `test_planet_rivers` 保持候选 `1,330` → 整树 `-203` / 短枝 `-315` → 最终 `812` 条，密度 `11.1%`，入海口 `27`，最短枝 `4`，`branch_p50=8`，`trunk_p50=13`，`tree_min=8`；mesh 仍为 `2,436` 采样点 / `3,248` 三角形；`test_planet_hills` PASS。
 
 后续如果地形高度范围或平坦区分布发生较大变化，导致单桶元素异常增多，可提高桶数或在桶内加小型堆；当前场景不需要。
+
+---
+
+## 20. 河流渲染第二阶段：河宽分级 + 链式 ribbon（2026-10-23 已实施，见 §20.14）
+
+> 前置：§18（A 方案）与 §19（生成性能）已落地，812 条河段 / 24 ms 河流层。
+> 本轮**只动渲染**：水文、选边、图层（低丘 0 → 河流 1 → 高山 2）、depth_bias 全部不改。
+> 落地范围收敛为**只做河宽**（配色仍沿用一期亮蓝），实际参数与踩坑记录见 **§20.14**。
+
+### 20.1 参考图 vs 现状：先量化差距
+
+口径：`temp/river.png` 为 2461×1910，星球直径 ≈ 2461 px → 1 个世界单位 ≈ 1230 px；
+当前截图 `final_river.png`（dist 1.15 近景）与 `final_1.png`（默认视角）。
+
+| 维度 | 参考图实测 | 当前实现 | 差距 |
+|---|---|---|---|
+| 干流核心宽度 | ≈ 24 px = **0.98% 星球直径** | 统一屏幕下限 2.2 px | 干流偏细约 4–5× |
+| 支流核心宽度 | ≈ 5–8 px = 0.2%–0.33% | 同样是 2.2 px | 支流偏粗约 2× |
+| 干/支宽度比 | **≈ 3–4×** | **1×** | 完全没有流量分级 |
+| 核心色（实测中位） | **(73, 82, 100) = #495264** | (50, 123, 199) = #327BC7 | 过饱和、过亮 |
+| 与陆地亮度关系 | 比陆地（112,101,56）**略暗**（≈0.85×） | 比陆地明显更亮 | 观感反转 |
+| 边缘 | 3–4 px 软过渡（源图放大伪影，换算 ≈1 px） | 1 px AA | 可接受 |
+| 拐点 | 连续，无分节 | 每段独立方头，拐点外凸小方块 | 明显"串珠/台阶" |
+| 汇流 | 支流细、干流粗，宽度自然跳级 | 等宽叠加，看不出汇水 | 缺少层级 |
+| 上游端头 | 渐细、接近消失 | 等宽硬截断 | 像被切断 |
+
+几个关键实测（用像素扫描得到，可复现）：
+
+- 参考图行 `y=800`：河道核心 `x∈[1112,1136]` 共 24 px，色值恒为 `(73,82,100)`；
+  两侧各有 3–4 px 从 `(80,85,91)` 渐变到陆地 —— 是**线性混合**，不是描边。
+- 当前截图里河色实测 `(50,123,199)`，与 uniform `(0.20,0.48,0.78)` **逐位相同**
+  → 本工程 GL Compatibility 管线下「uniform 值 = 屏幕值」，可直接按参考图色值填。
+- 陆地色：参考图 `(112,101,56)`，本工程 `(97,88,48)` —— 调色板本就接近，
+  所以参考图的河色可以直接搬过来，不需要为我们的地表重新配色。
+
+### 20.2 差距归因（按视觉贡献排序）
+
+1. **宽度不随流量分级**（贡献最大）。`RIVER_BASE_HALF_WIDTH=0.0018` 对干流、源头一视同仁，
+   再加上 `min_width_px=2.2` 兜底，远看所有河都是同一根线 → 没有主次，读不出"干流汇水"。
+2. **每段独立 ribbon + 方头延长**。相邻两段在同一节点各自沿自己的切线外扩半宽，
+   在拐点外侧留缺口、在转向处留下两个凸出的小方块 → 正是截图里那种"台阶/串珠"。
+3. **颜色策略反了**。现在是"高饱和亮蓝"，参考图是"比地表略暗的去饱和灰蓝"。
+   前者像在图上画的记号，后者像地表上的水。
+4. **上游端头硬截断**。等宽方头让支流末端像被切断的短线，破坏"叶脉/树根"感。
+5. **汇流处没有宽度台阶**。参考图支流汇入时宽度跳一级，是河网层级的主要视觉线索。
+6. **边缘锐度单一**。参考图（去掉放大伪影后）约 1 px 柔边；我们现在也是 1 px，
+   但配上亮色 + 等宽几何就显得硬。等颜色和宽度改对后，这一条会自然消失。
+
+### 20.3 目标与非目标
+
+**目标**
+
+1. 干流 / 支流有 **3–4× 的宽度差**，且下游只增不减，汇流处出现自然台阶。
+2. 河线在拐点处**连续无缝**：无外凸小方块、无台阶、无分节感。
+3. 河色改为参考图的暗灰蓝，整体**只比地表略暗**，不抢地表信息。
+4. 上游端头**渐细并轻微淡出**，支流末端不再是硬截断。
+5. 上述改动**不增加 draw call**，移动端 GL Compatibility 上帧率不变差。
+
+**非目标**
+
+- 不做流动动画、水面反光、泡沫、贴图波纹（属后续阶段，UV.y 已预留）；
+- 不做河道蜿蜒/平滑（是否加一次 Chaikin 见 §20.13 Q3，本轮默认不加）；
+- 不做湖泊出口、三角洲、分叉（非树结构）；
+- 不恢复"每段独立方头"的像素风硬边；
+- 不动水文、选边、密度、图层顺序与 `depth_bias`。
+
+### 20.4 架构决策：宽度搬到 CPU 烘焙，shader 只做最小像素补偿与上色
+
+**为什么不继续在 shader 里展开宽度**：
+
+- 拐点要 miter：左右两侧的偏移方向不同、长度也不同。当前顶点布局里
+  `NORMAL` 只能承载**一个**侧向方向，`UV.x` 只有 ±1 一个标量，表达不了 miter；
+- 端点要渐细：宽度变成沿链变化的量，而 shader 侧不知道"这是第几个采样点"；
+- 方头延长要跟宽度联动：几何侧延长量必须等于该端半宽。
+
+所以把 `half_w` 从 shader 搬到几何侧，**shader 只保留两件事**：
+① 远视角下的"最小屏幕宽度"补偿；② 边缘 AA 与 alpha。
+
+**顶点布局（一条 ribbon 每个采样点 2 个顶点）**
+
+| 通道 | 内容 | 用途 |
+|---|---|---|
+| `ARRAY_VERTEX` | 偏移后**重新归一化**到球面的点 | 半径恒为 1.0，贴地不变 |
+| `ARRAY_NORMAL` | 单位侧向向量（左顶点 `-side`，右顶点 `+side`） | 最小像素补偿方向 |
+| `ARRAY_TEX_UV` | `(0/1, s)` | x = 侧别 + AA；y = 沿链弧长归一（留给流动动画） |
+| `ARRAY_TEX_UV2` | `(half_w, w01)` | x = 烘焙半宽（世界单位）；y = 宽度归一值（调试用） |
+| `ARRAY_COLOR` | `(alpha, 0, 0, 1)` | 端点渐隐，乘进最终 alpha |
+
+**收益**：几何不再是零面积三角形 → 去掉 `custom_aabb` 兜底、AABB 真实、
+以后想开阴影/深度写也不用重做。代价是 mesh 构建时多算一遍偏移（仍在 2–4 ms 量级）。
+
+shader 草案（完整替换现有 `planet_rivers.gdshader`）：
+
+```glsl
+shader_type spatial;
+render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;
+
+uniform vec4 river_color : source_color = vec4(0.286, 0.322, 0.392, 1.0);
+uniform float min_width_px = 1.8;        // 远视角兜底；近景不生效
+uniform float edge_softness_px = 0.8;
+uniform float depth_bias = 0.004;        // 与现状一致，不动
+uniform float bank_darken = 0.0;         // 可选：岸线压暗（默认关）
+
+varying float v_alpha;
+varying float v_w01;
+
+void vertex() {
+    // 只在「窄河 + 远视角」时生效：烘焙宽度已经够宽就直接用几何
+    vec4 view_pos = MODELVIEW_MATRIX * vec4(VERTEX, 1.0);
+    float depth = max(-view_pos.z, 1e-4);
+    float px_world = 2.0 * depth / (PROJECTION_MATRIX[1][1] * VIEWPORT_SIZE.y);
+    float extra = max(0.0, 0.5 * min_width_px * px_world - UV2.x);
+    VERTEX += NORMAL * (UV.x * 2.0 - 1.0) * extra;
+
+    v_alpha = COLOR.r;
+    v_w01 = UV2.y;
+    VERTEX += normalize(CAMERA_POSITION_WORLD - VERTEX) * depth_bias;
+}
+
+void fragment() {
+    float edge = abs(UV.x * 2.0 - 1.0);
+    float aa = max(fwidth(UV.x), 1e-5) * edge_softness_px;
+    float cov = 1.0 - smoothstep(1.0 - aa, 1.0, edge);
+    vec3 col = river_color.rgb;
+    if (bank_darken > 0.0) {
+        // 岸线附近压暗，给河一点"湿岸"厚度
+        col *= 1.0 - bank_darken * smoothstep(0.55, 1.0, edge);
+    }
+    ALBEDO = col;
+    ALPHA = river_color.a * v_alpha * cov;
+}
+```
+
+注意：宽度烘焙后，`min_width_px` 只对**细河**起作用（干流在远视角仍按几何宽度走），
+所以远看不再是"一片同宽的线"，而是"干流粗、支流细、极细的兜到 1.8 px"。
+
+### 20.5 分支链（branch chain）+ miter 接头 —— 消掉"串珠"
+
+**邻接**：在候选图（§18.5 的 candidate-local 结构）上补三件事，O(E)：
+
+```
+child_count[v]   # 该节点有几条上游河段（0 = 源头，≥2 = 汇合点）
+first_child[v]   # 链表头
+next_sibling[v]  # 链表下一项
+```
+
+**分链规则**（每条河段恰好属于一条链，不做重复几何）：
+
+1. 从每个**源头**（`child_count == 0`）起一条链，沿 `parent` 往下游走；
+2. 走到**汇合点**（`child_count >= 2`）就**包含该点并停止**；
+3. 每个汇合点再起一条**下游链**（以它为首节点），继续走到下一个汇合点或水面；
+4. 水面是终点，沿用 §8.2 的"岸线中点截断"。
+
+于是链与链只在**汇合点这一个节点**上重叠，且该节点的宽度取自 `Q`（同一个值），
+两侧偏移点完全相同 → 天然无缝，既不会漏缝也不会重复叠色。
+
+**miter 计算**（内部节点，前后方向已知）：
+
+```
+d_in  = 前一采样点 → p 的切向（单位，投影到 p 的切平面）
+d_out = p → 后一采样点 的切向
+m     = normalize(d_in + d_out)                 # 角平分方向
+cos_h = dot(m, d_out)                           # = cos(转角/2)
+len   = half_w / max(cos_h, RIVER_MITER_MIN_COS) # 钳制，防止尖角爆长
+side  = normalize(cross(p, m))
+左顶点 = normalize(p - side * len)，右顶点 = normalize(p + side * len)
+```
+
+- `RIVER_MITER_MIN_COS = 0.4`（转角 > 约 132° 的尖角被截短，宁可留小缺口也不爆刺）；
+- 本工程走线是贴片中心线，相邻段转角多在 60° 以内，`len ≈ 1.15 × half_w`，不会触发钳制；
+- **汇合点**是特例：该点没有单一"前方向"，改用
+  `m = normalize(dir(最宽上游支流 → p) + dir(p → parent))` 作为统一角平分方向，
+  让上下游两条链在这一节点使用**同一组偏移点**，接头完全对齐。
+
+**端点处理**：
+
+- 下游端（入海口）：沿用现状，截到 `normalize(a + b)` 的岸线中点，不做方头延长；
+- 下游端（汇合点）：不延长（由下游链覆盖）；
+- 上游端（源头）：最上游 1 段内 `half_w` 从 `0.3 ×` 渐增到 `1 ×`，同时 `COLOR.r` 从 `0.4` 渐到 `1.0`
+  → 支流末端变成"逐渐消失的细尖"，而不是硬方头。
+
+**采样**：每个节点边仍按 `RIVER_MAX_ARC_DEG = 2.5°` 细分（沿用 §9.7.4 的防弦切下沉结论），
+节点处用 miter 偏移点，段内按 `t` 线性插值 `half_w`。
+
+### 20.6 河宽映射：流量 → 宽度
+
+在 `_compute_river_edges()` 末尾（过滤之后、建 mesh 之前）为每个河网节点算半宽：
+
+```
+q_ref = P90(_river_flow[v] for v in river_nodes)      # 本次生成实测，非硬编码
+u     = clamp(Q[v] / q_ref, 0, 1)
+w01   = pow(u, RIVER_WIDTH_EXP)                        # 初值 0.5 → 支流段更细
+half  = lerp(RIVER_HALF_MIN, RIVER_HALF_MAX, w01)
+```
+
+- `Q` 沿下游单调不减（§7.3 不变量）→ `half` 也单调不减，**不会出现下游变细**；
+- 汇流处 `Q` 跳一级 → 宽度台阶，正是参考图的层级感；
+- `RIVER_HALF_MIN = 0.0022`（≈0.22% 直径，对应参考图支流）、
+  `RIVER_HALF_MAX = 0.0095`（≈0.95% 直径，对应参考图干流）；
+- 实现时打印半宽直方图（p10/p50/p90/max）核对：目标 p50 ≈ 0.0035、p90 ≈ 0.0060；
+  若 p50 偏高说明支流整体过粗，调 `RIVER_WIDTH_EXP`（0.4–0.8）或 `q_ref` 分位。
+
+### 20.7 颜色、边缘、远视角
+
+- **核心色**：`(0.286, 0.322, 0.392)` = `#495264`，alpha **固定 1.0**
+  ——alpha < 1 会让汇流重叠处出现暗缝（§9.2 已踩过）；
+- **边缘**：`edge_softness_px = 0.8`，比现状略柔；`fwidth` AA 在 GL Compatibility 可用，不加额外成本；
+- **岸线压暗**：`bank_darken` 默认 **0**（参考图没有暗边），留作现场可调旋钮；
+- **远视角**：`min_width_px` 从 2.2 降到 1.8。因为干流现在有真实宽度，
+  兜底只需要照顾最细的支流，避免"远看一片同宽"；
+- **不做**：流动纹理、反光、泡沫。`UV.y = 弧长归一` 已经写入顶点，后续加动画不用改几何。
+
+### 20.8 参数表（初值，截图后调）
+
+| 参数 | 初值 | 说明 |
+|---|---:|---|
+| `RIVER_HALF_MIN` | 0.0022 | 最细河半宽（世界单位，球半径 1） |
+| `RIVER_HALF_MAX` | 0.0095 | 最粗干流半宽 |
+| `RIVER_WIDTH_EXP` | 0.5 | 流量→宽度曲线指数 |
+| `RIVER_WIDTH_Q_REF_PCT` | 0.90 | `q_ref` 取河流节点流量分位 |
+| `RIVER_MITER_MIN_COS` | 0.4 | miter 钳制（尖角截短） |
+| `RIVER_TIP_TAPER` | 0.3 | 上游端头起始宽度比例 |
+| `RIVER_TIP_ALPHA` | 0.4 | 上游端头起始 alpha |
+| `RIVER_MIN_WIDTH_PX` | 1.8 | 屏幕最小宽度（原 2.2） |
+| `RIVER_EDGE_SOFTNESS_PX` | 0.8 | 边缘 AA 宽度 |
+| `RIVER_COLOR` | `#495264` | 参考图实测核心色 |
+| `RIVER_BANK_DARKEN` | 0.0 | 岸线压暗（默认关） |
+| `RIVER_DEPTH_BIAS` | 0.004 | **不变** |
+| `RIVER_MAX_ARC_DEG` | 2.5 | **不变** |
+
+### 20.9 数据结构与代码落点
+
+**`planet.gd` 新增成员**
+
+```gdscript
+var _river_child_count := PackedInt32Array()   # 长度 total
+var _river_first_child := PackedInt32Array()
+var _river_next_sibling := PackedInt32Array()
+var _river_half_width := PackedFloat32Array()  # 长度 total，0 = 非河网
+var _river_branch_nodes := PackedInt32Array()  # 扁平节点串
+var _river_branch_offsets := PackedInt32Array() # CSR 偏移，长度 = 链数 + 1
+var _river_branch_n := 0
+var _render_stats: Dictionary = {}             # 链数/顶点数/宽度分位，给测试和日志
+```
+
+**新增/改写的函数**
+
+| 函数 | 职责 |
+|---|---|
+| `_compute_river_widths()` | 由 `_river_flow` 算 `_river_half_width`，打直方图 |
+| `_build_river_branches()` | 建 children 邻接 + 分链，产出 CSR |
+| `_build_river_mesh_from_branches()` | 替换 `_build_river_mesh_from_edges()`：miter + taper + 逐顶点属性 |
+| `_build_river_layer()` | 改调新 mesh 函数；不再设 `custom_aabb`；其余（材质/priority/阴影）不变 |
+
+**保持不变**：`_river_edges`（测试、HUD、`tools/capture_final.gd` 都依赖它）、
+`_river_parent` / `_river_flow` / `_river_stats`、shader 的 `depth_bias` 与图层 priority。
+
+### 20.10 分阶段实施（每阶段出截图再进下一阶段）
+
+| 阶段 | 内容 | 预期观感变化 | 验收 |
+|---|---|---|---|
+| **R1 河宽分级** | 加 `UV2.x` 烘焙半宽（几何仍按现有一边一段展开，宽度按端点插值），shader 改为"最小像素补偿" | 干流明显变粗、支流变细，出现层级 | 近景 vs `final_river.png`；宽直方图 p50/p90 |
+| **R2 链式 ribbon + miter** | `_build_river_branches()` + 新 mesh 函数，拐点 miter、汇合点共用偏移 | 串珠/台阶消失，线条连续 | 近景放大 4× 检查拐点；顶点/三角形数与链数吻合 |
+| **R3 端头 + 配色** | 上游 taper/渐隐、颜色 `#495264`、AA 0.8、"远视角 1.8 px" | 从"记号笔"变成"水脉" | 与 `temp/river.png` 同尺度并排 |
+| **R4 回归 + 文档** | 测试、三档截图、移动端帧时间、回填本节数据 | — | 全套回归绿 |
+
+每阶段都保留上一版截图（`user://final_*.png`），方便回退比较。
+
+### 20.11 测试与验收
+
+**`tools/test_planet_rivers.gd` 需要改的断言**（现在按"逐边 n+1 采样"重算 mesh，会失效）：
+
+- mesh：顶点数 = 链采样数 × 2（按 `_river_branch_nodes` 重算），索引 = 采样数 × 6；
+- 顶点半径仍为 `1.0 ± 1e-5`（偏移后必须重新归一化）；
+- `NORMAL` 为单位向量；`UV.x ∈ {0,1}`；`UV2.x ∈ [RIVER_HALF_MIN, RIVER_HALF_MAX]`；
+- 新断言：
+  - **宽度单调**：对每条河段 `half_width[to] >= half_width[from] - 1e-6`；
+  - **链完整性**：每条河段恰好出现在一条链里（用计数数组核对，无重复、无遗漏）；
+  - **链内一致**：链首是源头或汇合点，链尾是水面或汇合点；
+  - **无 NaN**：全部顶点 `is_finite()`；
+- 原有的 parent 链、无环、阈值、密度、确定性、图层 priority 断言全部保留。
+
+**视觉验收**
+
+1. 三档截图：dist 1.15 / 2.33 / 10.0（沿用 `tools/capture_final.gd`）；
+2. 新增"参考同尺度"一档：把星球直径控制在 ≈ 1000 px，然后**数值核对**干流半宽
+   是否落在星球直径的 0.45%–0.5%（参考图 0.49%）；
+3. 近景放大 4× 检查：拐点无台阶、汇流无缺口、上游端头是渐细不是断口、无 z-fighting；
+4. 干/湿两种气候各看一次，确认窄河在干旱区不会糊成一片。
+
+**回归**：`test_planet_hills`、`test_planet_texture`、`test_selection_*`、`test_starfield`、
+`test_region_cap`、`test_tile_hud`、`test_plugin_uid_fix` 全绿。
+
+**性能**：桌面 `_build_river_mesh_from_branches` 目标 ≤ 4 ms（现在 2.1 ms）；
+移动端关注**填充率**——变粗的干流会增加 overdraw，但支流变细、总覆盖面积基本持平，
+预计帧时间不升；生成期顶点数预计 4–6 k（现在 4.9 k）。
+
+### 20.12 风险与缓解
+
+| 风险 | 表现 | 缓解 |
+|---|---|---|
+| miter 在尖角处爆长 | 拐点出现长刺 | `RIVER_MITER_MIN_COS` 钳制 + 超阈值退化 bevel |
+| 干流过粗 | 近景像河堤/公路 | `RIVER_HALF_MAX` 上限 + 近景截图复核；必要时按 dist 做宽度缩放（本轮不做） |
+| 暗色河在深色地形上不可见 | 森林/基岩区河网"消失" | 保留 `bank_darken` 与 `river_color` 现场可调；必要时一提亮档 |
+| alpha 重叠发暗 | 汇合点出现暗斑 | 核心 alpha 锁 1.0，透明度只出现在 AA 边缘 |
+| 链式构建复杂度 | 分链错误 → 漏段/重段 | 测试里用"计数数组核对每条河段恰好一次" |
+| 顶点数上升 | 移动端 mesh 构建变慢 | 链共享节点，实际顶点数基本持平；实测 > 6 k 再优化 |
+| 过度模仿参考图的软边 | 河线发虚 | 参考图软边是放大伪影，按 0.8 px AA 收，不回退到 3 px |
+
+### 20.13 开始实现前需要拍板
+
+1. **配色**：直接用参考图实测 `#495264`（比地表略暗、去饱和），
+   还是保留一点"水蓝"倾向（例如 `(0.26, 0.36, 0.46)`）？我建议先用 `#495264` 出图，再微调。
+2. **干流宽度**：参考图是 ≈1% 星球直径（近景会比较粗），是否接受？
+   还是压到 0.7% 左右更"克制"？
+3. **折线感**：保持贴片中心的硬折线（更接近参考图的 120° 地格感），
+   还是加一次 Chaikin 平滑（更自然但会弱化地格感）？我建议**先不加**。
+4. **上游端头**：渐细 + 淡出（我建议），还是"细线直接断开"？
+5. **是否要岸线压暗**（`bank_darken`）：参考图没有，我建议默认关，只留旋钮。
+
+确认后按 §20.10 的 R1 → R4 顺序落地，每阶段出对比截图再继续。
+
+### 20.14 实施结果（2026-10-23，已落地，未提交）
+
+**范围收敛**：与需求方确认后，本轮**只做河宽**，配色沿用一期
+`RIVER_COLOR = (0.20, 0.48, 0.78)` 不动（§20.6/20.7 里关于 `#495264`、
+`bank_darken`、Chaikin 平滑的部分一律推迟）。取舍理由：先把"粗细"这个
+几何问题解决干净，配色是独立旋钮，混在一起改没法判断哪一步起了作用。
+
+**最终参数（与 §20.8 初值不同的以这里为准）**
+
+| 参数 | 最终值 | 相对 §20.8 初值的调整原因 |
+|---|---:|---|
+| `RIVER_HALF_MIN` | 0.0016 | 0.0022 太粗，细支流没有"毛细"感 |
+| `RIVER_HALF_MAX` | 0.0060 | 0.0095 近景像蓝色高速公路；0.006 实测更稳 |
+| `RIVER_WIDTH_EXP` | **0.80** | 初值 0.5 时 p50=0.0035，离 max 只有 1.7×，全网看着一样粗；0.8 把 p50 压到 0.0028，干/支比 2.3× → **3.0×**（参考图 3–4×） |
+| `RIVER_WIDTH_Q_PCT` | 0.90 | 不变 |
+| `RIVER_MITER_MAX_RATIO` | 1.4 | 替换 `RIVER_MITER_MIN_COS`：直接钳"偏移长度 ≤ 1.4×半宽"，比钳 cos 更好推理 |
+| `RIVER_TIP_TAPER` | 0.35 | 0.3 略尖，0.35 收得住又不像断线 |
+| `RIVER_TIP_ALPHA` | 0.45 | 0.4 有点糊 |
+| `RIVER_MIN_WIDTH_PX` | 1.6 | 干流已有真实宽度，兜底只照顾细支流 |
+| `RIVER_MAX_WIDTH_PX` | **28** | 初值 16 太小：dist 1.15 时几乎所有河道都被夹到同一宽度，直接复现"统一粗细" |
+| `RIVER_DEPTH_BIAS` | 0.004 | 不变 |
+
+**分支链实测**（`LEVEL=6`、`coverage=0.3`、seed 4242、rain/temp=1）：
+812 条河段 → **115 条分支链** → 927 采样点 / 1,624 三角形，单 surface 单
+draw call；半宽 p50 = 0.0028、p90 = 0.006、max = 0.006，干/支比 **3.0×**。
+
+#### 踩坑记录：`PROJECTION_MATRIX * VIEWPORT_SIZE` 在 GL Compatibility 下不可信
+
+这是本轮最难查的一个 bug，现象是"换了宽度之后河流整个消失"。
+
+- 用 `StandardMaterial3D`（洋红）覆盖河流材质 → 河道清晰可见 ⇒ 几何没问题；
+- 换成只有 `ALBEDO = vec3(1,0,0)` 的极简 `ShaderMaterial` → 也能看见 ⇒
+  材质槽、实例、AABB、图层都没问题；
+- 换回项目 shader → **一个像素都不出**（逐变体数像素：极简 5,234 px / 项目 0 px）；
+- 逐步加特征二分定位：问题出在
+  `px_world = 2·depth / (PROJECTION_MATRIX[1][1] · VIEWPORT_SIZE.y)` 这一行。
+
+把该式的结果编码进颜色回读到 CPU 后确认：算出的 `px_world` 比实际小约
+**26 倍**（同场景 CPU 侧真值 0.0033，shader 算出 0.00012）。后果是
+`half_hi = 0.5·max_width_px·px_world` 远小于已烘焙半宽，
+`clamp()` 把**每一条**河道都压成 ~1 像素 —— 淡水色细线在暗地表上等于消失。
+
+> 一期之所以没暴露：那时 shader 用 `max(base_half_width, 0.5·min_width_px·px_world)`，
+> 只有**下限**，`px_world` 偏小最多让细河不够粗，不会把河压没。
+> 本轮引入**上限**后，同一个偏差变成"把所有河压成 0"。
+
+**修法**：像素换算不再由 shader 反推，改由 CPU 直接给焦距（§20.14.1）。
+`focal_px = 0.5 · 视口高 / tan(fov/2)`，口径与 `orbit_camera.gd::_drag_gain`
+和选中环的 `px_per_world` 完全一致；`planet.gd::_update_river_camera_params()`
+在建层时写一次，并挂 `viewport.size_changed` 重算。
+
+#### 20.14.1 shader 侧宽度合成顺序（重要）
+
+```
+px_world = depth / focal_px
+want     = max(UV2.x, 0.5·min_width_px·px_world)        # ① 下限：远景细河别消失
+if max_width_px > 0:                                    # ② 软封顶
+    half_hi = 0.5·max_width_px·px_world
+    knee    = 0.6·half_hi
+    if want > knee:
+        want = knee + (half_hi-knee)·(1 - exp(-(want-knee)/(half_hi-knee)))
+VERTEX += side · (UV.x*2-1) · (want - UV2.x)            # ③ 差额补偿
+```
+
+② 必须是**软膝（exp 渐近）而不是 `clamp`**：`clamp` 会把所有超过上限的河道
+压成**同一个宽度**，近景干流/支流全变一样粗——又回到需求方最不能接受的
+"统一粗细"。exp 形式在 `UV2.x` 上严格单调，次序永不反转，所以也不会出现
+"这里粗、那里细、过一会又变粗"。
+
+③ 的差额可正可负：远景细河补宽（正），近景干流限宽（负）。
+
+#### 20.14.2 验收核对（§20.11 的逐条结果）
+
+| 验收项 | 结果 |
+|---|---|
+| 半宽 ∈ `[HALF_MIN, HALF_MAX]` | ✅ 0.0016–0.0060 |
+| 下游半宽单调不减（无"粗—细—粗"） | ✅ 逐边断言通过 |
+| 干/支比 ≥ 2.5× | ✅ 3.0× |
+| 每条河段被分支链覆盖恰好 1 次 | ✅ 812/812 |
+| 源头端渐细渐隐 | ✅ `TIP_TAPER`/`TIP_ALPHA` 仅对 `child_count < 2` 的链头生效 |
+| 汇合点无缝/无尖刺 | ✅ 共享角平分方向 + miter 钳 1.4×；孤立图层截图无断口 |
+| 单 surface 单 draw call | ✅ 1 surface / 1,624 三角形 |
+| 确定性（同种子逐位一致） | ✅ |
+| 回归 | ✅ `test_planet_rivers` PASS；hills/texture/selection_smoke/starfield/region_cap/tile_hud/uid 全 PASS |
+
+**出图**：dist 1.15 / 2.33 / 10.0 + 干流近景四张已复看；孤立图层（隐藏地表）
+确认 ribbon 无断口、miter 外角干净。
+
+**仍未做**：配色（仍是原亮蓝）、Chaikin 平滑、岸线压暗、流动纹理。
+按需求方要求**代码保持未提交**，可整体回滚。
+

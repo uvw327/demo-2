@@ -1,7 +1,21 @@
-// 星球河流层（一期）：固定宽度、方头、贴地 decal。
+// 星球河流层（宽度分级）：宽度已经烘进几何，shader 只负责
+//  ① 远视角最小屏幕宽度补偿（只对细支流生效，干流走真实几何宽度）
+//  ② 近景最大屏幕宽度封顶（避免贴脸时干流变成蓝色高速公路）
+//  ③ 边缘抗锯齿 + 源头端 alpha 渐隐
+//  ④ 视线深度偏移（零视差 decal）
 //
-// 几何半径 = 1.0（与地表共面），宽度在 vertex 里按屏幕最小宽度展开；
-// 深度避让不靠径向抬升，而是沿“相机→顶点”的视线推近 depth_bias。
+// 几何：半径 1.0 的球面 ribbon，左右顶点各自按 miter 偏移（见 planet.gd）；
+//   NORMAL = 侧向单位向量，UV.x = 0/1（左/右），UV2.x = 烘焙半宽（世界单位），
+//   COLOR.r = alpha（源头端渐细渐隐）。
+//
+// 像素换算：px_world = depth / focal_px。
+//   focal_px 由 GDScript 每帧写入（planet.gd 的 _update_river_camera_params），
+//   口径与 orbit_camera.gd 的拖动增益一致：focal = 0.5·视口高 / tan(fov/2)。
+//   ⚠ 不要在这里用 PROJECTION_MATRIX / VIEWPORT_SIZE 反推：实测在
+//   GL Compatibility 下二者乘积与真实光栅高度对不上（偏大约一个数量级），
+//   会把 px_world 算小，进而让下面的封顶把整条河网压成 1 像素。
+//
+// 深度避让不靠径向抬升，而是沿“相机→顶点”的视线推近 depth_bias：
 // 透视下屏幕投影严格不变，所以不会在大圆边缘（limb）浮空/错位，
 // 掠射角也不会像径向抬升那样把深度差压到 0。
 // 同款手法见 selection_ring.gdshader（depth_bias=0.006）。
@@ -17,27 +31,52 @@ shader_type spatial;
 render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;
 
 uniform vec4 river_color : source_color = vec4(0.20, 0.48, 0.78, 1.0);
-uniform float base_half_width = 0.0018;
-uniform float min_width_px = 2.2;
+// 屏幕最小宽度：只有「烘焙半宽 < 该值」的细支流会被加宽，
+// 干流在远视角仍保留真实宽度差，不会整条河网一样粗。
+uniform float min_width_px = 1.6;
+// 屏幕最大宽度：近景时干流按世界宽度会长到几十像素，这里压住上限，
+// 避免贴脸时河道变成「蓝色高速公路」。0 = 不限制。
+uniform float max_width_px = 16.0;
 uniform float edge_softness_px = 1.0;
 
+// 焦距（像素）：depth=1 处 1 世界单位投影多少像素。
+// 由 planet.gd 按当前相机 fov 与视口高度写入。
+uniform float focal_px = 800.0;
+
 // 沿视线向相机推近的世界单位：只改深度，不改屏幕投影。
-// 移动端初值 0.004；若设备是 16-bit 深度且远看仍闪，见 docs/planet_rivers_plan.md §9.7.6。
 uniform float depth_bias = 0.004;
 // 调试：0=视线偏移（默认），1=径向抬升（对照），2=不偏移（复现 z-fighting）。
 uniform int depth_mode = 0;
 
+varying float v_alpha;
+
 void vertex() {
 	vec3 side = normalize(NORMAL);
 
-	// 宽度展开：仍在模型空间；MODELVIEW_MATRIX 只用来算当前深度下
-	// 1 像素对应的世界尺寸。
+	// 屏幕宽度上下限：几何已按 Q 烘焙好宽度，这里只做差额补偿。
 	vec4 view_pos = MODELVIEW_MATRIX * vec4(VERTEX, 1.0);
 	float depth = max(-view_pos.z, 1e-4);
-	float px_world = 2.0 * depth
-			/ (PROJECTION_MATRIX[1][1] * VIEWPORT_SIZE.y);
-	float half_w = max(base_half_width, 0.5 * min_width_px * px_world);
-	VERTEX += side * (UV.x * 2.0 - 1.0) * half_w;
+	float px_world = depth / max(focal_px, 1.0);
+
+	float half_lo = 0.5 * min_width_px * px_world;
+	// 先兜最小屏幕宽度：远景时细支流不至于消失。
+	float want = max(UV2.x, half_lo);
+	// 再做软封顶：超过 60% 上限后按 exp 渐近逼近上限。
+	// 必须是软膝而不是 clamp——clamp 会把所有超过上限的河道压成同一宽度，
+	// 近景干流/支流全变成一样粗（正是「统一粗细」的老问题）。
+	// exp 形式严格单调：Q 大的永远比 Q 小的宽，次序不会反转，也就不会出现
+	// 「这里粗、那里细、过一会又变粗」。
+	if (max_width_px > 0.0) {
+		float half_hi = 0.5 * max_width_px * px_world;
+		float knee = 0.6 * half_hi;
+		if (want > knee) {
+			float over = max(half_hi - knee, 1e-8);
+			want = knee + over * (1.0 - exp(-(want - knee) / over));
+		}
+	}
+	VERTEX += side * (UV.x * 2.0 - 1.0) * (want - UV2.x);
+
+	v_alpha = COLOR.r;
 
 	if (depth_mode == 0) {
 		vec3 to_cam = normalize(CAMERA_POSITION_WORLD - VERTEX);
@@ -49,8 +88,10 @@ void vertex() {
 }
 
 void fragment() {
-	float edge = abs(UV.x * 2.0 - 1.0);
-	float aa = max(fwidth(UV.x * 2.0), 1e-5) * edge_softness_px;
+	float e = UV.x * 2.0 - 1.0;
+	float edge = abs(e);
+	float aa = max(fwidth(e), 1e-5) * edge_softness_px;
 	ALBEDO = river_color.rgb;
-	ALPHA = river_color.a * (1.0 - smoothstep(1.0 - aa, 1.0, edge));
+	ALPHA = river_color.a * v_alpha
+			* (1.0 - smoothstep(1.0 - aa, 1.0, edge));
 }
