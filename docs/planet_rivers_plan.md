@@ -1256,3 +1256,121 @@ A 相对一期现状（湿/热）：
 - 河宽/透明度分级：本期仍固定 2.2px；
 - 海岸线平滑/填小海湾：会改变地图，最后再评估；
 - 用覆盖率/更多陆地解决密度：实测不是解，反而增加入海口数量。
+
+
+## 19. 河流生成性能结论与优化路线（2026-10-23）
+
+### 19.1 结论
+
+只讨论河流网络生成，不涉及地形/气候/渲染管线的其它优化：
+
+1. **河流渲染与 mesh 构建不是瓶颈**：`_build_river_mesh_from_edges()` 约 **2.3 ms**，当前 812 条河段、2,436 个采样点、3,248 个三角形。
+2. **成本集中在 `_compute_river_edges()`**，约 **65.5 ms**。其中 priority-flood 约 **36.4 ms（55.6%）**，A 方案过滤约 **13.3 ms（20.3%）**，统计约 **5.2 ms（7.9%）**。
+3. **当前没有达到最佳性能状态**。已有优化（预分配 mesh、批量计时、typed/Packed 数组、单 mesh/单 draw call）主要解决的是“不要无谓扩容”和“渲染不要多次 draw”，但没有解决 priority-flood 的 GDScript 堆开销、A 过滤的全量数组扫描，以及统计的无效开销。
+4. **A 方案行为保持不变**：`Qc=1.0`、`Tmin=8`、`Lmin=4`、交替过滤、812 条河段/11.1% 密度是后续性能改动的回归基线；不改 shader、固定 2.2 px 宽度、方头、图层 priority。
+
+### 19.2 实测拆解
+
+口径：桌面 headless，`LEVEL=6`、`coverage=0.3`、seed `4242`、`rain=1/temp=1`、7,291 个陆地贴片；最终 812 条河段。
+
+| 子阶段 | 耗时 | 占 `_compute_river_edges` |
+|---|---:|---:|
+| 产流 injection | 7.2 ms | 11.0% |
+| **priority-flood** | **36.4 ms** | **55.6%** |
+| 倒序汇流 | 0.55 ms | 0.8% |
+| 候选收集 | 1.7 ms | 2.6% |
+| **A 方案过滤** | **13.3 ms** | **20.3%** |
+| 最终边提取 | 0.8 ms | 1.2% |
+| **统计** | **5.2 ms** | **7.9%** |
+| **合计** | **65.5 ms** | **100%** |
+| mesh 构建 | 2.3 ms | — |
+
+说明：
+
+- 这些是墙钟时间，包含分帧等待；手机端会整体放大，但比例基本不变，仍需在目标设备上复测。
+- 过滤前候选 **1,330** 段，A 方案 3 轮过滤后 **812** 段；候选只有 1,330，但过滤/统计仍在使用 `total=40,962` 大小的数组。
+- `_build_river_mesh_from_edges()` 已经是 append + 现有数组写入，继续抠只能省约 0.5–1 ms，优先级最低。
+
+### 19.3 优化候选（按收益/成本排序）
+
+#### A. priority-flood（36.4 ms，最大头）
+
+当前实现：
+
+- 两个 `Packed*Array` 分别存 key/tile；
+- 每次 push/pop 都是 GDScript 函数调用；
+- 每次 pop 都 `resize(n)`；
+- 约 7,291 个陆地 + 约 5,000 个水面种子。
+
+优化步骤：
+
+1. **低风险**：按 `total` 预分配 heap 数组；维护 `heap_size` 代替每次 `resize`；把 push/pop 内联到 flood 循环，减少函数调用和数组访问。
+2. **中风险**：用 radix heap / 单调 bucket priority queue 替换二叉堆。priority-flood 的 pop key 单调不减，适合 O(1) 均摊的桶队列；保留浮点 key 的精确排序，并用 tile 索引做 tie-break，避免改变河网方向或确定性。
+3. **可选**：所有 `SEA_LEVEL` 水面种子先用 FIFO/同 key 桶处理，再进入主堆，减少种子阶段的堆操作。
+
+预期：`36 ms → 15–20 ms`（radix heap 理想情况）；只做预分配+内联则约 `28–32 ms`。
+
+#### B. A 方案过滤与统计（18.5 ms，第二大头）
+
+当前问题：
+
+- `_remove_small_trees()`、`_prune_short_branches()`、`_river_selection_stats()` 每次分配 `total` 大小的数组；
+- 短枝剪枝每轮扫描全量，3 轮过滤后还要再统计；
+- 实际候选只有约 1,330 段，数组规模与工作量不匹配。
+
+优化步骤：
+
+1. 一次性建立 candidate-local 结构：
+   - `cand_tiles`：候选贴片列表；
+   - `local_parent`：候选内部父索引；
+   - `local_order`：全局 `order` 过滤成候选顺序；
+   - `selected/size/root/child/branch_len`：全部长度 C；
+   - 最终把 local 结果映射回全局 tile id 生成 edges。
+2. 每轮过滤从 `O(total)` 降到 `O(C)`；候选少时收益最大。
+3. `_river_selection_stats()` 改为基于最终 selected 的紧凑数组；移动端 release 可用 `OS.is_debug_build()` 或独立开关跳过 p50/trunk 统计。
+
+预期：过滤 `13.3 → 3–5 ms`，统计 `5.2 → 1–2 ms`。
+
+#### C. injection / 候选收集（约 9 ms）
+
+- 维护 `generated_ids`（约 12,289 个已生成贴片），injection、候选收集、统计只遍历生成区，不再每次扫 40,962。
+- 预期 injection `7.2 → 4–5 ms`，候选收集 `1.7 → 约 1 ms`。
+
+#### D. mesh 构建（2.3 ms）
+
+- 按最终采样点数精确 `resize` 顶点/索引数组，避免 append 扩容；
+- 预期 `2.3 → 1.5–2 ms`，只作为收尾，不改 mesh 格式/shader。
+
+#### E. 异步 / 线程（可选）
+
+- 河流计算依赖的地形数组生成后是只读的，可把 `_compute_river_edges()` 放到 `WorkerThreadPool`，或与丘陵 mesh 构建并行；
+- 不减少 CPU 总时间，但能减少主线程卡顿、缩短墙钟时间；
+- 应在 A–D 完成后再评估，避免过早引入线程复杂度。
+
+### 19.4 实施顺序与验收
+
+建议按以下顺序：
+
+1. priority-flood 预分配 + 内联 + 去掉 pop 的 `resize`；
+2. A 过滤/统计 candidate-local 化；
+3. release 跳过统计；
+4. injection 使用 `generated_ids`；
+5. 如仍不够，再上 radix heap；
+6. mesh 精确预分配收尾。
+
+预计河流生成整体从 **65 ms 降到 30–40 ms**（桌面量级），A 方案输出与视觉不变。
+
+验收必须保持：
+
+- `test_planet_rivers.gd` 全 PASS；
+- 湿/热仍为候选 `1,330` → 最终 `812` 条，密度 `11.1%`，入海口 `27`，最短枝 `4`；
+- `tree_min=8`、`branch_min=4`、交替过滤轮数行为不变；
+- mesh 仍为 `2,436` 采样点 / `3,248` 三角形；
+- parent 链全部入水、无环；固定宽度/方头/图层 priority 不变。
+
+### 19.5 暂不做
+
+- 不量化 flood key：会改变填洼高度和河网方向；
+- 不改 shader/mesh 格式/宽度/颜色/图层；
+- 不为了性能降低 A 方案阈值或改变河网密度；
+- D8/D-infinity、连续 polyline、湖单出口仍留到后续阶段。
