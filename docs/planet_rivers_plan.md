@@ -1293,9 +1293,12 @@ A 相对一期现状（湿/热）：
 
 ### 19.3 优化候选（按收益/成本排序）
 
+> 本节是 2026-10-23 优化前的评估记录；实际落地结果见 §19.6 与 §19.7。
+> priority-flood 最终采用**精确 bucket queue**，不是 radix heap。
+
 #### A. priority-flood（36.4 ms，最大头）
 
-当前实现：
+评估时的实现：
 
 - 两个 `Packed*Array` 分别存 key/tile；
 - 每次 push/pop 都是 GDScript 函数调用；
@@ -1379,7 +1382,7 @@ A 相对一期现状（湿/热）：
 
 已按 19.4 落地前四项，未改 A 方案参数、shader 或 mesh 格式：
 
-1. **priority-flood**
+1. **priority-flood（该版二叉堆随后被 §19.7 的 bucket queue 取代）**
    - heap 数组按 `total` 预分配，用 `_river_heap_size` 维护逻辑长度，pop 不再 `resize`；
    - 水面种子 key 全为 `SEA_LEVEL`，按 tile 升序直接铺入堆，省掉种子逐次 push；
    - 主循环内联 push/pop；
@@ -1393,7 +1396,7 @@ A 相对一期现状（湿/热）：
    - 生成收尾时构建 `_generated_ids`；
    - injection、候选收集、最大填洼深度统计只遍历生成区。
 4. **旧堆删除**
-   - 删除不再使用的 `_river_heap_pop()`；保留 `_river_heap_push()` 给防御性水面分支。
+   - 删除不再使用的 `_river_heap_pop()`；`_river_heap_push()` 暂留给防御性水面分支，随后在 §19.7 中随二叉堆一起删除。
 
 同口径实测（桌面 headless，seed `4242`、`coverage=0.3`、rain/temp `1`）：
 
@@ -1403,7 +1406,7 @@ A 相对一期现状（湿/热）：
 | `_build_river_mesh_from_edges` | 2.3 ms | 2.3 ms |
 | 河流层合计 | 67.8 ms | **约 45.2 ms** |
 
-约 **33%** 的河流生成耗时下降。priority-flood 仍是最大剩余热点；如继续优化，下一步是 radix/bucket heap 或 4-ary heap，而不是继续抠过滤和 mesh。
+约 **33%** 的河流生成耗时下降。priority-flood 仍是最大剩余热点；随后在 §19.7 中实测确认：4-ary/tile-only 堆无收益，最终改用精确 bucket queue。
 
 验收保持不变：
 
@@ -1412,3 +1415,60 @@ A 相对一期现状（湿/热）：
 - mesh `2,436` 采样点 / `3,248` 三角形；
 - parent 链全部入水、无环；
 - `test_planet_hills` PASS。
+
+### 19.7 priority-flood 精确 bucket queue 实施结果（2026-10-23）
+
+只替换 priority-flood 的堆，不改 A 方案参数、shader、mesh 格式、2.2 px 宽度、方头或图层 priority。
+
+#### 实现
+
+1. 新增 `RIVER_FLOOD_BUCKETS = 4096`。
+2. injection 循环顺便统计 `max_land_elev`，用
+   `[SEA_LEVEL, max_land_elev]` 建立桶范围；超出范围的高度夹到最后一桶。
+3. **水面种子批处理**：所有水面种子 key 都是 `SEA_LEVEL`，先按 tile 升序全部处理，把它们的陆地邻居推入桶，再开始桶队列。
+   - 不能把约 5,000 个种子直接塞进 bucket 0：实测会退化成每次 pop 扫描全部种子，耗时约 **918 ms**。
+4. 每个桶用 `head/tail/next` 链表保存 tile；pop 时从当前桶开始扫描，按 `(filled[tile], tile)` 精确取最小。
+   - 没有量化 key，填洼高度和河网方向不变。
+   - `filled` 单调不减，新节点不会进入当前桶之前的桶；这是正确性的关键。
+5. 删除 `_river_heap_keys/_river_heap_tiles/_river_heap_size` 和 `_river_heap_push()`；不再保留二叉堆。
+
+内存开销：4096 个桶的 `head/tail` 约 32 KB；`next` 按 `total` 预分配，40,962 贴片约 160 KB。实测最大桶大小：默认场景 21，`coverage=1.0` 场景 27，种子 7 场景 10。
+
+#### 实测
+
+同一口径（桌面 headless，seed `4242`、`coverage=0.3`、rain/temp `1`，7 次平均）：
+
+| 指标 | §19.6 二叉堆 | §19.7 bucket queue |
+|---|---:|---:|
+| `_compute_river_edges` | 42.9 ms | **21.2 ms** |
+| `_build_river_mesh_from_edges` | 2.3 ms | **2.1 ms** |
+| 河流层合计 | 45.2 ms | **约 23.3 ms** |
+
+`_compute_river_edges` 约下降 **51%**，河流层合计约下降 **48%**。
+
+只测 flood 的临时微基准：
+
+| 方案 | 平均耗时 |
+|---|---:|
+| 二叉堆 | 31–32.6 ms |
+| tile-only 堆 | 32.2–33.2 ms |
+| 4-ary 堆 | 32.9–33.2 ms |
+| **bucket queue 4096** | **15.2–15.3 ms** |
+| FIFO 下界（仅测速，顺序不正确） | 11.3–11.6 ms |
+
+结论：4-ary/tile-only 无收益；bucket queue 已接近 FIFO 下界。
+
+#### 精确性验收
+
+额外用 4 个场景逐位比较 bucket queue 与二叉堆的 `order`/`parent`：
+
+| 场景 | 生成贴片 | 最大桶 | parent | order |
+|---|---:|---:|---|---|
+| wet low | 12,289 | 21 | 一致 | 一致 |
+| dry | 12,289 | 21 | 一致 | 一致 |
+| seed 7 wet | 12,289 | 10 | 一致 | 一致 |
+| coverage 1.0 | 40,962 | 27 | 一致 | 一致 |
+
+`test_planet_rivers` 保持候选 `1,330` → 整树 `-203` / 短枝 `-315` → 最终 `812` 条，密度 `11.1%`，入海口 `27`，最短枝 `4`，`branch_p50=8`，`trunk_p50=13`，`tree_min=8`；mesh 仍为 `2,436` 采样点 / `3,248` 三角形；`test_planet_hills` PASS。
+
+后续如果地形高度范围或平坦区分布发生较大变化，导致单桶元素异常增多，可提高桶数或在桶内加小型堆；当前场景不需要。

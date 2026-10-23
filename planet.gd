@@ -219,10 +219,6 @@ var _river_filled := PackedFloat32Array()
 var _river_instance: MeshInstance3D = null
 var _river_material: ShaderMaterial = null
 var _river_stats: Dictionary = {}
-# priority-flood 的最小堆（成员数组：Packed 数组传参是值语义，用成员避免拷贝）
-var _river_heap_keys := PackedFloat32Array()
-var _river_heap_tiles := PackedInt32Array()
-var _river_heap_size := 0                 # 当前堆内元素数；数组按 total 预分配，pop 不再 resize
 var _selected_tile := -1                  # 当前选中贴片索引；-1 = 未选中
 var _orbit: OrbitCamera                   # 轨道相机（点按事件从这里进来）
 var _selection_ring: MeshInstance3D       # 选中环：独立实例，切换选中时重建其 mesh
@@ -282,6 +278,9 @@ const RIVER_SLOPE_NORM := 0.25
 const RIVER_RUNOFF_FLAT := 0.25
 const RIVER_RUNOFF_STEEP := 0.85
 const RIVER_FILL_EPS := 1e-6
+# priority-flood 精确分桶队列的桶数。filled 单调不减，桶内再按
+# (filled, tile) 精确取最小；实测最大桶只有几十个元素。
+const RIVER_FLOOD_BUCKETS := 4096
 # 河段阈值与选边（A 方案，见 docs/planet_rivers_plan.md §18）：
 # 先低阈值拿候选水网，再用“整树规模 + 叶枝长度”两级过滤去掉小短线。
 # 不再用 RIVER_MIN_Q / RIVER_DENSITY 的隐式除法：那个 0.15 不是实际密度。
@@ -474,6 +473,7 @@ func _compute_river_edges() -> void:
 	injection.fill(0.0)
 	var land_n := 0
 	var water_n := 0
+	var max_land_elev := SEA_LEVEL
 	var generated_ids := _generated_ids
 	for v in generated_ids:
 		if _inland_water[v] == 1:
@@ -481,6 +481,8 @@ func _compute_river_edges() -> void:
 			continue
 		land_n += 1
 		var elev := _tile_elev[v]
+		if elev > max_land_elev:
+			max_land_elev = elev
 		var temp := _tile_temp[v]
 		var humid := _tile_humid[v]
 		# 最大正高差：只跟陆地邻居比（水面/未生成不算坡）
@@ -506,6 +508,8 @@ func _compute_river_edges() -> void:
 		injection[v] = clampf(r, 0.0, 1.0)
 
 	# —— 2) priority-flood：水面是种子，填平洼地并记录 parent ——
+	# 精确分桶队列：filled 单调不减，桶间按高度递增，桶内再按
+	# (filled, tile) 扫描取最小，因此与二叉堆的 pop 顺序逐位一致。
 	var filled := PackedFloat32Array()
 	filled.resize(total)
 	filled.fill(0.0)
@@ -519,24 +523,24 @@ func _compute_river_edges() -> void:
 	for v in generated_ids:
 		visited[v] = 0
 	var order := PackedInt32Array()
-	_river_heap_keys = PackedFloat32Array()
-	_river_heap_keys.resize(total)
-	_river_heap_tiles = PackedInt32Array()
-	_river_heap_tiles.resize(total)
-	_river_heap_size = 0
-	var seed_count := 0
-	# 水面种子 key 全部等于 SEA_LEVEL；按贴片索引升序写入即可构成合法最小堆
-	#（父索引小于子索引，且 tile 升序，tie-break 自然成立），省掉 N 次 push/sift。
+	var bucket_head := PackedInt32Array()
+	bucket_head.resize(RIVER_FLOOD_BUCKETS)
+	bucket_head.fill(-1)
+	var bucket_tail := PackedInt32Array()
+	bucket_tail.resize(RIVER_FLOOD_BUCKETS)
+	bucket_tail.fill(-1)
+	var bucket_next := PackedInt32Array()
+	bucket_next.resize(total)
+	bucket_next.fill(-1)
+	var bucket_span := maxf(max_land_elev - SEA_LEVEL, 1e-6)
+	var bucket_scale := float(RIVER_FLOOD_BUCKETS - 1) / bucket_span
+	# 水面种子 key 全是 SEA_LEVEL：先按 tile 升序全部处理，再把邻居推入桶。
+	# 不能直接把种子塞进 bucket 0，否则每次 pop 都会扫描全部种子。
+	var seed_tiles := PackedInt32Array()
 	for v in generated_ids:
-		if _inland_water[v] != 1:
-			continue
-		filled[v] = SEA_LEVEL
-		visited[v] = 1
-		_river_heap_keys[seed_count] = SEA_LEVEL
-		_river_heap_tiles[seed_count] = v
-		seed_count += 1
-	_river_heap_size = seed_count
-	if seed_count == 0:
+		if _inland_water[v] == 1:
+			seed_tiles.append(v)
+	if seed_tiles.is_empty():
 		# 100% 陆地兜底：最低已生成陆地当虚拟出海口
 		var lowest := -1
 		var lowest_elev := INF
@@ -545,70 +549,92 @@ func _compute_river_edges() -> void:
 				lowest_elev = _tile_elev[v]
 				lowest = v
 		if lowest >= 0:
-			filled[lowest] = SEA_LEVEL
-			visited[lowest] = 1
-			_river_heap_keys[0] = SEA_LEVEL
-			_river_heap_tiles[0] = lowest
-			_river_heap_size = 1
+			seed_tiles.append(lowest)
 			print("河流层警告：没有水面种子，使用最低陆地贴片 ", lowest,
 					" 作为虚拟出海口")
-	while _river_heap_size > 0:
-		# pop：内联二叉堆下沉，避免每贴片一次函数调用。
-		var v := _river_heap_tiles[0]
-		var n := _river_heap_size - 1
-		_river_heap_size = n
-		if n > 0:
-			var last_key := _river_heap_keys[n]
-			var last_tile := _river_heap_tiles[n]
-			var hi := 0
-			while true:
-				var l := hi * 2 + 1
-				if l >= n:
-					break
-				var r := l + 1
-				var best := l
-				if r < n:
-					var kl := _river_heap_keys[l]
-					var kr := _river_heap_keys[r]
-					if kr < kl or (kr == kl and _river_heap_tiles[r] < _river_heap_tiles[l]):
-						best = r
-				var kb := _river_heap_keys[best]
-				if kb > last_key or (kb == last_key and _river_heap_tiles[best] >= last_tile):
-					break
-				_river_heap_keys[hi] = kb
-				_river_heap_tiles[hi] = _river_heap_tiles[best]
-				hi = best
-			_river_heap_keys[hi] = last_key
-			_river_heap_tiles[hi] = last_tile
+	var remaining := 0
+	var seed_count := seed_tiles.size()
+	for v in seed_tiles:
+		filled[v] = SEA_LEVEL
+		visited[v] = 1
 		order.append(v)
-		var fv := filled[v]
-		var base := v * 6
+		var seed_fv := filled[v]
+		var seed_base := v * 6
 		for k in _tile_neighbor_count[v]:
-			var u := _tile_neighbors[base + k]
+			var u := _tile_neighbors[seed_base + k]
 			if u < 0 or visited[u] != 0:
 				continue
 			visited[u] = 1
 			if _inland_water[u] == 1:
-				# 所有水面都应已入种子；这里只做防御（理论不会走到）
-				filled[u] = SEA_LEVEL
-				_river_heap_push(SEA_LEVEL, u)
 				continue
-			filled[u] = maxf(_tile_elev[u], fv + RIVER_FILL_EPS)
-			var u_key := filled[u]
+			filled[u] = maxf(_tile_elev[u], seed_fv + RIVER_FILL_EPS)
 			parent[u] = v
-			# push：内联二叉堆上浮。
-			var hi2 := _river_heap_size
-			_river_heap_size += 1
-			while hi2 > 0:
-				var p := (hi2 - 1) >> 1
-				var kp := _river_heap_keys[p]
-				if kp < u_key or (kp == u_key and _river_heap_tiles[p] <= u):
-					break
-				_river_heap_keys[hi2] = kp
-				_river_heap_tiles[hi2] = _river_heap_tiles[p]
-				hi2 = p
-			_river_heap_keys[hi2] = u_key
-			_river_heap_tiles[hi2] = u
+			var seed_b := int((filled[u] - SEA_LEVEL) * bucket_scale)
+			if seed_b < 0:
+				seed_b = 0
+			elif seed_b >= RIVER_FLOOD_BUCKETS:
+				seed_b = RIVER_FLOOD_BUCKETS - 1
+			if bucket_tail[seed_b] < 0:
+				bucket_head[seed_b] = u
+				bucket_tail[seed_b] = u
+			else:
+				bucket_next[bucket_tail[seed_b]] = u
+				bucket_tail[seed_b] = u
+			remaining += 1
+	var cur_bucket := 0
+	while remaining > 0:
+		while cur_bucket < RIVER_FLOOD_BUCKETS and bucket_head[cur_bucket] < 0:
+			cur_bucket += 1
+		if cur_bucket >= RIVER_FLOOD_BUCKETS:
+			break
+		# 当前桶内精确取 (filled, tile) 最小；桶内通常只有 1–20 个元素。
+		var best := -1
+		var best_key := INF
+		var prev := -1
+		var best_prev := -1
+		var scan := bucket_head[cur_bucket]
+		while scan >= 0:
+			var key := filled[scan]
+			if key < best_key or (key == best_key and scan < best):
+				best = scan
+				best_key = key
+				best_prev = prev
+			prev = scan
+			scan = bucket_next[scan]
+		if best < 0:
+			break
+		if best_prev < 0:
+			bucket_head[cur_bucket] = bucket_next[best]
+		else:
+			bucket_next[best_prev] = bucket_next[best]
+		if bucket_tail[cur_bucket] == best:
+			bucket_tail[cur_bucket] = best_prev
+		bucket_next[best] = -1
+		remaining -= 1
+		order.append(best)
+		var pop_fv := filled[best]
+		var pop_base := best * 6
+		for k in _tile_neighbor_count[best]:
+			var u := _tile_neighbors[pop_base + k]
+			if u < 0 or visited[u] != 0:
+				continue
+			visited[u] = 1
+			if _inland_water[u] == 1:
+				continue
+			filled[u] = maxf(_tile_elev[u], pop_fv + RIVER_FILL_EPS)
+			parent[u] = best
+			var push_b := int((filled[u] - SEA_LEVEL) * bucket_scale)
+			if push_b < 0:
+				push_b = 0
+			elif push_b >= RIVER_FLOOD_BUCKETS:
+				push_b = RIVER_FLOOD_BUCKETS - 1
+			if bucket_tail[push_b] < 0:
+				bucket_head[push_b] = u
+				bucket_tail[push_b] = u
+			else:
+				bucket_next[bucket_tail[push_b]] = u
+				bucket_tail[push_b] = u
+			remaining += 1
 
 	# —— 3) 倒序汇流：q = injection + 所有上游 ——
 	var flow := injection.duplicate()
@@ -1003,27 +1029,6 @@ func _river_pct_int(sorted: Array[int], q: float) -> float:
 	var idx := clampi(int(floor(q * float(sorted.size() - 1))), 0,
 			sorted.size() - 1)
 	return float(sorted[idx])
-
-
-# —— 二叉最小堆（key = 填洼后高程，tie-break = 贴片索引；确定性）——
-# 数组按 total 预分配，_river_heap_size 维护逻辑长度；pop 不再 resize/append。
-func _river_heap_push(key: float, tile: int) -> void:
-	var i := _river_heap_size
-	_river_heap_size += 1
-	_river_heap_keys[i] = key
-	_river_heap_tiles[i] = tile
-	while i > 0:
-		var p := (i - 1) >> 1
-		var kp := _river_heap_keys[p]
-		var ki := _river_heap_keys[i]
-		if kp < ki or (kp == ki and _river_heap_tiles[p] <= _river_heap_tiles[i]):
-			break
-		_river_heap_keys[p] = ki
-		_river_heap_keys[i] = kp
-		var tt := _river_heap_tiles[p]
-		_river_heap_tiles[p] = _river_heap_tiles[i]
-		_river_heap_tiles[i] = tt
-		i = p
 
 
 # 河段 → 球面 ribbon：每个贴片边至少 3 采样，合并段按 2.5° 再细分；
