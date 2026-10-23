@@ -1,11 +1,10 @@
 [gd_scene format=3 uid="uid://ilt5ff8k2vnw"]
 
 [ext_resource type="Script" uid="uid://bv2j0hi818v4k" path="res://planet.gd" id="1_planet"]
-[ext_resource type="AudioStreamOggVorbis" uid="uid://s5y4uvr01bo2" path="res://assets/These_Lands.ogg" id="2_start_music"]
+[ext_resource type="AudioStream" uid="uid://s5y4uvr01bo2" path="res://assets/These_Lands.ogg" id="2_start_music"]
 
 [node name="Planet" type="Node3D" unique_id=79377790]
 script = ExtResource("1_planet")
 
-[node name="StartMusic" type="AudioStreamPlayer" parent="."]
+[node name="StartMusic" type="AudioStreamPlayer" parent="." unique_id=699515212]
 stream = ExtResource("2_start_music")
-autoplay = false
