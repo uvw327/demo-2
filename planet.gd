@@ -147,6 +147,12 @@ const SHORE_BAND_HOPS := 4.0 # 带宽（离岸格数）：1 格 ≈1.1°，4 格
 # 永不剔除；11 片 ≈ 截图案例上限（链状湖 11 片），更大的湖保留。
 const MIN_LAKE_TILES := 11
 const LAKE_FILL_ELEV := 0.02  # 填湖后的海拔 = 海平面+0.02：判成陆地、地形 FLAT 不长丘陵
+# 有效带宽自适应（⑤b0b）：白噪带视觉宽度 = 水域半径（分量最大离岸跳数）× 比例，
+# 下限保证最小湖也有岸线感的一圈、上限 = SHORE_BAND_HOPS（大洋/内海封顶，观感不变）。
+# 0.35（用户拍板）→ 半径 ≤4 跳的小湖雾带只贴岸 1~2 圈，湖心回归深蓝净色，
+# 不再整湖被白雾淹没（temp/sea_wave3.png）。
+const LAKE_RING_RATIO := 0.35
+const MIN_LAKE_RING_HOPS := 1.5
 
 var _elev_noise: FastNoiseLite   # 海拔噪声
 var _humid_noise: FastNoiseLite  # 湿度噪声（决定沙漠/森林）
@@ -1150,10 +1156,67 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		if bfs_head < bfs_q.size() and Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
 			await _slice_yield(92.5)
 
-	# 角点平均 → 归一化 shore（逐角三角一次算完，⑤c 直接查表）：
-	#   陆地 dist=0 参与均值 → 贴岸角点 shore 恰拉满 1；海冰不参与平均（冰缘不出带）；
-	#   未访问水域按深海（=带宽）处理 → shore 0。
-	#   shore = clamp((BAND − avg) / (BAND − 1), 0, 1)：首圈 avg=1 → 1，avg≥BAND → 0。
+	# ===== ⑤b0b 逐水域分量的有效带宽 ring_w（带宽随水域大小自适应）=====
+	# 固定 4 跳带宽对大洋正合适，但对半径 2~4 跳的小湖会把整湖淹进白雾
+	# （temp/sea_wave3.png：湖心到不了深蓝，整湖读作白斑，反而没有海岸线感）。
+	# 视觉带宽应是水域半径的一个比例：ring_w = clamp(D_max × LAKE_RING_RATIO,
+	# MIN_LAKE_RING_HOPS, SHORE_BAND_HOPS)——大洋/内海 D_max 大 → 封顶 = 带宽，
+	# 观感与固定带宽完全一致；小湖按比例收窄 → 白雾只贴岸一圈，湖心 s=0 回归
+	# 深蓝净色（s=0 恒 0 的无缝不变量与假白环防护全部原样保住）。
+	# 连通域口径与 ⑤b0 剔除一致：水贴片（0/海冰1/未生成255）沿角三角邻接。
+	var ring_w := PackedFloat32Array()
+	ring_w.resize(total)
+	ring_w.fill(SHORE_BAND_HOPS) # 陆地/未覆盖占位（陆地走 s=1 常量分支不查表）
+	var comp_seen := PackedByteArray()
+	comp_seen.resize(total)
+	var comp_q := PackedInt32Array()
+	var ring_min := SHORE_BAND_HOPS
+	var comp_cnt := 0
+	for w in total:
+		if comp_seen[w] != 0:
+			continue
+		var bw: int = _tile_biome[w]
+		comp_seen[w] = 1
+		if bw != 0 and bw != 1 and bw != BIOME_NONE:
+			continue # 陆地不属于任何水域分量
+		# BFS 收集连通分量，顺带求分量内最大离岸跳数 D_max
+		comp_q.clear()
+		comp_q.append(w)
+		var d_max := 0.0
+		var c_head := 0
+		while c_head < comp_q.size():
+			var u: int = comp_q[c_head]
+			c_head += 1
+			d_max = maxf(d_max, shore_dist[u]) # 未访问 -1 不影响（max 起点 0）
+			for ti in vert_faces[u]:
+				for s in 3:
+					var w2 := tri_tiles[3 * ti + s]
+					if comp_seen[w2] != 0:
+						continue
+					var bw2: int = _tile_biome[w2]
+					comp_seen[w2] = 1
+					if bw2 != 0 and bw2 != 1 and bw2 != BIOME_NONE:
+						continue # 陆地不入分量
+					comp_q.append(w2)
+		var ring := clampf(d_max * LAKE_RING_RATIO, MIN_LAKE_RING_HOPS,
+				SHORE_BAND_HOPS)
+		if comp_q.size() > 1 and ring < SHORE_BAND_HOPS:
+			ring_min = minf(ring_min, ring)
+		comp_cnt += 1
+		for i in comp_q.size():
+			ring_w[comp_q[i]] = ring
+		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(92.4)
+	print("有效带宽自适应：水域分量 ", comp_cnt, " 个，ring 最小 ", ring_min,
+			" 跳（RATIO ", LAKE_RING_RATIO, "，大洋封顶 ", SHORE_BAND_HOPS, "）")
+
+	# 逐贴片 s 域归一 → 角点平均（⑤c 直接查表）：
+	#   水贴片 s = clamp((ring_w − dist)/(ring_w − 1), 0, 1)：dist=1 恰拉满 1，
+	#   dist ≥ ring_w → 0（小湖湖心/大洋深水同样到 0）；ring_w = 带宽时与旧公式
+	#   (BAND−avg)/(BAND−1) 逐角等价（affine + 末端 clamp，实测像素无差异）。
+	#   陆地 s = 1（贴岸拉满）；海冰不参与平均（冰缘不出带）；
+	#   未访问水域（-1）按深海 → s 0。逐贴片 clamp 再平均 → 混合角
+	#   （两湖夹一陆）各用各的 ring_w，自然处理。
 	var corner_shore := PackedFloat32Array()
 	corner_shore.resize(tris.size())
 	var corner_at := 0
@@ -1167,12 +1230,17 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 				if _tile_biome[w2] == 1: # 海冰不参与角点平均
 					continue
 				var dv := shore_dist[w2]
-				ssum += dv if dv >= 0.0 else SHORE_BAND_HOPS
+				if dv < 0.0:
+					ssum += 0.0 # 未访问水域 = 深海
+				elif dv == 0.0:
+					ssum += 1.0 # 陆地：贴岸角点拉满
+				else:
+					var rw := ring_w[w2]
+					ssum += clampf((rw - dv) / maxf(rw - 1.0, 0.001), 0.0, 1.0)
 				cnt += 1
 			var shore := 0.0
 			if cnt > 0:
-				shore = clampf((SHORE_BAND_HOPS - ssum / float(cnt))
-						/ (SHORE_BAND_HOPS - 1.0), 0.0, 1.0)
+				shore = clampf(ssum / float(cnt), 0.0, 1.0)
 			corner_shore[ti] = shore
 		corner_at = corner_end
 		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
