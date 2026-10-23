@@ -216,6 +216,74 @@ func _run() -> void:
 		return
 	print("PASS: 水格判定正确（格号反推 = 布局格号；仅格0 Ocean 与格7 未生成深洋判为水）")
 
+	# —— 5c) 小水域剔除（planet.gd ⑤b0）：生成后不该再有 ≤ 阈值的封闭小水域——
+	# 复测方式与生成端同构：贴片中心空间网格建邻接 → 水贴片（0/海冰1/未生成255）
+	# 连通域；含未生成贴片 = 真海/内海（豁免）；纯已生成分量 ≤ MIN_LAKE_TILES → FAIL。
+	var n5c: int = planet._tile_centers.size()
+	var rr5c := 0.0
+	for t in n5c:
+		rr5c += planet._tile_centers[t].length()
+	rr5c /= float(n5c)
+	var spacing5c := sqrt(4.0 * PI / float(n5c)) * rr5c
+	var cell5c := spacing5c * 2.5
+	var grid5c := {}
+	for t in n5c:
+		var pv: Vector3 = planet._tile_centers[t] / cell5c
+		var key := Vector3i(int(floor(pv.x)), int(floor(pv.y)), int(floor(pv.z)))
+		if not grid5c.has(key):
+			grid5c[key] = PackedInt32Array()
+		grid5c[key].append(t)
+	var seen5c := PackedByteArray()
+	seen5c.resize(n5c)
+	var comp5c := PackedInt32Array()
+	var bad_lake := -1
+	var reach5c := spacing5c * 2.05
+	for t in n5c:
+		if seen5c[t] != 0:
+			continue
+		var bw5: int = planet._tile_biome[t]
+		seen5c[t] = 1
+		if bw5 != 0 and bw5 != 1:
+			continue
+		comp5c.clear()
+		comp5c.append(t)
+		var is_open5: bool = bw5 == planet.BIOME_NONE
+		var head5 := 0
+		while head5 < comp5c.size():
+			var u5: int = comp5c[head5]
+			head5 += 1
+			var pu5: Vector3 = planet._tile_centers[u5] / cell5c
+			var base5c := Vector3i(int(floor(pu5.x)), int(floor(pu5.y)), int(floor(pu5.z)))
+			for dx in range(-1, 2):
+				for dy in range(-1, 2):
+					for dz in range(-1, 2):
+						var key5 := base5c + Vector3i(dx, dy, dz)
+						if not grid5c.has(key5):
+							continue
+						for w5 in grid5c[key5]:
+							if seen5c[w5] != 0:
+								continue
+							if planet._tile_centers[w5].distance_to(
+									planet._tile_centers[u5]) > reach5c:
+								continue
+							var bw_5: int = planet._tile_biome[w5]
+							seen5c[w5] = 1
+							if bw_5 != 0 and bw_5 != 1:
+								continue
+							if bw_5 == planet.BIOME_NONE:
+								is_open5 = true
+							comp5c.append(w5)
+		if not is_open5 and comp5c.size() <= planet.MIN_LAKE_TILES:
+			bad_lake = comp5c[0]
+			break
+	if bad_lake >= 0:
+		print("FAIL: 仍有 ≤", planet.MIN_LAKE_TILES, " 片的封闭小水域（起点贴片 ",
+				bad_lake, "）——⑤b0 剔除未生效")
+		_quit(1)
+		return
+	print("PASS: 小水域剔除生效（无 ≤%d 片封闭水域残留；剔除 %d 贴片，真海/内海豁免）" \
+			% [planet.MIN_LAKE_TILES, planet._lake_culled])
+
 	# —— 6) 材质 uniform 装配 ——
 	var mat: ShaderMaterial = planet._mesh_instance.material_override
 	var ok_mat: bool = false

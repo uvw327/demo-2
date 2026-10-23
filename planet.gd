@@ -141,6 +141,12 @@ const COAST_DEPTH := 0.06  # 压死后的海底深度（海平面再往下压这
 # （1=岸线，0=深海），由 ⑤c 写进水贴片顶点色 a。深海 shore=0 → 走净色纯色逐位不变；
 # 陆地 a 仍是岩石量，shader 用图集格号区分，两义互不污染。
 const SHORE_BAND_HOPS := 4.0 # 带宽（离岸格数）：1 格 ≈1.1°，4 格 ≈4.4° ≈ 参考图雾斑宽度（仍够不到覆盖区强制浅滩外缘，无假白环）
+# 小水域剔除阈值：完全被已生成陆地包住的连通水域 ≤ 这么多贴片 → 生成期填成
+# 陆地。原因：微型内陆湖整湖都落在 4 跳白噪带里 → 整片泛白像白斑
+# （temp/sea_wave*.png）。与未生成深洋（BIOME_NONE）连通的分量是真海/内海，
+# 永不剔除；11 片 ≈ 截图案例上限（链状湖 11 片），更大的湖保留。
+const MIN_LAKE_TILES := 11
+const LAKE_FILL_ELEV := 0.02  # 填湖后的海拔 = 海平面+0.02：判成陆地、地形 FLAT 不长丘陵
 
 var _elev_noise: FastNoiseLite   # 海拔噪声
 var _humid_noise: FastNoiseLite  # 湿度噪声（决定沙漠/森林）
@@ -151,6 +157,8 @@ var _terrain: PackedByteArray = PackedByteArray()
 # 区内水域表：贴片索引 → 1(区内海拔<海平面的水域：内海/内陆湖/大陆架，
 # 渲染群系海色、地形按海拔自然为平原) 。选区阶段不再产出，⑤ 循环里派生。
 var _inland_water: PackedByteArray = PackedByteArray()
+# 小水域剔除计数（⑤b0 填湖统计）：冒烟护栏用来断言剔除确实发生且规模合理
+var _lake_culled := 0
 # —— HUD 显示用的逐贴片缓存（阶段 B 填充，二次生成时重置）——
 var _tile_biome := PackedByteArray()    # 群系 id（BIOME_NONE=未生成）
 var _tile_elev := PackedFloat32Array()  # 海拔噪声值
@@ -1052,6 +1060,67 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		fill_at = fill_end
 		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
 			await _slice_yield(91.0 + 1.0 * float(fill_at) / float(total))
+
+	# ===== ⑤b0 小水域剔除（封闭小湖填成陆地，见 docs/planet_textures_plan.md §3⑥）=====
+	# 微型内陆湖整湖都落在近岸白噪带里 → 整片泛白像白斑（temp/sea_wave*.png），
+	# 按用户确认的阈值剔除：水贴片（海洋0/海冰1/未生成255）沿角三角邻接做连通域，
+	# 含未生成贴片的分量是真海/内海**永不剔除**；纯已生成且 ≤MIN_LAKE_TILES 的
+	# 封闭分量（含结冰小湖）抬海拔到海平面上 → 重判群系/地形，填成陆地。
+	# 放在离岸距离场**之前** → 填出来的陆地自动成为岸线种子，数据一步到位。
+	var lake_seen := PackedByteArray()
+	lake_seen.resize(total)
+	var lake_comp := PackedInt32Array()
+	var lake_culled := 0
+	var lake_at := 0
+	while lake_at < total:
+		var lake_end := mini(lake_at + SLICE_CHECK_STRIDE * 8, total)
+		for w0 in range(lake_at, lake_end):
+			if lake_seen[w0] != 0:
+				continue
+			var bw0: int = _tile_biome[w0]
+			lake_seen[w0] = 1
+			if bw0 != 0 and bw0 != 1:
+				continue # 陆地不是分量成员（海冰=1 仍算水：结冰小湖同样剔除）
+			# BFS 收集连通分量；碰到未生成贴片 → 真海/内海，整分量保留
+			lake_comp.clear()
+			lake_comp.append(w0)
+			var is_open := bw0 == BIOME_NONE
+			var head := 0
+			while head < lake_comp.size():
+				var u: int = lake_comp[head]
+				head += 1
+				for ti in vert_faces[u]:
+					var tri: Vector3i = tris[ti]
+					for s in 3:
+						var w2: int = tri[s]
+						if lake_seen[w2] != 0:
+							continue
+						var bw2: int = _tile_biome[w2]
+						lake_seen[w2] = 1
+						if bw2 != 0 and bw2 != 1:
+							continue # 陆地不入分量
+						if bw2 == BIOME_NONE:
+							is_open = true
+						lake_comp.append(w2)
+			if is_open or lake_comp.size() > MIN_LAKE_TILES:
+				continue
+			# 封闭小湖 → 填成陆地：海拔抬到海平面略上（FLAT 不长丘陵），
+			# 群系按温湿度重判（寒带自然成冰盖/苔原，与周边气候一致）
+			for u2 in lake_comp:
+				_tile_elev[u2] = SEA_LEVEL + LAKE_FILL_ELEV
+				_inland_water[u2] = 0
+				var tb: int = _biome_id(_tile_elev[u2], _tile_temp[u2], _tile_humid[u2])
+				_tile_biome[u2] = tb
+				_terrain[u2] = TerrainLevel.FLAT
+				tile_cols[u2] = _tile_appearance(TerrainLevel.FLAT)
+				tile_cells[u2] = _biome_cell_origins[tb]
+			lake_culled += lake_comp.size()
+		lake_at = lake_end
+		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(91.5)
+	_lake_culled = lake_culled
+	print("小水域剔除：", lake_culled, " 贴片（≤", MIN_LAKE_TILES,
+			" 片的封闭湖填为陆地；连通未生成深洋的分量保留）")
 
 	var shore_dist := PackedFloat32Array()
 	shore_dist.resize(total)
