@@ -280,9 +280,13 @@ const RIVER_SLOPE_NORM := 0.25
 const RIVER_RUNOFF_FLAT := 0.25
 const RIVER_RUNOFF_STEEP := 0.85
 const RIVER_FILL_EPS := 1e-6
-# 河段阈值：Qc = RIVER_MIN_Q / RIVER_DENSITY；一期目标密度 10%~20% 陆地贴片
-const RIVER_MIN_Q := 0.6
-const RIVER_DENSITY := 0.15
+# 河段阈值与选边（A 方案，见 docs/planet_rivers_plan.md §18）：
+# 先低阈值拿候选水网，再用“整树规模 + 叶枝长度”两级过滤去掉小短线。
+# 不再用 RIVER_MIN_Q / RIVER_DENSITY 的隐式除法：那个 0.15 不是实际密度。
+const RIVER_SOURCE_QC := 1.0          # 候选源阈值；一期基线是 4.0
+const RIVER_TREE_MIN_EDGES := 8       # 保留树的最小边数（1 边 = 1 贴片河段）
+const RIVER_BRANCH_MIN_EDGES := 4     # 保留叶枝的最小边数
+const RIVER_FILTER_MAX_PASSES := 64   # 整树/短枝交替过滤的安全上限
 
 
 # 丘陵图集惰性装配（一次打包，换种子不重做——与 biome 图集同策略）
@@ -562,12 +566,12 @@ func _compute_river_edges() -> void:
 		if p >= 0:
 			flow[p] += flow[v]
 
-	# —— 4) 阈值判定：Qc = RIVER_MIN_Q / RIVER_DENSITY ——
-	var qc := RIVER_MIN_Q / maxf(RIVER_DENSITY, 0.001)
+	# —— 4) 候选阈值：Qc 直接给定（A 方案，不再用隐式除法）——
+	var qc := RIVER_SOURCE_QC
 	var sel := _collect_river_edges(parent, flow, qc)
 	if int(sel["tiles"]) == 0:
-		# 一期先保证“能看到河”：绝对阈值一条都选不出时，回退到 top 5% 分位。
-		# 湿润气候下绝对阈值通常先触发，不会走到这里；调参后再决定是否保留。
+		# 保底：绝对阈值一条都选不出时，回退到 top 5% 分位。
+		# Qc=1 时通常不会走到这里；保留是为了极端干种子仍能看到河。
 		var qs: Array[float] = []
 		for v in total:
 			if _generated[v] == 1 and _inland_water[v] == 0 \
@@ -579,15 +583,26 @@ func _compute_river_edges() -> void:
 			qc = qs[maxi(0, qs.size() - target)]
 			sel = _collect_river_edges(parent, flow, qc)
 			print("河流层：绝对阈值过高，回退到 top 5% 分位 Q=", snappedf(qc, 0.001))
-	var edges: PackedInt32Array = sel["edges"]
+	var candidate_edges: PackedInt32Array = sel["edges"]
+	var candidate_tiles: int = int(sel["tiles"])
+	var selected := PackedByteArray()
+	selected.resize(total)
+	for e in candidate_tiles:
+		selected[candidate_edges[e * 2]] = 1
+
+	# —— 5) A 方案：整树规模 + 叶枝长度交替过滤 ——
+	var filtered := _filter_river_selection(parent, order, selected)
+	var final_selected: PackedByteArray = filtered["selected"]
+	var final_sel := _collect_edges_from_selection(parent, final_selected)
+	var edges: PackedInt32Array = final_sel["edges"]
 	_river_edges = edges
-	_river_edge_count = int(sel["tiles"])
+	_river_edge_count = int(final_sel["tiles"])
 	# 保留中间结果：测试可验证 parent 链最终入水、没有环。
 	_river_parent = parent
 	_river_flow = flow
 	_river_filled = filled
 
-	# —— 5) 统计（日志 + 测试断言用）——
+	# —— 6) 统计（日志 + 测试断言用）——
 	var max_fill := 0.0
 	for v in total:
 		if _generated[v] == 1 and _inland_water[v] == 0 and parent[v] >= 0:
@@ -602,24 +617,40 @@ func _compute_river_edges() -> void:
 		var hb: int = _terrain[_river_edges[e * 2 + 1]]
 		if ha >= TerrainLevel.MOUNTAINOUS or hb >= TerrainLevel.MOUNTAINOUS:
 			high_edges += 1
+	var river_stats := _river_selection_stats(parent, order, final_selected)
 	_river_stats = {
 		"land": land_n,
 		"water": water_n,
+		"candidate_tiles": candidate_tiles,
+		"tree_pruned_tiles": int(filtered["tree_pruned"]),
+		"branch_pruned_tiles": int(filtered["branch_pruned"]),
+		"filter_passes": int(filtered["passes"]),
 		"river_tiles": _river_edge_count,
 		"edges": _river_edge_count,
 		"density": density,
 		"max_q": float(sel["max_q"]),
 		"threshold": qc,
-		"mouths": int(sel["mouths"]),
+		"mouths": int(final_sel["mouths"]),
+		"tree_min": int(river_stats["tree_min"]),
+		"tree_p50": float(river_stats["tree_p50"]),
+		"branch_min": int(river_stats["branch_min"]),
+		"branch_p50": float(river_stats["branch_p50"]),
+		"branch_n": int(river_stats["branch_n"]),
+		"trunk_p50": float(river_stats["trunk_p50"]),
 		"max_fill": max_fill,
 		"seeds": seed_count,
 		"high_edges": high_edges,
 	}
-	print("河流：河段 ", _river_edge_count, " 条，河道贴片 ", _river_edge_count,
-			" / 陆地 ", land_n, "（", snappedf(density * 100.0, 0.1), "%），最大 Q=",
-			snappedf(float(sel["max_q"]), 0.01), "，阈值=", snappedf(qc, 0.01),
-			"，入海口 ", int(sel["mouths"]), "，跨高山 ", high_edges,
-			"，填洼最大深度=", snappedf(max_fill, 0.0001))
+	print("河流：候选 ", candidate_tiles, " 条 → 整树 -", int(filtered["tree_pruned"]),
+			" / 短枝 -", int(filtered["branch_pruned"]), "（", int(filtered["passes"]),
+			" 轮）→ 河段 ", _river_edge_count, " 条，河道贴片 ", _river_edge_count,
+			" / 陆地 ", land_n, "（", snappedf(density * 100.0, 0.1), "%），阈值=",
+			snappedf(qc, 0.01), "，入海口 ", int(final_sel["mouths"]),
+			"，最短枝 ", int(river_stats["branch_min"]), "，枝长 p50 ",
+			snappedf(float(river_stats["branch_p50"]), 0.1), "，干流 p50 ",
+			snappedf(float(river_stats["trunk_p50"]), 0.1))
+	print("河流：最大 Q=", snappedf(float(sel["max_q"]), 0.01), "，跨高山 ",
+			high_edges, "，填洼最大深度=", snappedf(max_fill, 0.0001))
 
 
 # 给定阈值收集河段：每个陆地贴片最多一条 (v -> parent[v])，天然无重复/无环
@@ -642,6 +673,239 @@ func _collect_river_edges(parent: PackedInt32Array, flow: PackedFloat32Array,
 			if _inland_water[parent[v]] == 1:
 				mouths += 1
 	return {"edges": edges, "tiles": tiles, "mouths": mouths, "max_q": max_q}
+
+
+func _collect_edges_from_selection(parent: PackedInt32Array,
+		selected: PackedByteArray) -> Dictionary:
+	var edges := PackedInt32Array()
+	var tiles := 0
+	var mouths := 0
+	for v in selected.size():
+		if selected[v] == 0:
+			continue
+		var p := parent[v]
+		if p < 0:
+			continue
+		edges.append(v)
+		edges.append(p)
+		tiles += 1
+		if _inland_water[p] == 1:
+			mouths += 1
+	return {"edges": edges, "tiles": tiles, "mouths": mouths}
+
+
+func _river_child_counts(parent: PackedInt32Array,
+		selected: PackedByteArray) -> PackedInt32Array:
+	var child := PackedInt32Array()
+	child.resize(selected.size())
+	for v in selected.size():
+		if selected[v] == 0:
+			continue
+		var p := parent[v]
+		if p >= 0:
+			child[p] += 1
+	return child
+
+
+# A 方案：先删小整树，再剪短叶枝；交替到稳定。
+# 返回值里的 selected 是新数组（Packed 数组按值传递，避免调用方误以为被原地修改）。
+func _filter_river_selection(parent: PackedInt32Array, order: PackedInt32Array,
+		start_selected: PackedByteArray) -> Dictionary:
+	var selected: PackedByteArray = start_selected.duplicate()
+	var tree_pruned := 0
+	var branch_pruned := 0
+	var passes := 0
+	var stable := false
+	while passes < RIVER_FILTER_MAX_PASSES:
+		passes += 1
+		var tr := _remove_small_trees(parent, order, selected,
+				RIVER_TREE_MIN_EDGES)
+		selected = tr["selected"]
+		tree_pruned += int(tr["removed"])
+		var br := _prune_short_branches(parent, selected,
+				RIVER_BRANCH_MIN_EDGES)
+		selected = br["selected"]
+		branch_pruned += int(br["removed"])
+		if int(tr["removed"]) == 0 and int(br["removed"]) == 0:
+			stable = true
+			break
+	if not stable:
+		print("河流层警告：两级过滤达到上限 ", RIVER_FILTER_MAX_PASSES,
+				" 轮，提前停止")
+	return {
+		"selected": selected,
+		"tree_pruned": tree_pruned,
+		"branch_pruned": branch_pruned,
+		"passes": passes,
+	}
+
+
+# 删除边数 < tmin 的整棵汇流树。顺序用 priority-flood 的 order：
+# 正序 parent 先于 child，逆序 child 先于 parent，所以一次扫描就能算子树大小。
+func _remove_small_trees(parent: PackedInt32Array, order: PackedInt32Array,
+		selected: PackedByteArray, tmin: int) -> Dictionary:
+	var total := selected.size()
+	var size := PackedInt32Array()
+	size.resize(total)
+	for i in range(order.size() - 1, -1, -1):
+		var v := order[i]
+		if selected[v] == 0:
+			continue
+		size[v] += 1
+		var p := parent[v]
+		if p >= 0 and selected[p] == 1:
+			size[p] += size[v]
+	var root := PackedInt32Array()
+	root.resize(total)
+	root.fill(-1)
+	var remove_root := PackedByteArray()
+	remove_root.resize(total)
+	var small_roots := 0
+	for v in order:
+		if selected[v] == 0:
+			continue
+		var p := parent[v]
+		if p >= 0 and selected[p] == 1 and root[p] >= 0:
+			root[v] = root[p]
+		else:
+			root[v] = v
+			if size[v] < tmin:
+				remove_root[v] = 1
+				small_roots += 1
+	if small_roots == 0:
+		return {"selected": selected, "removed": 0}
+	var alive: PackedByteArray = selected.duplicate()
+	var removed := 0
+	for v in order:
+		if selected[v] == 0:
+			continue
+		var r := root[v]
+		if r >= 0 and remove_root[r] == 1:
+			alive[v] = 0
+			removed += 1
+	return {"selected": alive, "removed": removed}
+
+
+# 迭代剪掉长度 < lmin 的叶枝：叶子沿下游走到第一个汇流点/入海口，
+# 整条叶枝删除；剪完后父节点可能变成新的短叶枝，所以重复到稳定。
+func _prune_short_branches(parent: PackedInt32Array,
+		selected: PackedByteArray, lmin: int) -> Dictionary:
+	var total := selected.size()
+	var alive: PackedByteArray = selected.duplicate()
+	var removed_total := 0
+	while true:
+		var child := _river_child_counts(parent, alive)
+		var remove := PackedByteArray()
+		remove.resize(total)
+		var any_removed := false
+		for v in total:
+			if alive[v] == 0 or child[v] != 0:
+				continue
+			var path: Array[int] = []
+			var cur := v
+			var length := 0
+			while true:
+				path.append(cur)
+				length += 1
+				var p := parent[cur]
+				if p < 0 or _inland_water[p] == 1 or alive[p] == 0 \
+						or child[p] >= 2:
+					break
+				cur = p
+			if length < lmin:
+				for node in path:
+					remove[node] = 1
+				any_removed = true
+		if not any_removed:
+			break
+		for v in total:
+			if remove[v] == 1:
+				alive[v] = 0
+				removed_total += 1
+	return {"selected": alive, "removed": removed_total}
+
+
+# 过滤后的树/枝/干流统计；只读，供日志和测试断言。
+func _river_selection_stats(parent: PackedInt32Array, order: PackedInt32Array,
+		selected: PackedByteArray) -> Dictionary:
+	var empty := {
+		"tree_min": 0, "tree_p50": 0.0,
+		"branch_min": 0, "branch_p50": 0.0, "branch_n": 0,
+		"trunk_p50": 0.0,
+	}
+	if selected.size() == 0:
+		return empty
+	var total := selected.size()
+	var size := PackedInt32Array()
+	size.resize(total)
+	for i in range(order.size() - 1, -1, -1):
+		var v := order[i]
+		if selected[v] == 0:
+			continue
+		size[v] += 1
+		var p := parent[v]
+		if p >= 0 and selected[p] == 1:
+			size[p] += size[v]
+	var root := PackedInt32Array()
+	root.resize(total)
+	root.fill(-1)
+	var depth := PackedInt32Array()
+	depth.resize(total)
+	var max_depth := PackedInt32Array()
+	max_depth.resize(total)
+	var tree_sizes: Array[int] = []
+	for v in order:
+		if selected[v] == 0:
+			continue
+		var p := parent[v]
+		if p >= 0 and selected[p] == 1 and root[p] >= 0:
+			root[v] = root[p]
+			depth[v] = depth[p] + 1
+		else:
+			root[v] = v
+			depth[v] = 0
+			tree_sizes.append(size[v])
+		var r := root[v]
+		if r >= 0 and depth[v] > max_depth[r]:
+			max_depth[r] = depth[v]
+	var child := _river_child_counts(parent, selected)
+	var branch_lengths: Array[int] = []
+	for v in total:
+		if selected[v] == 0 or child[v] != 0:
+			continue
+		var length := 1
+		var cur := v
+		while true:
+			var p := parent[cur]
+			if p < 0 or _inland_water[p] == 1 or selected[p] == 0 \
+					or child[p] >= 2:
+				break
+			cur = p
+			length += 1
+		branch_lengths.append(length)
+	var trunks: Array[int] = []
+	for v in total:
+		if selected[v] == 1 and root[v] == v:
+			trunks.append(max_depth[v] + 1)
+	if tree_sizes.is_empty() or branch_lengths.is_empty() or trunks.is_empty():
+		return empty
+	tree_sizes.sort()
+	branch_lengths.sort()
+	trunks.sort()
+	return {
+		"tree_min": tree_sizes[0],
+		"tree_p50": _river_pct_int(tree_sizes, 0.5),
+		"branch_min": branch_lengths[0],
+		"branch_p50": _river_pct_int(branch_lengths, 0.5),
+		"branch_n": branch_lengths.size(),
+		"trunk_p50": _river_pct_int(trunks, 0.5),
+	}
+
+
+func _river_pct_int(sorted: Array[int], q: float) -> float:
+	var idx := clampi(int(floor(q * float(sorted.size() - 1))), 0,
+			sorted.size() - 1)
+	return float(sorted[idx])
 
 
 # —— 二叉最小堆（key = 填洼后高程，tie-break = 贴片索引；确定性）——

@@ -140,20 +140,51 @@ func _run() -> void:
 			"" if bad_chain == -1 else "，坏贴片 %d" % bad_chain]))
 	_ok = _ok and ok_chain
 
-	# —— 5) 阈值一致性：河段集合 == flow >= threshold 的陆地贴片 ——
+	# —— 5) A 方案：Qc 候选 → 整树/短枝过滤，最终边是候选的子集 ——
 	var threshold: float = float(planet._river_stats["threshold"])
-	var expected_rivers := 0
+	var candidate_tiles: int = int(planet._river_stats["candidate_tiles"])
+	var expected_candidates := 0
+	var candidate_mask := PackedByteArray()
+	candidate_mask.resize(total)
 	for v in total:
 		if planet._generated[v] == 1 and planet._inland_water[v] == 0 \
 				and planet._river_parent[v] >= 0 \
 				and planet._river_flow[v] >= threshold:
-			expected_rivers += 1
+			expected_candidates += 1
+			candidate_mask[v] = 1
+	var bad_final := -1
+	var actual_mouths := 0
+	for e in edge_n:
+		var a: int = planet._river_edges[e * 2]
+		var b: int = planet._river_edges[e * 2 + 1]
+		if candidate_mask[a] == 0:
+			bad_final = a
+			break
+		if planet._inland_water[b] == 1:
+			actual_mouths += 1
 	var density: float = float(planet._river_stats["density"])
-	var ok_stats: bool = expected_rivers == edge_n \
-			and density > 0.01 and density < 0.40 \
-			and edge_n > 20 and int(planet._river_stats["land"]) > 0
-	print(bin_if(ok_stats, "阈值一致：%d 条河段（阈值 %.3f，密度 %.1f%%）"
-			% [expected_rivers, threshold, density * 100.0]))
+	var tree_pruned: int = int(planet._river_stats["tree_pruned_tiles"])
+	var branch_pruned: int = int(planet._river_stats["branch_pruned_tiles"])
+	var tree_min: int = int(planet._river_stats["tree_min"])
+	var branch_min: int = int(planet._river_stats["branch_min"])
+	var branch_p50: float = float(planet._river_stats["branch_p50"])
+	var trunk_p50: float = float(planet._river_stats["trunk_p50"])
+	var mouths: int = int(planet._river_stats["mouths"])
+	var ok_stats: bool = candidate_tiles == expected_candidates \
+			and edge_n > 0 and edge_n < candidate_tiles \
+			and tree_pruned + branch_pruned == candidate_tiles - edge_n \
+			and bad_final == -1 \
+			and tree_min >= PlanetScript.RIVER_TREE_MIN_EDGES \
+			and branch_min >= PlanetScript.RIVER_BRANCH_MIN_EDGES \
+			and density >= 0.105 and density <= 0.120 \
+			and mouths >= 25 and mouths <= 30 and mouths == actual_mouths \
+			and branch_p50 >= 7.0 and trunk_p50 >= 12.0 \
+			and int(planet._river_stats["land"]) > 0
+	var stats_msg := "A 方案：候选 %d → 整树 -%d / 短枝 -%d → %d 条" \
+			% [candidate_tiles, tree_pruned, branch_pruned, edge_n]
+	stats_msg += "（密度 %.1f%%，入海口 %d，枝长 p50 %.1f，干流 p50 %.1f，最短枝 %d，树最小 %d）" \
+			% [density * 100.0, mouths, branch_p50, trunk_p50, branch_min, tree_min]
+	print(bin_if(ok_stats, stats_msg))
 	_ok = _ok and ok_stats
 
 	# —— 6) ribbon mesh：采样数 / 半径 / 单位法线 / UV.x=0/1 / 索引范围 ——
@@ -263,6 +294,34 @@ func _run() -> void:
 			and first_flow == planet._river_flow
 	print(bin_if(ok_det, "水文确定性：重算河段/Q 逐位一致"))
 	_ok = _ok and ok_det
+
+	# —— 10) 气候响应：干/温密度必须低于湿/热，且过滤后仍有河 ——
+	planet.queue_free()
+	await process_frame
+	var dry: Node3D = PlanetScript.new()
+	root.add_child(dry)
+	await process_frame
+	dry._on_generate_requested({
+		"seed": 4242, "coverage": 0.3, "rainfall": 0, "temperature": 0,
+	})
+	tries = 0
+	while tries < 60000 and (dry._mesh_instance == null or dry._menu != null):
+		await process_frame
+		tries += 1
+	var dry_ok := false
+	var dry_density := -1.0
+	if dry._mesh_instance != null:
+		dry_density = float(dry._river_stats.get("density", -1.0))
+		var dry_tree_min: int = int(dry._river_stats.get("tree_min", 0))
+		var dry_branch_min: int = int(dry._river_stats.get("branch_min", 0))
+		dry_ok = dry_density >= 0.075 and dry_density <= 0.095 \
+				and dry_density < density - 0.015 \
+				and dry_tree_min >= PlanetScript.RIVER_TREE_MIN_EDGES \
+				and dry_branch_min >= PlanetScript.RIVER_BRANCH_MIN_EDGES
+	print(bin_if(dry_ok, "气候响应：干/温密度 %.1f%% < 湿/热 %.1f%%（过滤后仍有河）"
+			% [dry_density * 100.0, density * 100.0]))
+	_ok = _ok and dry_ok
+	dry.queue_free()
 
 	print("RESULT: ", "PASS" if _ok else "FAIL")
 	print("=== 河流层冒烟结束 ===")
