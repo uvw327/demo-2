@@ -34,9 +34,9 @@ uniform vec4 river_color : source_color = vec4(0.20, 0.48, 0.78, 1.0);
 // 屏幕最小宽度：只有「烘焙半宽 < 该值」的细支流会被加宽，
 // 干流在远视角仍保留真实宽度差，不会整条河网一样粗。
 uniform float min_width_px = 1.6;
-// 屏幕最大宽度：近景时干流按世界宽度会长到几十像素，这里压住上限，
-// 避免贴脸时河道变成「蓝色高速公路」。0 = 不限制。
-uniform float max_width_px = 16.0;
+// 屏幕最大宽度：默认 0 = 不封顶。近景封顶会把干/支一起压成同一条带，
+// 把几何里做好的分级重新抹平（实测），所以只在需要时手工调大。
+uniform float max_width_px = 0.0;
 uniform float edge_softness_px = 1.0;
 
 // 焦距（像素）：depth=1 处 1 世界单位投影多少像素。

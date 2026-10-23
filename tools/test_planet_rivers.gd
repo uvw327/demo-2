@@ -196,6 +196,8 @@ func _run() -> void:
 	var actual_tris := 0
 	var expect_samples := 0
 	var expect_strips := 0
+	var pool_seg: int = PlanetScript.RIVER_POOL_SEG
+	var pools := 0
 	if ok_mesh:
 		var arr := mesh.surface_get_arrays(0)
 		var verts: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
@@ -206,11 +208,13 @@ func _run() -> void:
 		var idx: PackedInt32Array = arr[Mesh.ARRAY_INDEX]
 		vn = verts.size()
 		actual_tris = int(idx.size() / 3)
-		ok_mesh = vn > 0 and vn % 2 == 0 and normals.size() == vn \
+		ok_mesh = vn > 0 and normals.size() == vn \
 				and uvs.size() == vn and uv2s.size() == vn and cols.size() == vn \
-				and idx.size() % 6 == 0
-		# 期望采样数：按分支链重算（与 planet.gd 同规则：每段按 2.5° 细分，
-		# 段接缝复用上一次采样 → 每条链 Σnseg + 1 个采样点）
+				and idx.size() % 3 == 0
+		# 期望采样数：按分支链重算。RIVER_SMOOTH_ITERS>0 时链先做 Chaikin，
+		# 点数 = count × 2^iters，且平滑后单段 ≤0.55°（< RIVER_MAX_ARC_DEG）
+		# 不会再细分，所以采样数就等于平滑后的点数。
+		var iters: int = PlanetScript.RIVER_SMOOTH_ITERS
 		for bi in planet._river_branch_n:
 			var s0: int = planet._river_branch_offsets[bi]
 			var cnt: int = planet._river_branch_offsets[bi + 1] - s0
@@ -222,6 +226,16 @@ func _run() -> void:
 				pts[i] = planet._tile_centers[planet._river_branch_nodes[s0 + i]]
 			if planet._inland_water[planet._river_branch_nodes[s0 + cnt - 1]] == 1:
 				pts[cnt - 1] = (pts[cnt - 2] + pts[cnt - 1]).normalized()
+			if iters > 0:
+				var arc_sum0 := 0.0
+				for i in cnt - 1:
+					arc_sum0 += pts[i].angle_to(pts[i + 1])
+				if arc_sum0 < 1e-9:
+					continue
+				# cnt<3 的链没法角切，原样输出（点数不变）
+				expect_samples += cnt if cnt < 3 else cnt * (1 << iters)
+				expect_strips += 1
+				continue
 			var nseg_sum := 0
 			var arc_sum := 0.0
 			for i in cnt - 1:
@@ -233,12 +247,20 @@ func _run() -> void:
 				continue
 			expect_samples += nseg_sum + 1
 			expect_strips += 1
-		ok_mesh = ok_mesh and vn == expect_samples * 2 \
-				and idx.size() == (expect_samples - expect_strips) * 6
+		# 汇合点汇水潭：每个汇合点 1 个圆心 + POOL_SEG 个环点、POOL_SEG 个三角形
+		for vk in planet._river_junction_dir.keys():
+			if planet._river_half_width[vk] * PlanetScript.RIVER_POOL_ACROSS > 0.0 \
+					and planet._river_down[vk] >= 0:
+				pools += 1
+		ok_mesh = ok_mesh and vn == expect_samples * 2 + pools * (pool_seg + 1) \
+				and idx.size() == (expect_samples - expect_strips) * 6 \
+						+ pools * pool_seg * 3
 		if ok_mesh:
+			# UV2.x 上限：干流最粗 × 入海口喇叭口 × miter 伸出
 			var half_lo: float = PlanetScript.RIVER_HALF_MIN \
 					* PlanetScript.RIVER_TIP_TAPER - 1e-5
 			var half_hi: float = PlanetScript.RIVER_HALF_MAX \
+					* PlanetScript.RIVER_MOUTH_FLARE \
 					* PlanetScript.RIVER_MITER_MAX_RATIO + 1e-5
 			for i in vn:
 				var p := verts[i]
@@ -249,7 +271,9 @@ func _run() -> void:
 					ok_mesh = false
 					break
 				var uvx := uvs[i].x
-				if absf(uvx) > 1e-6 and absf(uvx - 1.0) > 1e-6:
+				# 0/1 = ribbon 两侧；0.5 = 汇水潭圆心（偏移系数为 0，不被补偿移动）
+				if absf(uvx) > 1e-6 and absf(uvx - 1.0) > 1e-6 \
+						and absf(uvx - 0.5) > 1e-6:
 					ok_mesh = false
 					break
 				# UV2.x = 烘焙半宽（miter 处可放大到 1/cos 倍）
@@ -257,8 +281,8 @@ func _run() -> void:
 				if hw < half_lo or hw > half_hi:
 					ok_mesh = false
 					break
-				# COLOR.r = 端头 alpha
-				if cols[i].r <= 0.0 or cols[i].r > 1.0:
+				# COLOR.r = 端头 alpha（源头/河口允许淡到 0）
+				if cols[i].r < 0.0 or cols[i].r > 1.0:
 					ok_mesh = false
 					break
 			if ok_mesh:
@@ -266,9 +290,10 @@ func _run() -> void:
 					if idx[j] < 0 or idx[j] >= vn:
 						ok_mesh = false
 						break
-	print(bin_if(ok_mesh, "河流 mesh：%d 采样点 / %d 三角形（期望 %d / %d，%d 条链），"
-			% [vn >> 1, actual_tris, expect_samples,
-			(expect_samples - expect_strips) * 2, planet._river_branch_n])
+	print(bin_if(ok_mesh, "河流 mesh：%d 顶点 / %d 三角形（期望 %d / %d，%d 条链 + %d 个汇水潭），"
+			% [vn, actual_tris, expect_samples * 2 + pools * (pool_seg + 1),
+			(expect_samples - expect_strips) * 2 + pools * pool_seg,
+			planet._river_branch_n, pools])
 			+ "半径 1.0、单位法线、UV/UV2/COLOR 合法")
 	_ok = _ok and ok_mesh
 
@@ -325,7 +350,10 @@ func _run() -> void:
 	var ratio := 0.0
 	if half_lo_all > 0.0:
 		ratio = half_hi_all / half_lo_all
-	ok_width = ok_width and bad_width == -1 and ratio >= 2.5
+	# 对数映射的护栏：顶到上限的节点必须极少（线性+clamp 时实测 12%，
+	# 等于把整个上游主干并成同一宽度 —— §21 P2）
+	var sat := float(planet._river_render_stats.get("half_at_max", 1.0))
+	ok_width = ok_width and bad_width == -1 and ratio >= 4.0 and sat <= 0.02
 	# 分支链覆盖：每条河段恰好被一条链走过（每个 from 节点的 cover 恰为 1）
 	var cover := PackedInt32Array()
 	cover.resize(total)
@@ -344,8 +372,8 @@ func _run() -> void:
 	ok_width = ok_width and bad_cover == -1
 	var half_p50 := float(planet._river_render_stats.get("half_p50", 0.0))
 	var half_p90 := float(planet._river_render_stats.get("half_p90", 0.0))
-	print(bin_if(ok_width, "河宽分级：半宽 %.4f–%.4f（干/支 %.1f×，p50 %.4f，p90 %.4f），%d 条链覆盖每条河段一次%s"
-			% [half_lo_all, half_hi_all, ratio, half_p50, half_p90,
+	print(bin_if(ok_width, "河宽分级：半宽 %.4f–%.4f（干/支 %.1f×，p50 %.4f，p90 %.4f，顶上限 %.1f%%），%d 条链覆盖每条河段一次%s"
+			% [half_lo_all, half_hi_all, ratio, half_p50, half_p90, 100.0 * sat,
 			planet._river_branch_n,
 			"" if bad_width == -1 and bad_cover == -1
 					else "，坏贴片 %d" % maxi(bad_width, bad_cover)]))
