@@ -190,6 +190,7 @@ var _mesh_instance: MeshInstance3D
 # 未生成区域查询用的拓扑缓存（方向→贴片）。全部指向单位球面。
 var _topo_verts: Array[Vector3] = []
 var _generated: PackedByteArray = PackedByteArray() # 贴片是否已生成（可交互）
+var _generated_ids := PackedInt32Array()  # 已生成贴片索引（河流/统计热循环只遍历这一份）
 
 # —— 点击选区：拾取 + 选中高亮 ——
 # 每块贴片的边界顶点（单位球面）：阶段 B 建网格时顺手缓存，
@@ -221,6 +222,7 @@ var _river_stats: Dictionary = {}
 # priority-flood 的最小堆（成员数组：Packed 数组传参是值语义，用成员避免拷贝）
 var _river_heap_keys := PackedFloat32Array()
 var _river_heap_tiles := PackedInt32Array()
+var _river_heap_size := 0                 # 当前堆内元素数；数组按 total 预分配，pop 不再 resize
 var _selected_tile := -1                  # 当前选中贴片索引；-1 = 未选中
 var _orbit: OrbitCamera                   # 轨道相机（点按事件从这里进来）
 var _selection_ring: MeshInstance3D       # 选中环：独立实例，切换选中时重建其 mesh
@@ -472,9 +474,8 @@ func _compute_river_edges() -> void:
 	injection.fill(0.0)
 	var land_n := 0
 	var water_n := 0
-	for v in total:
-		if _generated[v] != 1:
-			continue
+	var generated_ids := _generated_ids
+	for v in generated_ids:
 		if _inland_water[v] == 1:
 			water_n += 1
 			continue
@@ -513,40 +514,78 @@ func _compute_river_edges() -> void:
 	parent.fill(-1)
 	var visited := PackedByteArray()
 	visited.resize(total)
+	# 未生成贴片直接视为已访问，flood 邻居循环里就不必再查 _generated[u]。
+	visited.fill(1)
+	for v in generated_ids:
+		visited[v] = 0
 	var order := PackedInt32Array()
 	_river_heap_keys = PackedFloat32Array()
+	_river_heap_keys.resize(total)
 	_river_heap_tiles = PackedInt32Array()
+	_river_heap_tiles.resize(total)
+	_river_heap_size = 0
 	var seed_count := 0
-	for v in total:
-		if _generated[v] != 1 or _inland_water[v] != 1:
+	# 水面种子 key 全部等于 SEA_LEVEL；按贴片索引升序写入即可构成合法最小堆
+	#（父索引小于子索引，且 tile 升序，tie-break 自然成立），省掉 N 次 push/sift。
+	for v in generated_ids:
+		if _inland_water[v] != 1:
 			continue
 		filled[v] = SEA_LEVEL
 		visited[v] = 1
-		_river_heap_push(SEA_LEVEL, v)
+		_river_heap_keys[seed_count] = SEA_LEVEL
+		_river_heap_tiles[seed_count] = v
 		seed_count += 1
+	_river_heap_size = seed_count
 	if seed_count == 0:
 		# 100% 陆地兜底：最低已生成陆地当虚拟出海口
 		var lowest := -1
 		var lowest_elev := INF
-		for v in total:
-			if _generated[v] == 1 and _tile_elev[v] < lowest_elev:
+		for v in generated_ids:
+			if _tile_elev[v] < lowest_elev:
 				lowest_elev = _tile_elev[v]
 				lowest = v
 		if lowest >= 0:
 			filled[lowest] = SEA_LEVEL
 			visited[lowest] = 1
-			_river_heap_push(SEA_LEVEL, lowest)
-			seed_count = 1
+			_river_heap_keys[0] = SEA_LEVEL
+			_river_heap_tiles[0] = lowest
+			_river_heap_size = 1
 			print("河流层警告：没有水面种子，使用最低陆地贴片 ", lowest,
 					" 作为虚拟出海口")
-	while _river_heap_keys.size() > 0:
-		var v := _river_heap_pop()
+	while _river_heap_size > 0:
+		# pop：内联二叉堆下沉，避免每贴片一次函数调用。
+		var v := _river_heap_tiles[0]
+		var n := _river_heap_size - 1
+		_river_heap_size = n
+		if n > 0:
+			var last_key := _river_heap_keys[n]
+			var last_tile := _river_heap_tiles[n]
+			var hi := 0
+			while true:
+				var l := hi * 2 + 1
+				if l >= n:
+					break
+				var r := l + 1
+				var best := l
+				if r < n:
+					var kl := _river_heap_keys[l]
+					var kr := _river_heap_keys[r]
+					if kr < kl or (kr == kl and _river_heap_tiles[r] < _river_heap_tiles[l]):
+						best = r
+				var kb := _river_heap_keys[best]
+				if kb > last_key or (kb == last_key and _river_heap_tiles[best] >= last_tile):
+					break
+				_river_heap_keys[hi] = kb
+				_river_heap_tiles[hi] = _river_heap_tiles[best]
+				hi = best
+			_river_heap_keys[hi] = last_key
+			_river_heap_tiles[hi] = last_tile
 		order.append(v)
 		var fv := filled[v]
 		var base := v * 6
 		for k in _tile_neighbor_count[v]:
 			var u := _tile_neighbors[base + k]
-			if u < 0 or _generated[u] != 1 or visited[u] != 0:
+			if u < 0 or visited[u] != 0:
 				continue
 			visited[u] = 1
 			if _inland_water[u] == 1:
@@ -555,8 +594,21 @@ func _compute_river_edges() -> void:
 				_river_heap_push(SEA_LEVEL, u)
 				continue
 			filled[u] = maxf(_tile_elev[u], fv + RIVER_FILL_EPS)
+			var u_key := filled[u]
 			parent[u] = v
-			_river_heap_push(filled[u], u)
+			# push：内联二叉堆上浮。
+			var hi2 := _river_heap_size
+			_river_heap_size += 1
+			while hi2 > 0:
+				var p := (hi2 - 1) >> 1
+				var kp := _river_heap_keys[p]
+				if kp < u_key or (kp == u_key and _river_heap_tiles[p] <= u):
+					break
+				_river_heap_keys[hi2] = kp
+				_river_heap_tiles[hi2] = _river_heap_tiles[p]
+				hi2 = p
+			_river_heap_keys[hi2] = u_key
+			_river_heap_tiles[hi2] = u
 
 	# —— 3) 倒序汇流：q = injection + 所有上游 ——
 	var flow := injection.duplicate()
@@ -568,32 +620,38 @@ func _compute_river_edges() -> void:
 
 	# —— 4) 候选阈值：Qc 直接给定（A 方案，不再用隐式除法）——
 	var qc := RIVER_SOURCE_QC
-	var sel := _collect_river_edges(parent, flow, qc)
+	var sel := _collect_river_edges(parent, flow, qc, generated_ids)
 	if int(sel["tiles"]) == 0:
 		# 保底：绝对阈值一条都选不出时，回退到 top 5% 分位。
 		# Qc=1 时通常不会走到这里；保留是为了极端干种子仍能看到河。
 		var qs: Array[float] = []
-		for v in total:
-			if _generated[v] == 1 and _inland_water[v] == 0 \
+		for v in generated_ids:
+			if _inland_water[v] == 0 \
 					and parent[v] >= 0 and flow[v] > 0.0:
 				qs.append(flow[v])
 		if not qs.is_empty():
 			qs.sort()
 			var target := clampi(int(land_n * 0.05), 1, qs.size())
 			qc = qs[maxi(0, qs.size() - target)]
-			sel = _collect_river_edges(parent, flow, qc)
+			sel = _collect_river_edges(parent, flow, qc, generated_ids)
 			print("河流层：绝对阈值过高，回退到 top 5% 分位 Q=", snappedf(qc, 0.001))
 	var candidate_edges: PackedInt32Array = sel["edges"]
 	var candidate_tiles: int = int(sel["tiles"])
+	# 候选图紧凑化：过滤/统计只处理候选贴片（C 通常远小于 total），
+	# 不再为每轮过滤分配 total 大小的数组。local_parent=-1 表示入海/父节点未入选。
+	var candidate_graph := _build_river_candidate_graph(
+			candidate_edges, candidate_tiles, parent, order)
+	var cand_tiles: PackedInt32Array = candidate_graph["tiles"]
+	var local_parent: PackedInt32Array = candidate_graph["parent"]
+	var local_order: PackedInt32Array = candidate_graph["order"]
 	var selected := PackedByteArray()
-	selected.resize(total)
-	for e in candidate_tiles:
-		selected[candidate_edges[e * 2]] = 1
+	selected.resize(candidate_tiles)
+	selected.fill(1)
 
 	# —— 5) A 方案：整树规模 + 叶枝长度交替过滤 ——
-	var filtered := _filter_river_selection(parent, order, selected)
+	var filtered := _filter_river_selection(local_parent, local_order, selected)
 	var final_selected: PackedByteArray = filtered["selected"]
-	var final_sel := _collect_edges_from_selection(parent, final_selected)
+	var final_sel := _collect_edges_from_selection(cand_tiles, parent, final_selected)
 	var edges: PackedInt32Array = final_sel["edges"]
 	_river_edges = edges
 	_river_edge_count = int(final_sel["tiles"])
@@ -604,8 +662,8 @@ func _compute_river_edges() -> void:
 
 	# —— 6) 统计（日志 + 测试断言用）——
 	var max_fill := 0.0
-	for v in total:
-		if _generated[v] == 1 and _inland_water[v] == 0 and parent[v] >= 0:
+	for v in generated_ids:
+		if _inland_water[v] == 0 and parent[v] >= 0:
 			max_fill = maxf(max_fill, filled[v] - _tile_elev[v])
 	var density := 0.0
 	if land_n > 0:
@@ -617,7 +675,7 @@ func _compute_river_edges() -> void:
 		var hb: int = _terrain[_river_edges[e * 2 + 1]]
 		if ha >= TerrainLevel.MOUNTAINOUS or hb >= TerrainLevel.MOUNTAINOUS:
 			high_edges += 1
-	var river_stats := _river_selection_stats(parent, order, final_selected)
+	var river_stats := _river_selection_stats(local_parent, local_order, final_selected)
 	_river_stats = {
 		"land": land_n,
 		"water": water_n,
@@ -655,13 +713,13 @@ func _compute_river_edges() -> void:
 
 # 给定阈值收集河段：每个陆地贴片最多一条 (v -> parent[v])，天然无重复/无环
 func _collect_river_edges(parent: PackedInt32Array, flow: PackedFloat32Array,
-		qc: float) -> Dictionary:
+		qc: float, generated_ids: PackedInt32Array) -> Dictionary:
 	var edges := PackedInt32Array()
 	var tiles := 0
 	var mouths := 0
 	var max_q := 0.0
-	for v in parent.size():
-		if _generated[v] != 1 or _inland_water[v] == 1 or parent[v] < 0:
+	for v in generated_ids:
+		if _inland_water[v] == 1 or parent[v] < 0:
 			continue
 		var q := flow[v]
 		if q > max_q:
@@ -675,14 +733,55 @@ func _collect_river_edges(parent: PackedInt32Array, flow: PackedFloat32Array,
 	return {"edges": edges, "tiles": tiles, "mouths": mouths, "max_q": max_q}
 
 
-func _collect_edges_from_selection(parent: PackedInt32Array,
-		selected: PackedByteArray) -> Dictionary:
+func _build_river_candidate_graph(candidate_edges: PackedInt32Array,
+		candidate_tiles: int, parent: PackedInt32Array,
+		order: PackedInt32Array) -> Dictionary:
+	var tiles := PackedInt32Array()
+	tiles.resize(candidate_tiles)
+	var local_of := PackedInt32Array()
+	local_of.resize(parent.size())
+	local_of.fill(-1)
+	for e in candidate_tiles:
+		var v := candidate_edges[e * 2]
+		tiles[e] = v
+		local_of[v] = e
+	var local_parent := PackedInt32Array()
+	local_parent.resize(candidate_tiles)
+	for e in candidate_tiles:
+		var p := parent[tiles[e]]
+		local_parent[e] = local_of[p] if p >= 0 else -1
+	var local_order := PackedInt32Array()
+	local_order.resize(candidate_tiles)
+	var n := 0
+	for v in order:
+		var li := local_of[v]
+		if li >= 0:
+			local_order[n] = li
+			n += 1
+	if n != candidate_tiles:
+		# 防御：候选陆地正常都在 priority-flood order 中；若索引不完整则补齐，
+		# 避免过滤阶段静默漏节点。正常情况下这段不会执行。
+		var seen := PackedByteArray()
+		seen.resize(candidate_tiles)
+		for i in n:
+			seen[local_order[i]] = 1
+		for i in candidate_tiles:
+			if seen[i] == 0:
+				local_order[n] = i
+				n += 1
+		local_order.resize(n)
+	return {"tiles": tiles, "parent": local_parent, "order": local_order}
+
+
+func _collect_edges_from_selection(cand_tiles: PackedInt32Array,
+		parent: PackedInt32Array, selected: PackedByteArray) -> Dictionary:
 	var edges := PackedInt32Array()
 	var tiles := 0
 	var mouths := 0
-	for v in selected.size():
-		if selected[v] == 0:
+	for i in selected.size():
+		if selected[i] == 0:
 			continue
+		var v := cand_tiles[i]
 		var p := parent[v]
 		if p < 0:
 			continue
@@ -808,8 +907,7 @@ func _prune_short_branches(parent: PackedInt32Array,
 				path.append(cur)
 				length += 1
 				var p := parent[cur]
-				if p < 0 or _inland_water[p] == 1 or alive[p] == 0 \
-						or child[p] >= 2:
+				if p < 0 or alive[p] == 0 or child[p] >= 2:
 					break
 				cur = p
 			if length < lmin:
@@ -877,8 +975,7 @@ func _river_selection_stats(parent: PackedInt32Array, order: PackedInt32Array,
 		var cur := v
 		while true:
 			var p := parent[cur]
-			if p < 0 or _inland_water[p] == 1 or selected[p] == 0 \
-					or child[p] >= 2:
+			if p < 0 or selected[p] == 0 or child[p] >= 2:
 				break
 			cur = p
 			length += 1
@@ -909,10 +1006,12 @@ func _river_pct_int(sorted: Array[int], q: float) -> float:
 
 
 # —— 二叉最小堆（key = 填洼后高程，tie-break = 贴片索引；确定性）——
+# 数组按 total 预分配，_river_heap_size 维护逻辑长度；pop 不再 resize/append。
 func _river_heap_push(key: float, tile: int) -> void:
-	_river_heap_keys.append(key)
-	_river_heap_tiles.append(tile)
-	var i := _river_heap_keys.size() - 1
+	var i := _river_heap_size
+	_river_heap_size += 1
+	_river_heap_keys[i] = key
+	_river_heap_tiles[i] = tile
 	while i > 0:
 		var p := (i - 1) >> 1
 		var kp := _river_heap_keys[p]
@@ -925,43 +1024,6 @@ func _river_heap_push(key: float, tile: int) -> void:
 		_river_heap_tiles[p] = _river_heap_tiles[i]
 		_river_heap_tiles[i] = tt
 		i = p
-
-
-func _river_heap_pop() -> int:
-	var n := _river_heap_tiles.size()
-	var result := _river_heap_tiles[0]
-	n -= 1
-	if n > 0:
-		_river_heap_keys[0] = _river_heap_keys[n]
-		_river_heap_tiles[0] = _river_heap_tiles[n]
-		_river_heap_keys.resize(n)
-		_river_heap_tiles.resize(n)
-		var i := 0
-		while true:
-			var l := i * 2 + 1
-			if l >= n:
-				break
-			var r := l + 1
-			var best := l
-			if r < n:
-				var kl := _river_heap_keys[l]
-				var kr := _river_heap_keys[r]
-				if kr < kl or (kr == kl and _river_heap_tiles[r] < _river_heap_tiles[l]):
-					best = r
-			var kb := _river_heap_keys[best]
-			var ki := _river_heap_keys[i]
-			if kb > ki or (kb == ki and _river_heap_tiles[best] >= _river_heap_tiles[i]):
-				break
-			_river_heap_keys[i] = kb
-			_river_heap_keys[best] = ki
-			var tt := _river_heap_tiles[i]
-			_river_heap_tiles[i] = _river_heap_tiles[best]
-			_river_heap_tiles[best] = tt
-			i = best
-	else:
-		_river_heap_keys.resize(0)
-		_river_heap_tiles.resize(0)
-	return result
 
 
 # 河段 → 球面 ribbon：每个贴片边至少 3 采样，合并段按 2.5° 再细分；
@@ -2036,6 +2098,16 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		if write_at < total and Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
 			await _slice_yield(94.0 + 3.0 * float(write_at) / float(total))
 	t_stage = _stage_mark("⑤c网格写入", t_stage)
+
+	# 已生成贴片索引：河流 injection / 候选 / 统计都只遍历生成区，
+	# 避免每次在 40,962 个贴片里反复 if _generated[v]。
+	_generated_ids.resize(total)
+	var gen_n := 0
+	for v in total:
+		if _generated[v] == 1:
+			_generated_ids[gen_n] = v
+			gen_n += 1
+	_generated_ids.resize(gen_n)
 
 	# ===== ⑥ 收尾：组装 ArrayMesh（让 97% 先画出来再干最后一下）=====
 	_progress(97.0)

@@ -1374,3 +1374,41 @@ A 相对一期现状（湿/热）：
 - 不改 shader/mesh 格式/宽度/颜色/图层；
 - 不为了性能降低 A 方案阈值或改变河网密度；
 - D8/D-infinity、连续 polyline、湖单出口仍留到后续阶段。
+
+### 19.6 实施结果（2026-10-23）
+
+已按 19.4 落地前四项，未改 A 方案参数、shader 或 mesh 格式：
+
+1. **priority-flood**
+   - heap 数组按 `total` 预分配，用 `_river_heap_size` 维护逻辑长度，pop 不再 `resize`；
+   - 水面种子 key 全为 `SEA_LEVEL`，按 tile 升序直接铺入堆，省掉种子逐次 push；
+   - 主循环内联 push/pop；
+   - 未生成贴片在 `visited` 初始化时直接标记，邻居循环少一次 `_generated[u]` 查询；
+   - 内联 push 的 key 从 `filled` 回读，保证 float32 舍入与堆内 key 完全一致，避免同 key 的 tie-break 偏移。
+2. **A 过滤/统计 candidate-local 化**
+   - 新增 `_build_river_candidate_graph()`：候选贴片、local parent、local order；
+   - `_filter_river_selection()`、`_remove_small_trees()`、`_prune_short_branches()`、`_river_selection_stats()` 全部只操作长度 C 的数组；
+   - `_collect_edges_from_selection()` 通过 `cand_tiles` 映射回全局边。
+3. **generated_ids**
+   - 生成收尾时构建 `_generated_ids`；
+   - injection、候选收集、最大填洼深度统计只遍历生成区。
+4. **旧堆删除**
+   - 删除不再使用的 `_river_heap_pop()`；保留 `_river_heap_push()` 给防御性水面分支。
+
+同口径实测（桌面 headless，seed `4242`、`coverage=0.3`、rain/temp `1`）：
+
+| 指标 | 优化前 | 优化后 |
+|---|---:|---:|
+| `_compute_river_edges` | 65.5 ms | **42.9 ms** |
+| `_build_river_mesh_from_edges` | 2.3 ms | 2.3 ms |
+| 河流层合计 | 67.8 ms | **约 45.2 ms** |
+
+约 **33%** 的河流生成耗时下降。priority-flood 仍是最大剩余热点；如继续优化，下一步是 radix/bucket heap 或 4-ary heap，而不是继续抠过滤和 mesh。
+
+验收保持不变：
+
+- `test_planet_rivers` PASS；
+- 湿/热候选 `1,330` → 最终 `812` 条，密度 `11.1%`，入海口 `27`，最短枝 `4`，枝长 p50 `8`，干流 p50 `13`；
+- mesh `2,436` 采样点 / `3,248` 三角形；
+- parent 链全部入水、无环；
+- `test_planet_hills` PASS。
