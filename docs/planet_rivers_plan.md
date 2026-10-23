@@ -696,7 +696,7 @@ sag = R · (1 − cos(θ/2)) ≈ R · θ² / 8
 
 实现建议（保持一次 RNG 遍历、同种子逐位一致）：
 
-- 修改 `_build_hills_mesh(world_seed)`：仍然只遍历一次 `_terrain`，但把 quad 分别追加到 `low` / `high` 两组数组；
+- 修改 `_build_hills_meshes(world_seed)`：仍然只遍历一次 `_terrain`，但把 quad 分别追加到 `low` / `high` 两组数组；
 - 返回两组 `ArrayMesh`（或一个带两个 surface 的 mesh）；
 - 低丘/高山各用一个 `ShaderMaterial`（同 shader、同 atlas，只差 `render_priority`）；
 - 如果用一个 `MeshInstance3D` + 两个 surface，必须用 `set_surface_override_material()`，不要用 `material_override`（它会覆盖所有 surface）；
@@ -885,13 +885,52 @@ _build_river_mesh()
 - `RIVER_DEPTH_BIAS` 先按移动端 24-bit 深度取 0.004；若目标机是 16-bit，按 §9.7.6 走备选；
 - `RIVER_LIFT` 主方案恒为 1.0，仅作为 shader `depth_mode=1` 的对照/备选参数。
 
+### 11.1 实施回填（2026-10-23，GL Compatibility 实测）
+
+一期已落地。实际常量与上表“首版起点”有几处按截图/日志校准：
+
+| 常量 | 实际值 | 说明 |
+|---|---:|---|
+| `RIVER_BASE_HALF_WIDTH` | 0.0018 | 世界半宽；近看固定宽度 |
+| `RIVER_MIN_WIDTH_PX` | 2.2 | 屏幕下限；默认视角稳定可见 |
+| `RIVER_COLOR` | `RGB(0.20, 0.48, 0.78)` | 比初版更饱和的蓝 |
+| `RIVER_MIN_Q` | 0.6 | 产流阈值 |
+| `RIVER_DENSITY` | 0.15 | 目标密度；`Qc = 0.6 / 0.15 = 4.0` |
+| `OROGRAPHIC` | 0.8 | 山地增雨 |
+| `PET_MIN` / `PET_MAX` / `PET_EXP` | 0.05 / 0.65 / 1.4 | 潜在蒸散 |
+| `SNOW_FADE_LO` / `SNOW_FADE_HI` | 0.05 / 0.05 | 积雪过渡 |
+| `SLOPE_NORM` | 0.25 | 坡度归一化 |
+| `RUNOFF_FLAT` / `RUNOFF_STEEP` | 0.25 / 0.85 | 产流系数 |
+| `RIVER_FILL_EPS` | `1e-6` | priority-flood 严格下降 |
+| `RIVER_DEPTH_BIAS` | 0.004 | 视线偏移（未变） |
+| `RIVER_MAX_ARC_DEG` | 2.5 | 子段最大圆心角（未变） |
+
+**宽度/颜色为什么改**：初版 `1.2px + RGB(0.29,0.43,0.62)` 在 2000×1125 截图中基本看不见；临时把颜色改成洋红、宽度 4px 后，几何/shader/图层全部正常（洋红河段清楚可见）。最终取 2.2px + 更饱和的蓝，默认 `dist=2.33` 和近景都清楚；宽度仍是“世界固定宽度 + 屏幕下限”的组合，不是按流量变化。
+
+**实测数据**（headless，`LEVEL=6`，`coverage=0.3`）：
+
+| 种子/气候 | 河段 | 陆地密度 | 入海口 | 最大 Q | 填洼最大深度 | mesh |
+|---|---:|---:|---:|---:|---:|---|
+| 4242 / rain 1 / temp 1 | 531 | 7.3% | 32 | 79.27 | 0.1443 | 1593 采样点 / 2124 三角形 |
+| 20261021 / rain 0 / temp 0 | 118 | 1.8% | 11 | 28.42 | 0.1219 | 354 采样点 / 472 三角形 |
+
+30% 完整生成在开发机（AMD 780M / GL Compatibility）约 740–780 ms，河流层约 50 ms；移动端需要单独 profile 堆操作与 mesh 构建。
+
+**图层验证**：低丘 0 → 河流 1 → 高山 2 的 priority 回归已通过；近景截图中河流连续压在低丘/平原上。湿润种子 4242 的 531 条河段里 **跨高山 0 条**——高山是分水岭，河网自然绕开，所以这组种子没有“高山压河”的视觉样本；该行为由 priority 回归保证，若后续种子出现跨山河段，priority 2 会让高山后画并盖住河流。
+
+**测试**：
+
+- `tools/test_planet_rivers.gd`：邻接 N×6（5/6 邻居、恰 12 个五边形、严格对称）、河段端点/邻接、parent 链全部入水且无环、阈值一致、ribbon 采样数/半径/单位法线/UV、图层 priority 0/1/2、shader 参数、`custom_aabb`、水文重算确定性。
+- `tools/test_planet_hills.gd`：已按低丘/高山拆分更新（数量、半径、UV 落格、确定性）。
+- 暂缓：气候响应对比（rainfall ±1 的河段数）、封闭湖单出口、GUT 集成；这些在二期/后续 review 补。
+
 ---
 
 ## 12. 验证计划
 
 ### 12.1 GUT 单元/管线测试
 
-新增 `tests/test_rivers.gd`，沿用 `tests/test_coverage.gd` 的方式：在场景树里跑完整生成管线，然后检查数组。
+新增 `tools/test_planet_rivers.gd`（一期已落地；GUT 集成后续再补），沿用 `tools/test_planet_hills.gd` 的方式：在场景树里跑完整生成管线，然后检查数组。
 
 建议用例：
 

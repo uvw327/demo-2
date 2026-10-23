@@ -92,87 +92,89 @@ func _run() -> void:
 		return
 	print("PASS: 星球生成完毕")
 
-	# —— 3) quad 数量 = 地形 ≥ 小丘 的贴片数（精确相等 → 平原/水域/未生成无 quad）——
-	var hills_count := 0
+	# —— 3) quad 数量 = 地形分组后的贴片数（低丘/高山各一个 mesh）——
+	# 河流要压住低丘、被高山压住，所以丘陵层现已按 TerrainLevel 拆成两个实例。
+	var low_levels: Array[int] = []
+	var high_levels: Array[int] = []
 	for lv in planet._terrain:
-		if lv >= PlanetScript.TerrainLevel.SMALL_HILLS:
-			hills_count += 1
-	var hm: ArrayMesh = null
-	if planet._hills_instance != null:
-		hm = planet._hills_instance.mesh
-	var verts := PackedVector3Array()
-	var uvs := PackedVector2Array()
-	var idx := PackedInt32Array()
-	var ok_count: bool = hm != null and hills_count > 0
-	if ok_count:
-		var ha := hm.surface_get_arrays(0)
-		verts = ha[Mesh.ARRAY_VERTEX]
-		uvs = ha[Mesh.ARRAY_TEX_UV]
-		idx = ha[Mesh.ARRAY_INDEX]
-		ok_count = verts.size() == hills_count * 4 and idx.size() == hills_count * 6 \
-				and uvs.size() == verts.size()
-	print(bin_if(ok_count, "quad 数与地形匹配（%d quad × 4 顶点，%d 片 ≥小丘）"
-			% [verts.size(), hills_count]))
+		if lv >= PlanetScript.TerrainLevel.MOUNTAINOUS:
+			high_levels.append(lv)
+		elif lv >= PlanetScript.TerrainLevel.SMALL_HILLS:
+			low_levels.append(lv)
+	var low_count := low_levels.size()
+	var high_count := high_levels.size()
+	var low_hm: ArrayMesh = null
+	var high_hm: ArrayMesh = null
+	if planet._hills_low_instance != null:
+		low_hm = planet._hills_low_instance.mesh
+	if planet._hills_high_instance != null:
+		high_hm = planet._hills_high_instance.mesh
+	var low_a := _mesh_arrays(low_hm)
+	var high_a := _mesh_arrays(high_hm)
+	var ok_count := true
+	if low_count > 0:
+		ok_count = ok_count and not low_a.is_empty() \
+				and (low_a["verts"] as PackedVector3Array).size() == low_count * 4 \
+				and (low_a["idx"] as PackedInt32Array).size() == low_count * 6 \
+				and (low_a["uvs"] as PackedVector2Array).size() == low_count * 4
+	else:
+		ok_count = ok_count and low_hm == null
+	if high_count > 0:
+		ok_count = ok_count and not high_a.is_empty() \
+				and (high_a["verts"] as PackedVector3Array).size() == high_count * 4 \
+				and (high_a["idx"] as PackedInt32Array).size() == high_count * 6 \
+				and (high_a["uvs"] as PackedVector2Array).size() == high_count * 4
+	else:
+		ok_count = ok_count and high_hm == null
+	print(bin_if(ok_count, "quad 数与地形匹配（低丘 %d + 高山 %d，共 %d quad；"
+			% [low_count, high_count, low_count + high_count])
+			+ "每组 4 顶点/6 索引）")
 	_ok = _ok and ok_count
 
-	# —— 4) 几何：顶点半径全部在 1.005×R ± 0.001（离球面防 z-fighting、贴而不浮）——
+	# —— 4) 几何：所有顶点半径都在 1.005×R ± 0.001 ——
+	var all_verts := PackedVector3Array()
+	if not low_a.is_empty():
+		all_verts.append_array(low_a["verts"])
+	if not high_a.is_empty():
+		all_verts.append_array(high_a["verts"])
 	var rmin := INF
 	var rmax := 0.0
-	for vv in verts:
+	for vv in all_verts:
 		var r := vv.length()
 		rmin = minf(rmin, r)
 		rmax = maxf(rmax, r)
 	var expect_r: float = 1.0 + PlanetScript.HILLS_OFFSET
-	var ok_geo: bool = ok_count and rmin > expect_r - 0.001 and rmax < expect_r + 0.001
+	var ok_geo: bool = ok_count and not all_verts.is_empty() \
+			and rmin > expect_r - 0.001 and rmax < expect_r + 0.001
 	print(bin_if(ok_geo, "quad 顶点半径 = 1.005±0.001（min %.4f max %.4f）"
 			% [rmin, rmax]))
 	_ok = _ok and ok_geo
 
-	# —— 5) UV 落格：第 i 个 quad 的 UV 全在「第 i 个 ≥小丘 贴片」等级格的 2×2 变体内 ——
-	var lvl_list: Array[int] = []
-	for lv2 in planet._terrain:
-		if lv2 >= PlanetScript.TerrainLevel.SMALL_HILLS:
-			lvl_list.append(lv2)
+	# —— 5) UV 落格：低丘/高山各自按「该组贴片在 _terrain 里的顺序」核对 ——
 	var bad_uv := -1
-	if ok_count and lvl_list.size() == hills_count:
-		for qi in lvl_list.size():
-			var cell: Vector2 = origins[lvl_list[qi] - PlanetScript.TerrainLevel.SMALL_HILLS]
-			for k in 4:
-				var uv: Vector2 = uvs[qi * 4 + k]
-				# 变体格范围 = [cell, cell + sprite_uv]（容差 1e-4 吃 float32 舍入）
-				if uv.x < cell.x - 0.0001 or uv.x > cell.x + sprite_uv.x + 0.0001 \
-						or uv.y < cell.y - 0.0001 or uv.y > cell.y + sprite_uv.y + 0.0001:
-					bad_uv = qi
-					break
-	elif ok_count:
-		bad_uv = -2 # 贴片序与 quad 序对不上（数量断言已过的前提下不该发生）
+	if ok_count:
+		bad_uv = _check_uv_group(low_a, low_levels, origins, sprite_uv,
+				PlanetScript.TerrainLevel.SMALL_HILLS)
+		if bad_uv == -1:
+			bad_uv = _check_uv_group(high_a, high_levels, origins, sprite_uv,
+					PlanetScript.TerrainLevel.SMALL_HILLS)
 	var ok_uv: bool = ok_count and bad_uv == -1
-	print(bin_if(ok_uv, "UV 全部落在对应等级格内（%d quad 逐个核对%s）"
-			% [lvl_list.size(), "" if bad_uv == -1 else "，坏 quad %d" % bad_uv]))
+	print(bin_if(ok_uv, "UV 全部落在对应等级格内（低丘 %d + 高山 %d 逐个核对%s）"
+			% [low_count, high_count,
+			"" if bad_uv == -1 else "，坏 quad %d" % bad_uv]))
 	_ok = _ok and ok_uv
 
-	# —— 6) 确定性：同 seed 重建逐位一致（独立随机流）；换 seed 必须有差异 ——
-	var v1 := PackedVector3Array()
-	var ok_det: bool = hm != null
-	if ok_det:
-		var hm2: ArrayMesh = planet._build_hills_mesh(4242)
-		if hm2 != null:
-			var a1 := hm.surface_get_arrays(0)
-			var a2 := hm2.surface_get_arrays(0)
-			v1 = a1[Mesh.ARRAY_VERTEX]
-			var v2: PackedVector3Array = a2[Mesh.ARRAY_VERTEX]
-			var u1: PackedVector2Array = a1[Mesh.ARRAY_TEX_UV]
-			var u2: PackedVector2Array = a2[Mesh.ARRAY_TEX_UV]
-			ok_det = not v1.is_empty() and v1 == v2 and u1 == u2
-		else:
-			ok_det = false
-		var hm3: ArrayMesh = planet._build_hills_mesh(9999)
-		if ok_det and hm3 != null:
-			var v3: PackedVector3Array = hm3.surface_get_arrays(0)[Mesh.ARRAY_VERTEX]
-			ok_det = v3 != v1
-		else:
-			ok_det = false
-	print(bin_if(ok_det, "确定性：同种子 quad 逐位一致、换种子有差异"))
+	# —— 6) 确定性：同 seed 重建低丘/高山逐位一致（独立随机流）；换 seed 有差异 ——
+	var r1: Dictionary = planet._build_hills_meshes(4242)
+	var r2: Dictionary = planet._build_hills_meshes(4242)
+	var r3: Dictionary = planet._build_hills_meshes(9999)
+	var j1 := _join_hills(r1)
+	var j2 := _join_hills(r2)
+	var j3 := _join_hills(r3)
+	var v1: PackedVector3Array = j1["verts"]
+	var ok_det: bool = not v1.is_empty() and v1 == j2["verts"] \
+			and j1["uvs"] == j2["uvs"] and v1 != j3["verts"]
+	print(bin_if(ok_det, "确定性：同种子低丘/高山 quad 逐位一致、换种子有差异"))
 	_ok = _ok and ok_det
 
 	_quit(0 if _ok else 1)
@@ -186,3 +188,45 @@ func _quit(code: int) -> void:
 
 func bin_if(ok: bool, msg: String) -> String:
 	return ("PASS: " + msg) if ok else ("FAIL: " + msg)
+
+
+func _mesh_arrays(m: ArrayMesh) -> Dictionary:
+	if m == null or m.get_surface_count() == 0:
+		return {}
+	var a := m.surface_get_arrays(0)
+	return {
+		"verts": a[Mesh.ARRAY_VERTEX],
+		"uvs": a[Mesh.ARRAY_TEX_UV],
+		"idx": a[Mesh.ARRAY_INDEX],
+	}
+
+
+func _check_uv_group(a: Dictionary, levels: Array[int], origins: Array[Vector2],
+		sprite_uv: Vector2, base_level: int) -> int:
+	if levels.is_empty():
+		return -1 if a.is_empty() else -3
+	if a.is_empty():
+		return -4
+	var uvs: PackedVector2Array = a["uvs"]
+	for qi in levels.size():
+		var cell: Vector2 = origins[levels[qi] - base_level]
+		for k in 4:
+			var uv: Vector2 = uvs[qi * 4 + k]
+			# 变体格范围 = [cell, cell + sprite_uv]（容差 1e-4 吃 float32 舍入）
+			if uv.x < cell.x - 0.0001 or uv.x > cell.x + sprite_uv.x + 0.0001 \
+					or uv.y < cell.y - 0.0001 or uv.y > cell.y + sprite_uv.y + 0.0001:
+				return qi
+	return -1
+
+
+func _join_hills(r: Dictionary) -> Dictionary:
+	var verts := PackedVector3Array()
+	var uvs := PackedVector2Array()
+	for key in ["low", "high"]:
+		var m := r[key] as ArrayMesh
+		if m == null:
+			continue
+		var a := m.surface_get_arrays(0)
+		verts.append_array(a[Mesh.ARRAY_VERTEX])
+		uvs.append_array(a[Mesh.ARRAY_TEX_UV])
+	return {"verts": verts, "uvs": uvs}

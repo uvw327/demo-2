@@ -32,6 +32,7 @@ const HillsAtlasScript := preload("res://hills_atlas.gd")
 const SELECTION_RING_SHADER := preload("res://selection_ring.gdshader")
 const ATMOSPHERE_SHADER := preload("res://atmosphere.gdshader")
 const HILLS_SHADER := preload("res://planet_hills.gdshader")
+const RIVER_SHADER := preload("res://planet_rivers.gdshader")
 # level：递归二分段数，f = 2^level → 贴片总数 = 10·4^level + 2
 # level=7 → f=128 → 163842 个贴片
 const LEVEL := 6
@@ -195,11 +196,31 @@ var _generated: PackedByteArray = PackedByteArray() # 贴片是否已生成（�
 # 点击选中时据此生成“向内溢出的白色光晕环”（见 _rebuild_selection_ring）。
 var _tile_polys: Array[PackedVector3Array] = []
 # 每块贴片的中心方向（单位球面，与 _tile_polys 同序同生命周期）：
-# 阶段 B 同一处缓存，丘陵 quad 按它定位（见 _build_hills_mesh）。
+# 阶段 B 同一处缓存，丘陵 quad 按它定位（见 _build_hills_meshes）。
 var _tile_centers := PackedVector3Array()
-# —— 丘陵/山脉贴片层（第 2 期）：独立 MeshInstance3D，1 次 draw call ——
-var _hills_instance: MeshInstance3D = null
+# —— 丘陵/山脉贴片层（第 2 期）：按 TerrainLevel 拆低丘/高山两个实例 ——
+# 拆分原因见 docs/planet_rivers_plan.md §9.4/§9.7.5：河流要压住低丘、但被高山压住。
+var _hills_low_instance: MeshInstance3D = null   # SmallHills / LargeHills，priority 0
+var _hills_high_instance: MeshInstance3D = null  # Mountainous / Impassable，priority 2
 var _hills_atlas: Dictionary = {} # 丘陵图集（惰性打包一次，换种子不重做）
+
+# —— 河流层（第 3 期一期）：贴片中心线水网 + 独立 ribbon mesh ——
+# 邻接 N×6（不足 6 个用 -1 填充）由 ⑤b 的 tri_tiles + vert_faces 建出；
+# 水文只在已生成区（_generated==1）内跑，水面是终点。
+var _tile_neighbors := PackedInt32Array()
+var _tile_neighbor_count := PackedByteArray()
+var _river_edges := PackedInt32Array() # 扁平 [from, to, from, to, ...]，下游方向
+var _river_edge_count := 0
+# 水文中间结果（调试/测试用；parent=-1 表示水面种子）
+var _river_parent := PackedInt32Array()
+var _river_flow := PackedFloat32Array()
+var _river_filled := PackedFloat32Array()
+var _river_instance: MeshInstance3D = null
+var _river_material: ShaderMaterial = null
+var _river_stats: Dictionary = {}
+# priority-flood 的最小堆（成员数组：Packed 数组传参是值语义，用成员避免拷贝）
+var _river_heap_keys := PackedFloat32Array()
+var _river_heap_tiles := PackedInt32Array()
 var _selected_tile := -1                  # 当前选中贴片索引；-1 = 未选中
 var _orbit: OrbitCamera                   # 轨道相机（点按事件从这里进来）
 var _selection_ring: MeshInstance3D       # 选中环：独立实例，切换选中时重建其 mesh
@@ -241,6 +262,28 @@ const JITTER_SMALL_HILLS := 0.37
 const JITTER_LARGE_HILLS := 0.20
 const JITTER_HIGH := 0.08 # 山区 / 不可逾越同值
 
+# —— 第 3 期：河流层参数（一期先做贴片中心线 + 固定宽度）——
+# 几何半径 1.0（贴地），深度避让靠 shader 的视线偏移；详见 docs/planet_rivers_plan.md §9.7。
+const RIVER_BASE_HALF_WIDTH := 0.0018
+const RIVER_MIN_WIDTH_PX := 2.2
+const RIVER_DEPTH_BIAS := 0.004
+const RIVER_MAX_ARC_DEG := 2.5
+const RIVER_COLOR := Color(0.20, 0.48, 0.78, 1.0)
+# 产流/汇流参数（一期初值；先看日志里的河段密度/Q，再按截图调）
+const RIVER_OROGRAPHIC := 0.8
+const RIVER_PET_MIN := 0.05
+const RIVER_PET_MAX := 0.65
+const RIVER_PET_EXP := 1.4
+const RIVER_SNOW_FADE_LO := 0.05
+const RIVER_SNOW_FADE_HI := 0.05
+const RIVER_SLOPE_NORM := 0.25
+const RIVER_RUNOFF_FLAT := 0.25
+const RIVER_RUNOFF_STEEP := 0.85
+const RIVER_FILL_EPS := 1e-6
+# 河段阈值：Qc = RIVER_MIN_Q / RIVER_DENSITY；一期目标密度 10%~20% 陆地贴片
+const RIVER_MIN_Q := 0.6
+const RIVER_DENSITY := 0.15
+
 
 # 丘陵图集惰性装配（一次打包，换种子不重做——与 biome 图集同策略）
 func _ensure_hills_atlas() -> Dictionary:
@@ -254,7 +297,7 @@ func _ensure_hills_atlas() -> Dictionary:
 # · 随机性走独立 RNG（seed ^ "HILL"）：不碰地形/气候随机流 → 主生成确定性不破坏；
 #   quad 数组只依赖 (world_seed, _terrain, _tile_centers) → 同种子重建逐位一致。
 # · 一次同步构建（30% 档 ~3.7k quad、100% 档 ~12k quad，毫秒级，不进分帧热路径）。
-func _build_hills_mesh(world_seed: int) -> ArrayMesh:
+func _build_hills_meshes(world_seed: int) -> Dictionary:
 	var hills := _ensure_hills_atlas()
 	var cells: Array[Vector2] = hills["cell_origins"]
 	var sprite_uv: Vector2 = hills["sprite_uv"]
@@ -265,20 +308,27 @@ func _build_hills_mesh(world_seed: int) -> ArrayMesh:
 	# 平均贴片宽（单位球等面积圆直径 = 4/√N，弧度 × R 换算世界单位）：与原版
 	# averageTileSize 同语义，quad 边长与球面抖动都以它为尺
 	var avg_tile := 4.0 / sqrt(float(total))
-	var verts := PackedVector3Array()
-	var uvs := PackedVector2Array()
-	var indices := PackedInt32Array()
-	var quad_n := 0
+	# 低丘 / 高山各一组数组：一次 RNG 遍历分别追加，保持同种子逐位一致。
+	# 河流层要插在两者之间（低丘 0 → 河流 1 → 高山 2），所以不能合成一个 mesh。
+	var low_verts := PackedVector3Array()
+	var low_uvs := PackedVector2Array()
+	var low_indices := PackedInt32Array()
+	var high_verts := PackedVector3Array()
+	var high_uvs := PackedVector2Array()
+	var high_indices := PackedInt32Array()
+	var low_quad_n := 0
+	var high_quad_n := 0
 	for v in total:
 		var lv: int = _terrain[v]
 		if lv < TerrainLevel.SMALL_HILLS:
 			continue # 平原 / 水域 / 未生成（NOT_GENERATED=0、FLAT=1）都不贴
 		# 位置抖动：中心 + 随机单位向量 × 量程再归一化（归一化去掉径向分量
 		# → 与原版「加 UnitVector3 再 normalize*半径」等效，纯角位置抖动）
+		var is_high: bool = lv >= TerrainLevel.MOUNTAINOUS
 		var j := JITTER_SMALL_HILLS
 		if lv == TerrainLevel.LARGE_HILLS:
 			j = JITTER_LARGE_HILLS
-		elif lv >= TerrainLevel.MOUNTAINOUS:
+		elif is_high:
 			j = JITTER_HIGH
 		var dir := (_tile_centers[v] + Vector3(rng.randfn(), rng.randfn(),
 				rng.randfn()).normalized() * (j * avg_tile)).normalized()
@@ -294,30 +344,60 @@ func _build_hills_mesh(world_seed: int) -> ArrayMesh:
 		var half := rng.randf_range(QUAD_SIZE_MIN, QUAD_SIZE_MAX) * avg_tile \
 				* 0.5 * PLANET_RADIUS
 		var pos := dir * ((1.0 + HILLS_OFFSET) * PLANET_RADIUS)
-		var vi := verts.size()
-		verts.append(pos - xr * half - yr * half)
-		verts.append(pos + xr * half - yr * half)
-		verts.append(pos + xr * half + yr * half)
-		verts.append(pos - xr * half + yr * half)
 		# UV：按地形等级选图集格 + 2×2 变体随机（原版 Rand.Range(0,2) 两轴）
 		var cell := cells[lv - TerrainLevel.SMALL_HILLS]
 		var o := cell + Vector2(rng.randi_range(0, 1), rng.randi_range(0, 1)) \
 				* variant_uv
-		# 纹理「上」对齐 +y_axis（与 star_dome 的 quad UV 同构；随机旋转后朝向天然随机）
-		uvs.append(o + Vector2(0, 1) * variant_uv)
-		uvs.append(o + Vector2(1, 1) * variant_uv)
-		uvs.append(o + Vector2(1, 0) * variant_uv)
-		uvs.append(o + Vector2(0, 0) * variant_uv)
-		# 三角形（与 star_dome 的 quad 同构：0,1,2 / 0,2,3）
-		indices.append(vi)
-		indices.append(vi + 1)
-		indices.append(vi + 2)
-		indices.append(vi)
-		indices.append(vi + 2)
-		indices.append(vi + 3)
-		quad_n += 1
-	if quad_n == 0:
-		return null # 全平原/水世界：不建丘陵层
+		if is_high:
+			var vi := high_verts.size()
+			high_verts.append(pos - xr * half - yr * half)
+			high_verts.append(pos + xr * half - yr * half)
+			high_verts.append(pos + xr * half + yr * half)
+			high_verts.append(pos - xr * half + yr * half)
+			# 纹理「上」对齐 +y_axis（与 star_dome 的 quad UV 同构；随机旋转后朝向天然随机）
+			high_uvs.append(o + Vector2(0, 1) * variant_uv)
+			high_uvs.append(o + Vector2(1, 1) * variant_uv)
+			high_uvs.append(o + Vector2(1, 0) * variant_uv)
+			high_uvs.append(o + Vector2(0, 0) * variant_uv)
+			# 三角形（与 star_dome 的 quad 同构：0,1,2 / 0,2,3）
+			high_indices.append(vi)
+			high_indices.append(vi + 1)
+			high_indices.append(vi + 2)
+			high_indices.append(vi)
+			high_indices.append(vi + 2)
+			high_indices.append(vi + 3)
+			high_quad_n += 1
+		else:
+			var vi := low_verts.size()
+			low_verts.append(pos - xr * half - yr * half)
+			low_verts.append(pos + xr * half - yr * half)
+			low_verts.append(pos + xr * half + yr * half)
+			low_verts.append(pos - xr * half + yr * half)
+			low_uvs.append(o + Vector2(0, 1) * variant_uv)
+			low_uvs.append(o + Vector2(1, 1) * variant_uv)
+			low_uvs.append(o + Vector2(1, 0) * variant_uv)
+			low_uvs.append(o + Vector2(0, 0) * variant_uv)
+			low_indices.append(vi)
+			low_indices.append(vi + 1)
+			low_indices.append(vi + 2)
+			low_indices.append(vi)
+			low_indices.append(vi + 2)
+			low_indices.append(vi + 3)
+			low_quad_n += 1
+	print("丘陵贴片层：低丘 ", low_quad_n, " quad，高山 ", high_quad_n,
+			" quad（/ ", total, " 贴片）")
+	return {
+		"low": _make_quad_mesh(low_verts, low_uvs, low_indices),
+		"high": _make_quad_mesh(high_verts, high_uvs, high_indices),
+		"low_n": low_quad_n,
+		"high_n": high_quad_n,
+	}
+
+
+func _make_quad_mesh(verts: PackedVector3Array, uvs: PackedVector2Array,
+		indices: PackedInt32Array) -> ArrayMesh:
+	if verts.is_empty():
+		return null # 该组没有 quad：不建空 surface（Godot 会报 ERR_INVALID_DATA）
 	var arrays := []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = verts
@@ -325,7 +405,371 @@ func _build_hills_mesh(world_seed: int) -> ArrayMesh:
 	arrays[Mesh.ARRAY_INDEX] = indices
 	var mesh := ArrayMesh.new()
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-	print("丘陵贴片层：", quad_n, " 个 quad（/ ", total, " 贴片）")
+	return mesh
+
+
+func _make_hills_instance(mesh: ArrayMesh, priority: int) -> MeshInstance3D:
+	var inst := MeshInstance3D.new()
+	inst.mesh = mesh
+	var hmat := ShaderMaterial.new()
+	hmat.shader = HILLS_SHADER
+	hmat.set_shader_parameter("hills_atlas", _ensure_hills_atlas()["texture"])
+	hmat.render_priority = priority
+	inst.material_override = hmat
+	return inst
+
+
+# ===== 河流层（第 3 期一期）=====
+# 数据 → 水文 → ribbon。全部同步执行（40k 贴片量级，先保证可见；后续再按需分帧）。
+func _build_river_layer() -> void:
+	var t0 := Time.get_ticks_msec()
+	_compute_river_edges()
+	if _river_edges.is_empty():
+		print("河流层：没有河段（产流为 0 或阈值过高），跳过 mesh")
+		return
+	var mesh := _build_river_mesh_from_edges()
+	if mesh == null:
+		return
+	_river_instance = MeshInstance3D.new()
+	_river_instance.mesh = mesh
+	_river_material = ShaderMaterial.new()
+	_river_material.shader = RIVER_SHADER
+	_river_material.set_shader_parameter("river_color", RIVER_COLOR)
+	_river_material.set_shader_parameter("base_half_width", RIVER_BASE_HALF_WIDTH)
+	_river_material.set_shader_parameter("min_width_px", RIVER_MIN_WIDTH_PX)
+	_river_material.set_shader_parameter("depth_bias", RIVER_DEPTH_BIAS)
+	_river_material.set_shader_parameter("depth_mode", 0)
+	# 低丘 0 → 河流 1 → 高山 2：河流压住低丘，但被高山压住
+	_river_material.render_priority = 1
+	_river_instance.material_override = _river_material
+	_river_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# 零面积对象空间三角形：必须给覆盖整球的 AABB，否则会被视锥裁掉
+	_river_instance.custom_aabb = AABB(Vector3.ONE * -1.01, Vector3.ONE * 2.02)
+	add_child(_river_instance)
+	print("河流层：", _river_edge_count, " 条河段，mesh ", mesh.get_surface_count(),
+			" surface，构建 ", Time.get_ticks_msec() - t0, " ms")
+
+
+# 产流 → priority-flood → 汇流 → 阈值 → _river_edges（扁平 from/to 对）
+func _compute_river_edges() -> void:
+	_river_edges = PackedInt32Array()
+	_river_edge_count = 0
+	_river_parent = PackedInt32Array()
+	_river_flow = PackedFloat32Array()
+	_river_filled = PackedFloat32Array()
+	_river_stats = {}
+	var total := _tile_centers.size()
+	if total == 0:
+		return
+
+	# —— 1) 产流 injection（水面/未生成 = 0）——
+	var injection := PackedFloat32Array()
+	injection.resize(total)
+	injection.fill(0.0)
+	var land_n := 0
+	var water_n := 0
+	for v in total:
+		if _generated[v] != 1:
+			continue
+		if _inland_water[v] == 1:
+			water_n += 1
+			continue
+		land_n += 1
+		var elev := _tile_elev[v]
+		var temp := _tile_temp[v]
+		var humid := _tile_humid[v]
+		# 最大正高差：只跟陆地邻居比（水面/未生成不算坡）
+		var max_drop := 0.0
+		var base := v * 6
+		for k in _tile_neighbor_count[v]:
+			var u := _tile_neighbors[base + k]
+			if u < 0 or _generated[u] != 1 or _inland_water[u] == 1:
+				continue
+			var drop := elev - _tile_elev[u]
+			if drop > max_drop:
+				max_drop = drop
+		var p := clampf(humid, 0.0, 1.0) \
+				* (1.0 + RIVER_OROGRAPHIC * maxf(elev - SEA_LEVEL, 0.0))
+		var warm := clampf((temp - T_FREEZE) / (1.0 - T_FREEZE), 0.0, 1.0)
+		var pet := RIVER_PET_MIN + (RIVER_PET_MAX - RIVER_PET_MIN) \
+				* pow(warm, RIVER_PET_EXP)
+		var snow := 1.0 - smoothstep(T_FREEZE - RIVER_SNOW_FADE_LO,
+				T_FREEZE + RIVER_SNOW_FADE_HI, temp)
+		var slope01 := clampf(max_drop / RIVER_SLOPE_NORM, 0.0, 1.0)
+		var r := maxf(0.0, p - pet) * (1.0 - snow) \
+				* lerpf(RIVER_RUNOFF_FLAT, RIVER_RUNOFF_STEEP, slope01)
+		injection[v] = clampf(r, 0.0, 1.0)
+
+	# —— 2) priority-flood：水面是种子，填平洼地并记录 parent ——
+	var filled := PackedFloat32Array()
+	filled.resize(total)
+	filled.fill(0.0)
+	var parent := PackedInt32Array()
+	parent.resize(total)
+	parent.fill(-1)
+	var visited := PackedByteArray()
+	visited.resize(total)
+	var order := PackedInt32Array()
+	_river_heap_keys = PackedFloat32Array()
+	_river_heap_tiles = PackedInt32Array()
+	var seed_count := 0
+	for v in total:
+		if _generated[v] != 1 or _inland_water[v] != 1:
+			continue
+		filled[v] = SEA_LEVEL
+		visited[v] = 1
+		_river_heap_push(SEA_LEVEL, v)
+		seed_count += 1
+	if seed_count == 0:
+		# 100% 陆地兜底：最低已生成陆地当虚拟出海口
+		var lowest := -1
+		var lowest_elev := INF
+		for v in total:
+			if _generated[v] == 1 and _tile_elev[v] < lowest_elev:
+				lowest_elev = _tile_elev[v]
+				lowest = v
+		if lowest >= 0:
+			filled[lowest] = SEA_LEVEL
+			visited[lowest] = 1
+			_river_heap_push(SEA_LEVEL, lowest)
+			seed_count = 1
+			print("河流层警告：没有水面种子，使用最低陆地贴片 ", lowest,
+					" 作为虚拟出海口")
+	while _river_heap_keys.size() > 0:
+		var v := _river_heap_pop()
+		order.append(v)
+		var fv := filled[v]
+		var base := v * 6
+		for k in _tile_neighbor_count[v]:
+			var u := _tile_neighbors[base + k]
+			if u < 0 or _generated[u] != 1 or visited[u] != 0:
+				continue
+			visited[u] = 1
+			if _inland_water[u] == 1:
+				# 所有水面都应已入种子；这里只做防御（理论不会走到）
+				filled[u] = SEA_LEVEL
+				_river_heap_push(SEA_LEVEL, u)
+				continue
+			filled[u] = maxf(_tile_elev[u], fv + RIVER_FILL_EPS)
+			parent[u] = v
+			_river_heap_push(filled[u], u)
+
+	# —— 3) 倒序汇流：q = injection + 所有上游 ——
+	var flow := injection.duplicate()
+	for i in range(order.size() - 1, -1, -1):
+		var v := order[i]
+		var p := parent[v]
+		if p >= 0:
+			flow[p] += flow[v]
+
+	# —— 4) 阈值判定：Qc = RIVER_MIN_Q / RIVER_DENSITY ——
+	var qc := RIVER_MIN_Q / maxf(RIVER_DENSITY, 0.001)
+	var sel := _collect_river_edges(parent, flow, qc)
+	if int(sel["tiles"]) == 0:
+		# 一期先保证“能看到河”：绝对阈值一条都选不出时，回退到 top 5% 分位。
+		# 湿润气候下绝对阈值通常先触发，不会走到这里；调参后再决定是否保留。
+		var qs: Array[float] = []
+		for v in total:
+			if _generated[v] == 1 and _inland_water[v] == 0 \
+					and parent[v] >= 0 and flow[v] > 0.0:
+				qs.append(flow[v])
+		if not qs.is_empty():
+			qs.sort()
+			var target := clampi(int(land_n * 0.05), 1, qs.size())
+			qc = qs[maxi(0, qs.size() - target)]
+			sel = _collect_river_edges(parent, flow, qc)
+			print("河流层：绝对阈值过高，回退到 top 5% 分位 Q=", snappedf(qc, 0.001))
+	var edges: PackedInt32Array = sel["edges"]
+	_river_edges = edges
+	_river_edge_count = int(sel["tiles"])
+	# 保留中间结果：测试可验证 parent 链最终入水、没有环。
+	_river_parent = parent
+	_river_flow = flow
+	_river_filled = filled
+
+	# —— 5) 统计（日志 + 测试断言用）——
+	var max_fill := 0.0
+	for v in total:
+		if _generated[v] == 1 and _inland_water[v] == 0 and parent[v] >= 0:
+			max_fill = maxf(max_fill, filled[v] - _tile_elev[v])
+	var density := 0.0
+	if land_n > 0:
+		density = float(_river_edge_count) / float(land_n)
+	# 跨高山河段数：高山是分水岭，河网通常绕开；>0 时由 priority 2 压住。
+	var high_edges := 0
+	for e in _river_edge_count:
+		var ha: int = _terrain[_river_edges[e * 2]]
+		var hb: int = _terrain[_river_edges[e * 2 + 1]]
+		if ha >= TerrainLevel.MOUNTAINOUS or hb >= TerrainLevel.MOUNTAINOUS:
+			high_edges += 1
+	_river_stats = {
+		"land": land_n,
+		"water": water_n,
+		"river_tiles": _river_edge_count,
+		"edges": _river_edge_count,
+		"density": density,
+		"max_q": float(sel["max_q"]),
+		"threshold": qc,
+		"mouths": int(sel["mouths"]),
+		"max_fill": max_fill,
+		"seeds": seed_count,
+		"high_edges": high_edges,
+	}
+	print("河流：河段 ", _river_edge_count, " 条，河道贴片 ", _river_edge_count,
+			" / 陆地 ", land_n, "（", snappedf(density * 100.0, 0.1), "%），最大 Q=",
+			snappedf(float(sel["max_q"]), 0.01), "，阈值=", snappedf(qc, 0.01),
+			"，入海口 ", int(sel["mouths"]), "，跨高山 ", high_edges,
+			"，填洼最大深度=", snappedf(max_fill, 0.0001))
+
+
+# 给定阈值收集河段：每个陆地贴片最多一条 (v -> parent[v])，天然无重复/无环
+func _collect_river_edges(parent: PackedInt32Array, flow: PackedFloat32Array,
+		qc: float) -> Dictionary:
+	var edges := PackedInt32Array()
+	var tiles := 0
+	var mouths := 0
+	var max_q := 0.0
+	for v in parent.size():
+		if _generated[v] != 1 or _inland_water[v] == 1 or parent[v] < 0:
+			continue
+		var q := flow[v]
+		if q > max_q:
+			max_q = q
+		if q >= qc:
+			edges.append(v)
+			edges.append(parent[v])
+			tiles += 1
+			if _inland_water[parent[v]] == 1:
+				mouths += 1
+	return {"edges": edges, "tiles": tiles, "mouths": mouths, "max_q": max_q}
+
+
+# —— 二叉最小堆（key = 填洼后高程，tie-break = 贴片索引；确定性）——
+func _river_heap_push(key: float, tile: int) -> void:
+	_river_heap_keys.append(key)
+	_river_heap_tiles.append(tile)
+	var i := _river_heap_keys.size() - 1
+	while i > 0:
+		var p := (i - 1) >> 1
+		var kp := _river_heap_keys[p]
+		var ki := _river_heap_keys[i]
+		if kp < ki or (kp == ki and _river_heap_tiles[p] <= _river_heap_tiles[i]):
+			break
+		_river_heap_keys[p] = ki
+		_river_heap_keys[i] = kp
+		var tt := _river_heap_tiles[p]
+		_river_heap_tiles[p] = _river_heap_tiles[i]
+		_river_heap_tiles[i] = tt
+		i = p
+
+
+func _river_heap_pop() -> int:
+	var n := _river_heap_tiles.size()
+	var result := _river_heap_tiles[0]
+	n -= 1
+	if n > 0:
+		_river_heap_keys[0] = _river_heap_keys[n]
+		_river_heap_tiles[0] = _river_heap_tiles[n]
+		_river_heap_keys.resize(n)
+		_river_heap_tiles.resize(n)
+		var i := 0
+		while true:
+			var l := i * 2 + 1
+			if l >= n:
+				break
+			var r := l + 1
+			var best := l
+			if r < n:
+				var kl := _river_heap_keys[l]
+				var kr := _river_heap_keys[r]
+				if kr < kl or (kr == kl and _river_heap_tiles[r] < _river_heap_tiles[l]):
+					best = r
+			var kb := _river_heap_keys[best]
+			var ki := _river_heap_keys[i]
+			if kb > ki or (kb == ki and _river_heap_tiles[best] >= _river_heap_tiles[i]):
+				break
+			_river_heap_keys[i] = kb
+			_river_heap_keys[best] = ki
+			var tt := _river_heap_tiles[i]
+			_river_heap_tiles[i] = _river_heap_tiles[best]
+			_river_heap_tiles[best] = tt
+			i = best
+	else:
+		_river_heap_keys.resize(0)
+		_river_heap_tiles.resize(0)
+	return result
+
+
+# 河段 → 球面 ribbon：每个贴片边至少 3 采样，合并段按 2.5° 再细分；
+# 两侧顶点位置相同、NORMAL 相同（侧向）、UV.x=0/1，宽度由 shader 展开。
+func _build_river_mesh_from_edges() -> ArrayMesh:
+	var verts := PackedVector3Array()
+	var normals := PackedVector3Array()
+	var uvs := PackedVector2Array()
+	var indices := PackedInt32Array()
+	var edge_n := _river_edges.size() >> 1
+	for e in edge_n:
+		var from := _river_edges[e * 2]
+		var to := _river_edges[e * 2 + 1]
+		if from < 0 or to < 0 or from >= _tile_centers.size() \
+				or to >= _tile_centers.size():
+			continue
+		var a := _tile_centers[from]
+		var b := _tile_centers[to]
+		var mouth: bool = _inland_water[to] == 1
+		if mouth:
+			b = (a + b).normalized() # 入海口截到两贴片中心的中点（岸线）
+		var theta := a.angle_to(b)
+		if theta < 1e-6:
+			continue
+		var n := maxi(2, ceili(theta / deg_to_rad(RIVER_MAX_ARC_DEG)))
+		var start := verts.size()
+		for i in n + 1:
+			var t := float(i) / float(n)
+			var p := a.slerp(b, t).normalized()
+			# 大圆切向：把 (b-a) 投影到 p 的切平面
+			var seg := b - a
+			var dir := seg - p * seg.dot(p)
+			if dir.length_squared() < 1e-12:
+				var helper := Vector3.UP if absf(p.y) < 0.9 else Vector3.RIGHT
+				dir = helper - p * helper.dot(p)
+			dir = dir.normalized()
+			# 方头：两端沿切向各延长半个宽度；入海口不向水面延长
+			if i == 0:
+				p = (p - dir * RIVER_BASE_HALF_WIDTH).normalized()
+			elif i == n and not mouth:
+				p = (p + dir * RIVER_BASE_HALF_WIDTH).normalized()
+			var side := p.cross(dir)
+			if side.length_squared() < 1e-12:
+				var helper2 := Vector3.UP if absf(p.y) < 0.9 else Vector3.RIGHT
+				side = p.cross(helper2)
+			side = side.normalized()
+			verts.append(p)
+			verts.append(p)
+			normals.append(side)
+			normals.append(side)
+			uvs.append(Vector2(0.0, t))
+			uvs.append(Vector2(1.0, t))
+		for i in n:
+			var base := start + i * 2
+			indices.append(base)
+			indices.append(base + 1)
+			indices.append(base + 2)
+			indices.append(base + 1)
+			indices.append(base + 3)
+			indices.append(base + 2)
+	if verts.is_empty():
+		return null
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_NORMAL] = normals
+	arrays[Mesh.ARRAY_TEX_UV] = uvs
+	arrays[Mesh.ARRAY_INDEX] = indices
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	print("河流 mesh：", verts.size() >> 1, " 个采样点，", indices.size() / 3,
+			" 个三角形")
 	return mesh
 
 
@@ -421,19 +865,31 @@ func _on_generate_requested(params: Dictionary) -> void:
 	add_child(_mesh_instance)
 	# 大气光晕：紧跟星球上线（星球边缘那圈柔和的蓝白光晕，见 atmosphere.gdshader）
 	_build_atmosphere()
-	# 丘陵/山脉贴片层（第 2 期）：独立 MeshInstance3D 仍只 1 次 draw call，
-	# 旧层与旧星球同步退场（同 _mesh_instance 的二次生成语义）
-	if _hills_instance != null:
-		_hills_instance.queue_free()
-	var hills_mesh := _build_hills_mesh(params["seed"])
-	_hills_instance = MeshInstance3D.new()
-	if hills_mesh != null:
-		_hills_instance.mesh = hills_mesh
-		var hmat := ShaderMaterial.new()
-		hmat.shader = HILLS_SHADER
-		hmat.set_shader_parameter("hills_atlas", _ensure_hills_atlas()["texture"])
-		_hills_instance.material_override = hmat
-		add_child(_hills_instance)
+	# 丘陵/山脉贴片层（第 2 期）：按 TerrainLevel 拆低丘/高山，priority 0 / 2。
+	# 旧层与旧星球同步退场（同 _mesh_instance 的二次生成语义）。
+	if _hills_low_instance != null:
+		_hills_low_instance.queue_free()
+		_hills_low_instance = null
+	if _hills_high_instance != null:
+		_hills_high_instance.queue_free()
+		_hills_high_instance = null
+	var hills := _build_hills_meshes(params["seed"])
+	var low_mesh: ArrayMesh = hills["low"]
+	var high_mesh: ArrayMesh = hills["high"]
+	if low_mesh != null:
+		_hills_low_instance = _make_hills_instance(low_mesh, 0)
+		add_child(_hills_low_instance)
+	if high_mesh != null:
+		_hills_high_instance = _make_hills_instance(high_mesh, 2)
+		add_child(_hills_high_instance)
+
+	# 河流层（第 3 期一期）：priority 1 插在低丘/高山之间。
+	# 二次生成先撤旧河，再按新地形重建。
+	if _river_instance != null:
+		_river_instance.queue_free()
+		_river_instance = null
+		_river_material = null
+	_build_river_layer()
 
 	# 生成完把画面交给玩家：镜头对准区域（球冠）中心——大陆正对着玩家，
 	# 北极朝上。focus_on 对准生成前就定好的 _region_center，
@@ -1066,6 +1522,37 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 		fill_at = fill_end
 		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
 			await _slice_yield(91.0 + 1.0 * float(fill_at) / float(total))
+
+	# ===== ⑤b-adj 贴片邻接（河流水文用）=====
+	# 共享一条棱 ⇔ 共享两个角三角；对每个贴片，取它周围每个角三角的另外两个
+	# 汇入贴片，去重后存 N×6（不足 6 个 -1）。纯拓扑，不依赖水深/群系。
+	_tile_neighbors = PackedInt32Array()
+	_tile_neighbors.resize(total * 6)
+	_tile_neighbors.fill(-1)
+	_tile_neighbor_count = PackedByteArray()
+	_tile_neighbor_count.resize(total)
+	var adj_at := 0
+	while adj_at < total:
+		var adj_end := mini(adj_at + SLICE_CHECK_STRIDE, total)
+		for w in range(adj_at, adj_end):
+			var cnt := 0
+			for ti in vert_faces[w]:
+				for s in 3:
+					var u := tri_tiles[3 * ti + s]
+					if u == w:
+						continue
+					var dup := false
+					for k in cnt:
+						if _tile_neighbors[w * 6 + k] == u:
+							dup = true
+							break
+					if not dup and cnt < 6:
+						_tile_neighbors[w * 6 + cnt] = u
+						cnt += 1
+			_tile_neighbor_count[w] = cnt
+		adj_at = adj_end
+		if Time.get_ticks_msec() - _gen_slice_t0 >= _gen_budget:
+			await _slice_yield(91.1)
 
 	# ===== ⑤b0 小水域剔除（封闭小湖填成陆地，见 docs/planet_textures_plan.md §3⑥）=====
 	# 微型内陆湖整湖都落在近岸白噪带里 → 整片泛白像白斑（temp/sea_wave*.png），

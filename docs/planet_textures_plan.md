@@ -303,7 +303,7 @@ ALBEDO = mix(band_water, PALE_TINT, gain);          // PALE_TINT=(0.66,0.70,0.76
      延展填充 + `generate_mipmaps()`（同 biome 图集防串味手法；带 alpha 的图
      透明边延展透明，天然正确）
    - 返回 { texture, cell_origins(4 格左上角 UV), sprite_uv }
-6. **贴片网格**：`planet.gd _build_hills_mesh()`（新）——每个 `level ≥ 小丘陵`
+6. **贴片网格**：`planet.gd _build_hills_meshes()`（新）——每个 `level ≥ 小丘陵`
    的贴片，在其中心方向加抖动后的位置、离球面 1.005× 半径处贴一个**切线 quad**：
    - 边长 0.9–1.1 × `avg_tile`（= 4/√贴片总数，单位球等面积圆直径，与原版
      averageTileSize 同语义）；球面位置抖动按等级递减 0.37/0.20/0.08/0.08
