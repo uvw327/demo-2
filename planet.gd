@@ -224,7 +224,7 @@ var _river_half_width := PackedFloat32Array()   # 每贴片半宽，0 = 非河�
 var _river_child_count := PackedInt32Array()    # 河网内上游支流条数（0=源头，≥2=汇合点）
 var _river_down := PackedInt32Array()           # 下游邻居（-1=无河段）
 var _river_widest_child := PackedInt32Array()   # 最宽上游支流（汇合点处给 miter 定向）
-var _river_junction_dir: Dictionary = {}        # 汇合点 → 统一角平分方向（端面对齐）
+var _river_junctions: PackedInt32Array = PackedInt32Array()  # 汇合点节点（放圆角接头）
 var _river_branch_nodes := PackedInt32Array()   # 分支链节点串（扁平）
 var _river_branch_offsets := PackedInt32Array() # CSR 偏移，长度 = 链数 + 1
 var _river_branch_n := 0
@@ -273,9 +273,10 @@ const JITTER_HIGH := 0.08 # 山区 / 不可逾越同值
 # —— 河流层参数（第 3 期做数据与图层；§20 二期改为按流量分级河宽）——
 # 几何半径 1.0（贴地），深度避让靠 shader 的视线偏移；详见 docs/planet_rivers_plan.md §9.7 / §20。
 const RIVER_MIN_WIDTH_PX := 1.6   # 屏幕最小宽度（只兜最细的支流，不再让全网红一样粗）
-# 屏幕最大宽度默认关闭（0 = 不封顶）：实测 28px 的上限在近景会把干/支一起压到
-# 同一条带上——半宽 0.0013–0.0070 全部落在膝点以上，压缩成 1.7× 的区间，
-# 等于把几何里做好的分级又抹平了。远看怕"蓝色高速公路"再调这个值。
+# 屏幕最大宽度默认关闭（0 = 不封顶）：实测近景下这类上限会把干/支一起压到
+# 同一条带上（半宽区间整体落在膝点以上 → 压缩成 1.7×），等于把几何里做好的
+# 分级又抹平了。宽度已经在几何层按贴片尺度过一遍（§23.2），远看不需要再封。
+# 真要封，必须往下调 `RIVER_MIN_WIDTH_PX` 一起调，别单独开这个。
 const RIVER_MAX_WIDTH_PX := 0.0
 const RIVER_DEPTH_BIAS := 0.004
 const RIVER_MAX_ARC_DEG := 2.5
@@ -286,25 +287,28 @@ const RIVER_COLOR := Color(0.20, 0.48, 0.78, 1.0)
 # 等价于幂律 half ∝ Q^b（b 由数据自动定出，约 0.35–0.45），正是水力学里的
 # 「河宽 ∝ Q^0.5」；线性刻度 + clamp 会把流量前 10% 全压成同一宽度（§21.1 实测 12%），
 # 对数刻度在高流量段天然保留分辨率，只有 P99 以上才顶到上限。
-const RIVER_HALF_MIN := 0.0013        # 最细支流半宽（世界单位，球半径 1）
-const RIVER_HALF_MAX := 0.0070        # 最粗干流半宽（干/支比 5.4×）
+# —— 宽度尺度以「贴片」为准，不以「星球」为准 ——
+# level 6 贴片：边长 a=0.01087、对边宽 L=0.01882。玩法上河不能吃掉太多陆地
+# （玩家降落后要发展，靠河流发电但陆地不能太小），所以干流全宽上限压到
+# 0.0064 = 34% L（改造前是 0.0140 = 74% L，几乎占满一整个贴片）。
+# 测试里有硬护栏：2 × 实测最大半宽 / L ≤ 0.40。
+const RIVER_HALF_MIN := 0.00095       # 最细支流半宽 = 0.050 L（全宽 10% L）
+const RIVER_HALF_MAX := 0.00320       # 最粗干流半宽 = 0.170 L（全宽 34% L，干/支 3.4×）
 const RIVER_WIDTH_Q_LO_PCT := 0.05    # 宽度下端点对应的 Q 分位
 const RIVER_WIDTH_Q_HI_PCT := 0.99    # 宽度上端点对应的 Q 分位
 const RIVER_MITER_MAX_RATIO := 1.4    # miter 偏移上限（×半宽），尖角只切角不爆刺
 # —— 形状后处理（§21 P0/P3/P4）——
 # 折角：路径沿六边形网格的边走，方向量化到 60° 整数倍（实测 p90 转角 61.6°）。
 # Chaikin 角切 2 次 → 转角 p90 降到 16°、最大 19°，而端点是钉住的，
-# 所以汇合点的切线方向完全不变（_river_junction_dir 仍然成立）。
+# 所以链两端的切线方向完全不变（汇合点接头按端切线算，不受影响）。
 const RIVER_SMOOTH_ITERS := 2         # Chaikin 迭代次数（0 = 关闭）
 const RIVER_TIP_LEN_DEG := 3.0        # 源头渐细/渐隐的弧长（度）
 const RIVER_TIP_TAPER := 0.30         # 源头最末端的半宽比例
-const RIVER_MOUTH_LEN_DEG := 0.6      # 入海口喇叭口弧长（度；只需覆盖被截断的半个段长）
+const RIVER_MOUTH_PAST := 0.62        # 河口：沿(最后陆地片→水域片)方向取的比例，0.5=岸线
+const RIVER_MOUTH_LEN_DEG := 0.6      # 河口喇叭口弧长（度）
 const RIVER_MOUTH_FLARE := 1.15       # 入海口半宽放大倍数（做过头会像码头）
-# 汇水潭：横跨干流方向必须正好相切（=1.0，否则会鼓出一圈"领口"），
-# 只在沿干流方向拉长，用来盖住支流那道楔形缺口。
-const RIVER_POOL_ACROSS := 1.0        # 横向半径（× 半宽）
-const RIVER_POOL_ALONG := 1.8         # 沿干流半径（× 半宽）
-const RIVER_POOL_SEG := 16            # 边数（10 边时弦长台阶看得出来）
+# 汇合点圆角接头：半径 = 该点半宽（圆角 join 的定义），只补两条正截面之间的夹角。
+const RIVER_JOIN_SEG := 14            # 圆弧边数（14 边时弦高 < 2.5% 半径，看不出多边形）
 # 产流/汇流参数（一期初值；先看日志里的河段密度/Q，再按截图调）
 const RIVER_OROGRAPHIC := 0.8
 const RIVER_PET_MIN := 0.05
@@ -1226,20 +1230,12 @@ func _build_river_branches() -> void:
 		var wc: int = _river_widest_child[b]
 		if wc < 0 or _river_half_width[a] > _river_half_width[wc]:
 			_river_widest_child[b] = a
-	# 汇合点的统一角平分方向：最宽支流来向 + 下游出向。
-	# 所有汇入支流与下游链都用它 → 端面互相平行，接头严丝合缝。
-	_river_junction_dir = {}
+	# 汇合点清单（≥2 条来水且有下游）：出网格时在这里放圆角接头。
+	_river_junctions = PackedInt32Array()
 	for v in total:
-		if _river_child_count[v] < 2:
+		if _river_child_count[v] < 2 or _river_down[v] < 0:
 			continue
-		var pn0: int = _river_down[v]
-		var wc0: int = _river_widest_child[v]
-		if pn0 < 0 or wc0 < 0:
-			continue
-		var pc := _tile_centers[v]
-		_river_junction_dir[v] = _river_bisector(pc,
-				_river_dir(pc, _tile_centers[wc0]),
-				_river_dir(pc, _tile_centers[pn0]))
+		_river_junctions.append(v)
 	for v in total:
 		if _river_down[v] < 0:
 			continue
@@ -1328,6 +1324,8 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 	var indices := PackedInt32Array()
 	var sample_n := 0
 	var quad_n := 0
+	var mouth_pts := PackedVector3Array()
+	var mouth_rad := PackedFloat32Array()
 	for b in _river_branch_n:
 		var start: int = _river_branch_offsets[b]
 		var count: int = _river_branch_offsets[b + 1] - start
@@ -1341,30 +1339,35 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 			var v: int = _river_branch_nodes[start + i]
 			pts[i] = _tile_centers[v]
 			halves[i] = _river_half_width[v]
-		var mouth := _inland_water[_river_branch_nodes[start + count - 1]] == 1
-		if mouth:
-			# 入海口截到岸线（两贴片中心的中点），宽度沿用最后一个陆地节点
-			pts[count - 1] = (pts[count - 2] + pts[count - 1]).normalized()
-			halves[count - 1] = halves[count - 2]
-		else:
-			# 链尾落在汇合点：**不**继承汇合点（= 下游）的半宽，否则细支流在口
-			# 上会突然胀到干流宽度，被斜切的端面切成一个方块凸起（实测很显眼）。
-			# 支流按自己的宽度收在汇合端面上，加宽交给下游链 + 汇水潭圆盘。
-			halves[count - 1] = halves[count - 2]
 		var head_v: int = _river_branch_nodes[start]
 		var tail_v: int = _river_branch_nodes[start + count - 1]
 		var is_source: bool = _river_child_count[head_v] < 2
-		if not is_source:
-			# 链头落在汇合点：从「最宽上游支流」的宽度起步，再在下一段里长到
-			# 汇合点（= 合流后）的宽度。否则汇合处会留下半个宽度的硬台阶
-			# ——那圈"领口"比支流在口上鼓起方块更常见、也更难忽略。
-			var wc: int = _river_widest_child[head_v]
-			if wc >= 0 and _river_half_width[wc] > 0.0:
-				halves[0] = minf(halves[0], _river_half_width[wc])
+		var mouth := _inland_water[tail_v] == 1
+		var ends_at_junction: bool = (not mouth) and _river_child_count[tail_v] >= 2
+		var is_dead_end: bool = (not mouth) and (not ends_at_junction)
+		if mouth:
+			# 河口：从「最后陆地片 → 水域片」的连线上取 0.62（海岸线在 0.5 处），
+			# 也就是**略微伸进水面**。六边形海岸是锯齿状的，取中点经常刚好卡在
+			# 陆地一侧 → 留下一条缝 + 那块"没入海"的半透明。伸进去一点必然跨过
+			# 岸线；alpha 全程保持 1，不再做淡出（淡出在岸带的白色雾面上就是
+			# 一坨不明所以的透明）。
+			pts[count - 1] = pts[count - 2].slerp(pts[count - 1],
+					RIVER_MOUTH_PAST).normalized()
+			halves[count - 1] = halves[count - 2]
+		elif ends_at_junction:
+			# 汇合点：干流（= 最宽的那条来水）**保留汇合后的半宽**——上游最后一段
+			# 自然张开成汇流喇叭；支流则按自身半宽收口（否则细支流会在口上胀到
+			# 干流宽度，被斜切端面切成一个方块凸起）。两者端面之间的那个凹角，
+			# 由汇合点圆盘（半径正好 = 汇合后半宽）填成圆角。
+			if _river_widest_child[tail_v] != _river_branch_nodes[start + count - 2]:
+				halves[count - 1] = halves[count - 2]
+		# 链头落在汇合点时不用特别处理：halves[0] 本来就是汇合后的半宽，
+		# 与上游干流在汇合点的端面完全一致（改造前这里还做了一次 min() 收缩，
+		# 结果加宽被挤到汇合点之后的那一段里，看起来就是"过一会儿突然肿一下"）。
 
 		# —— 折角平滑（§21 P0）：Chaikin ×N，端点钉住 ——
 		# 端点处第一/最后一段的方向严格等于原折线的第一/最后一段（凸包内切只切角、
-		# 不动端点切线），所以汇合点的 _river_junction_dir 依然成立，无需重算。
+		# 不动端点切线），所以汇合点接头按端切线算依然成立，无需重算。
 		var sm := _river_chaikin(pts, halves, RIVER_SMOOTH_ITERS)
 		pts = sm[0]
 		halves = sm[1]
@@ -1396,9 +1399,8 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 				halves[i] *= lerpf(RIVER_TIP_TAPER, 1.0, smoothstep(0.0, 1.0, u))
 				alphas[i] = smoothstep(0.0, 0.5, u)
 		if mouth:
-			# 入海口：短喇叭口 + 只在最末一个采样点软边。
-			# 试过长淡出（0.6°）——在本作这种六边形锯齿海岸上会露出一块
-			# 半透明"幽灵三角"，比平口截断还难看，所以只保留 1 个采样点的渐隐。
+			# 入海口：短喇叭口，alpha 保持 1（不做淡出——淡出落在岸带白色雾面上
+			# 就是一坨"没入海"的透明；伸进水面之后自然被水面接住）。
 			var mlen := minf(deg_to_rad(RIVER_MOUTH_LEN_DEG), total_arc * 0.5)
 			mlen = maxf(mlen, 1e-9)
 			var m0: float = total_arc - mlen
@@ -1409,7 +1411,18 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 				var u := clampf((s2 - m0) / mlen, 0.0, 1.0)
 				halves[i] *= lerpf(1.0, RIVER_MOUTH_FLARE,
 						u * u * (3.0 - 2.0 * u))
-			alphas[n - 1] = 0.0
+		elif is_dead_end:
+			# 断头于干涸洼地：从尾部同样收细（只收宽度，不做透明），
+			# 免得在荒地里留一个平口。
+			var dlen := minf(deg_to_rad(RIVER_TIP_LEN_DEG), total_arc * 0.35)
+			dlen = maxf(dlen, 1e-9)
+			for i in range(n - 1, -1, -1):
+				var ds: float = total_arc - cum[i]
+				if ds > dlen:
+					break
+				var du := ds / dlen
+				halves[i] *= lerpf(RIVER_TIP_TAPER, 1.0,
+						smoothstep(0.0, 1.0, du))
 
 		# —— 段方向（p 点切平面内的单位向量）——
 		var dirs := PackedVector3Array()
@@ -1426,28 +1439,27 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 			var p := pts[i]
 			var d_in := dirs[i - 1] if i > 0 else Vector3.ZERO
 			var d_out := dirs[i] if i < count - 1 else Vector3.ZERO
+			# 链头落在汇合点：把「最宽的那条来水」的方向当成自己的来向；
+			# 链尾落在汇合点（或带着链路走向河口）：把「下游节点方向」当成去向往外接。
+			# 这样每个端头都是**自己这条河道**与下游河道之间的标准 miter 接头，
+			# 干流尾端与下游链头端会算出**完全相同**的角平分方向与偏移量 → 端面重合。
+			if d_in == Vector3.ZERO and _river_child_count[head_v] >= 2:
+				var wc: int = _river_widest_child[head_v]
+				if wc >= 0:
+					d_in = _river_dir(p, _tile_centers[wc])
+			if d_out == Vector3.ZERO:
+				var dn: int = _river_down[tail_v]
+				if dn >= 0:
+					d_out = _river_dir(p, _tile_centers[dn])
 			var m := Vector3.ZERO
-			var shared := false
-			if i == count - 1 and not mouth:
-				# 链尾落在汇合点：所有支流与下游链共用同一角平分方向，
-				# 端面互相平行 → 接头严丝合缝（支流的斜切被更宽的干流盖住）
-				var jd: Vector3 = _river_junction_dir.get(tail_v, Vector3.ZERO)
-				if jd != Vector3.ZERO:
-					m = jd
-					shared = true
-				else:
-					m = d_in
-			elif i == 0 and _river_child_count[head_v] >= 2:
-				var jd0: Vector3 = _river_junction_dir.get(head_v, Vector3.ZERO)
-				if jd0 != Vector3.ZERO:
-					m = jd0
-					shared = true
-				else:
-					m = d_out
-			elif d_in == Vector3.ZERO:
-				m = d_out
-			elif d_out == Vector3.ZERO:
-				m = d_in
+			var at_end := (i == 0 or i == count - 1)
+			if at_end:
+				# 链的两端用**自己的切向**，不做 miter 拉伸：端面就是本河道的一个
+				# 正截面（离轴正好 ±半宽）。转角由汇合点的圆角接头去接，
+				# 端面本身绝不能斜切——斜切会在干流边上啃掉一个角，那就是缺口。
+				m = d_out if i == 0 else d_in
+				if m == Vector3.ZERO:
+					m = d_in if d_in != Vector3.ZERO else d_out
 			else:
 				m = _river_bisector(p, d_in, d_out)
 			if m == Vector3.ZERO:
@@ -1457,14 +1469,12 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 				var helper := Vector3.UP if absf(p.y) < 0.9 else Vector3.RIGHT
 				side = p.cross(helper)
 			sides[i] = side.normalized()
-			# 汇合点两侧共用同一角平分方向时，偏移量就是半宽本身（见 shared）
-			if shared:
+			if at_end:
 				offs[i] = halves[i]
 			else:
-				var d_ref := d_out if d_out != Vector3.ZERO else d_in
-				var cos_h := 1.0
-				if d_ref != Vector3.ZERO:
-					cos_h = clampf(m.dot(d_ref), 1.0 / RIVER_MITER_MAX_RATIO, 1.0)
+				# 内点 miter：把 ±半宽 推到两条边线的交点上，拐角外沿才不会被切角。
+				# Chaikin 之后最大转角 19°，实际补偿 ≤1.5%，钳到 1.4× 只兜异常值。
+				var cos_h := clampf(m.dot(d_out), 1.0 / RIVER_MITER_MAX_RATIO, 1.0)
 				offs[i] = halves[i] / cos_h
 
 		# —— 采样：每段按 2.5° 细分，位置/侧向/偏移/alpha 沿线插值 ——
@@ -1527,58 +1537,79 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 			indices.append(q0 + 2)
 		sample_n += emitted
 		quad_n += emitted - 1
+		if mouth:
+			mouth_pts.append(pts[count - 1])
+			mouth_rad.append(halves[count - 1])
 
-	# —— 汇水潭（§21 P6）：盖住三叉口的「领口台阶」和支流的楔形缺口 ——
-	# 椭圆而不是圆：横跨干流方向**正好相切**（×1.0，多一点都不行——多出来的部分
-	# 就是一圈看得见的"领口"台阶），只沿干流方向拉长（×1.8）去吃缺口。
-	# 顶点约定与 ribbon 一致：NORMAL = 切平面径向单位向量、UV2.x = 半径，
-	# shader 的屏幕最小宽度补偿对潭面同样成立（远看不会缩没）；
-	# 圆心 UV.x = 0.5 → 偏移系数 (UV.x*2-1) = 0，圆心不会被补偿移动。
-	# 注意 PackedArray 是值类型，这里必须就地写，不能拆成会改副本的辅助函数。
-	var pool_n := 0
-	var pool_seg := RIVER_POOL_SEG
-	for pv in _river_junction_dir.keys():
-		var pr: float = _river_half_width[pv]
-		# 潭的横向半径要跟「汇合点处 ribbon 的实际半宽」对齐（= 最宽上游支流），
-		# 否则会鼓出下游干流的轮廓之外。
-		var pw: int = _river_widest_child[pv]
-		if pw >= 0 and _river_half_width[pw] > 0.0:
-			pr = _river_half_width[pw]
-		if pr <= 0.0:
+	# —— 汇合点圆角接头（round join）——
+	# 每条链在汇合点处以「自己的正截面」结束，两个截面之间那个夹角由一段
+	# **以汇合点为圆心、半径正好等于该点半宽**的圆弧补上。这就是制图学里的
+	# round join：圆弧在两边的切点处与两条岸线相切 → 既没有 miter 的尖刺，
+	# 也没有切角留下的缺口；而且半径 = 半宽，圆弧永远不会伸出河道轮廓之外。
+	# 支流比干流细，它的端面本来就落在圆弧内部，露不出来。
+	# 改造前这里是一个纵向拉伸 1.8× 的椭圆"汇水潭"：斜向半径能到 1.35× 半宽，
+	# 于是干流边上肿出一块——截图里的"突出"和"肿胀"都是它。
+	var join_n := 0
+	var join_seg := RIVER_JOIN_SEG
+	for jv in _river_junctions:
+		var jr: float = _river_half_width[jv]
+		if jr <= 0.0:
 			continue
-		var pc: Vector3 = _tile_centers[pv]
-		var dn: int = _river_down[pv]
-		if dn < 0:
-			continue
-		# 沿干流方向 / 横跨干流方向（切平面内正交基）
-		var b_dir: Vector3 = _river_dir(pc, _tile_centers[dn])
-		if b_dir == Vector3.ZERO:
-			continue
-		var a_dir: Vector3 = pc.cross(b_dir).normalized()
-		var ra := pr * RIVER_POOL_ACROSS
-		var rb := pr * RIVER_POOL_ALONG
+		var pc: Vector3 = _tile_centers[jv]
+		var helper := Vector3.UP if absf(pc.y) < 0.9 else Vector3.RIGHT
+		var e1: Vector3 = pc.cross(helper).normalized()
+		var e2: Vector3 = pc.cross(e1).normalized()
 		var ci := verts.size()
 		verts.append(pc)
-		normals.append(a_dir)
+		normals.append(e1)
 		uvs.append(Vector2(0.5, 0.0))
-		uv2s.append(Vector2(ra, 0.0))
+		uv2s.append(Vector2(jr, 0.0))
 		cols.append(Color(1.0, 0.0, 0.0, 1.0))
-		for k in pool_seg:
-			var a := TAU * float(k) / float(pool_seg)
-			var rad: Vector3 = a_dir * cos(a) + b_dir * sin(a)
-			verts.append((pc + a_dir * (ra * cos(a)) + b_dir * (rb * sin(a))).normalized())
-			normals.append((rad - pc * rad.dot(pc)).normalized())
-			# UV.x = 1 → shader 里 (UV.x*2-1) = +1，与 NORMAL（径向朝外）同向：
-			# 补偿为正时向外扩、为负时向内缩。写成 0 会反号，潭面会反向放大。
+		for k in join_seg:
+			var a := TAU * float(k) / float(join_seg)
+			var rad: Vector3 = e1 * cos(a) + e2 * sin(a)
+			verts.append((pc + rad * jr).normalized())
+			normals.append(rad)
+			# UV.x = 1 → shader 里 (UV.x*2-1) = +1，与径向 NORMAL 同向，
+			# 远看的屏幕最小宽度补偿才会把圆盘补大而不是缩没。
 			uvs.append(Vector2(1.0, 0.0))
-			uv2s.append(Vector2(ra, 0.0))
+			uv2s.append(Vector2(jr, 0.0))
 			cols.append(Color(1.0, 0.0, 0.0, 1.0))
-		for k in pool_seg:
+		for k in join_seg:
 			indices.append(ci)
 			indices.append(ci + 1 + k)
-			indices.append(ci + 1 + (k + 1) % pool_seg)
-		pool_n += 1
+			indices.append(ci + 1 + (k + 1) % join_seg)
+		join_n += 1
 
+	# —— 河口端头：半径 = 河口半宽的圆 ——
+	# 河道在岸线外侧一点点被截断，用同半径的圆收尾 → 断面不再是"被剪断的管子"，
+	# 而是一个圆润的河口；圆不会超出河道轮廓（半径就是半宽）。
+	for mi in mouth_pts.size():
+		var mp: Vector3 = mouth_pts[mi]
+		var mr: float = mouth_rad[mi]
+		if mr <= 0.0:
+			continue
+		var mh := Vector3.UP if absf(mp.y) < 0.9 else Vector3.RIGHT
+		var me1: Vector3 = mp.cross(mh).normalized()
+		var me2: Vector3 = mp.cross(me1).normalized()
+		var mci := verts.size()
+		verts.append(mp)
+		normals.append(me1)
+		uvs.append(Vector2(0.5, 0.0))
+		uv2s.append(Vector2(mr, 0.0))
+		cols.append(Color(1.0, 0.0, 0.0, 1.0))
+		for k in join_seg:
+			var ma := TAU * float(k) / float(join_seg)
+			var mrad: Vector3 = me1 * cos(ma) + me2 * sin(ma)
+			verts.append((mp + mrad * mr).normalized())
+			normals.append(mrad)
+			uvs.append(Vector2(1.0, 0.0))
+			uv2s.append(Vector2(mr, 0.0))
+			cols.append(Color(1.0, 0.0, 0.0, 1.0))
+		for k in join_seg:
+			indices.append(mci)
+			indices.append(mci + 1 + k)
+			indices.append(mci + 1 + (k + 1) % join_seg)
 	if verts.is_empty():
 		return null
 	var arrays := []
@@ -1593,9 +1624,12 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 	_river_render_stats["samples"] = sample_n
 	_river_render_stats["quads"] = quad_n
-	_river_render_stats["pools"] = pool_n
-	print("河流 mesh：", sample_n, " 采样点 / ", quad_n * 2 + pool_n * pool_seg,
-			" 三角形（", _river_branch_n, " 条链，", pool_n, " 个汇水潭）")
+	_river_render_stats["joins"] = join_n
+	_river_render_stats["mouths"] = mouth_pts.size()
+	print("河流 mesh：", sample_n, " 采样点 / ",
+			quad_n * 2 + (join_n + mouth_pts.size()) * join_seg,
+			" 三角形（", _river_branch_n, " 条链，", join_n, " 个汇合点圆角，",
+			mouth_pts.size(), " 个河口）")
 	return mesh
 
 
