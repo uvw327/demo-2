@@ -75,7 +75,7 @@ const C_ICE := Color(0.93, 0.95, 0.97)    # 冰盖
 # （Ocean 卡备份），贴图 × macro × 顶点色与已生成海域逐像素一致，覆盖区边界
 # 无缝，不再出现与海洋对比强烈的浅蓝死海块；逻辑上它仍属于“未生成”，
 # 没有地形数据也不可交互（见 is_tile_interactable）。
-# 注：第 8 格与第 0 格都是「水格」→ shader 里同走深海净色（+贴岸近白噪带），
+# 注：第 8 格与第 0 格都是「水格」→ shader 里同走水色公式（浅水→深海渐变），
 #     两格处理一致，逐像素一致的不变量不受影响。
 
 # ---- 群系 id 表：颜色与 HUD 显示同源（_biome_id 判定，BIOME_NAMES/ COLORS 查表）----
@@ -133,25 +133,26 @@ const COAST_TRANS := 0.25  # 过渡带宽度 = 区域角距 θ 的比例
 const COAST_KILL := 0.08   # 完全水下的带宽 = θ 的比例
 const COAST_DEPTH := 0.06  # 压死后的海底深度（海平面再往下压这么多）
 
-# ---- 近岸白噪带（参考 24-OceanShoreNoise.md，实现见 docs/planet_textures_plan.md §3⑥）----
-# 原版近岸“白色噪声” = 贴岸一圈的「色卡细颗粒 × WorldMacro + 白抬升」，深海被权重混成
-# 常量深海。不照抄它的高程公式（E∈[-320,0]）：我们的覆盖率边界把最外圈强行压到
-# SEA_LEVEL−COAST_DEPTH 的海底，高程做白带会沿世界边缘出现一圈**假白环**，破坏刚做好的
-# 覆盖区无缝。改为**离岸距离场**：贴片图上从陆地贴片多源 BFS（只在开放水域传播，
-# 海冰既不算岸也不传播），逐角点取汇于该角 3 贴片的距离均值 → 归一化 shore∈[0,1]
-# （1=岸线，0=深海），由 ⑤c 写进水贴片顶点色 a。深海 shore=0 → 走净色纯色逐位不变；
+# ---- 水域深度场（离岸距离 → 浅水/深海渐变；见 docs/planet_water_plan.md）----
+# 曾经这里是"近岸白噪带"（贴岸一圈 fBm 白雾）。逆向参考图 temp/river10.png 后发现：
+# 海岸根本没有"带"这个独立结构，而是**一整片从岸线到深海的长渐变**——岸线处是最浅的
+# 水色（= 河水色），往外单调暗化。所以现在同一份距离场只做一件事：给 shader 一个
+# 0→1 的深度权重，由它 mix(ocean_deep, ocean_flat, w)。
+# 数据来源不变：贴片图上从陆地贴片多源 BFS（只在开放水域传播，海冰既不算岸也不传播），
+# 逐角点取汇于该角 3 贴片的距离均值 → 归一化 shore∈[0,1]（1=岸线，0=深海），
+# 由 ⑤c 写进水贴片顶点色 a。深海 shore=0 → 恒等于 ocean_deep；
 # 陆地 a 仍是岩石量，shader 用图集格号区分，两义互不污染。
-const SHORE_BAND_HOPS := 4.0 # 带宽（离岸格数）：1 格 ≈1.1°，4 格 ≈4.4° ≈ 参考图雾斑宽度（仍够不到覆盖区强制浅滩外缘，无假白环）
+const SHORE_BAND_HOPS := 6.0 # 带宽（离岸格数）：1 格 ≈1.1°，6 格 ≈6.6° ≈ 参考图"浅水→深海"渐变的跨度（约屏幕宽 22%）。岸线处最浅、往外单调变暗，不再是一圈白雾。
 # 小水域剔除阈值：完全被已生成陆地包住的连通水域 ≤ 这么多贴片 → 生成期填成
-# 陆地。原因：微型内陆湖整湖都落在 4 跳白噪带里 → 整片泛白像白斑
+# 陆地。原因：微型内陆湖整湖都落在带宽内 → 整片偏亮像一块浅色斑
 # （temp/sea_wave*.png）。与未生成深洋（BIOME_NONE）连通的分量是真海/内海，
 # 永不剔除；11 片 ≈ 截图案例上限（链状湖 11 片），更大的湖保留。
 const MIN_LAKE_TILES := 11
 const LAKE_FILL_ELEV := 0.02  # 填湖后的海拔 = 海平面+0.02：判成陆地、地形 FLAT 不长丘陵
-# 有效带宽自适应（⑤b0b）：白噪带视觉宽度 = 水域半径（分量最大离岸跳数）× 比例，
-# 下限保证最小湖也有岸线感的一圈、上限 = SHORE_BAND_HOPS（大洋/内海封顶，观感不变）。
-# 0.35（用户拍板）→ 半径 ≤4 跳的小湖雾带只贴岸 1~2 圈，湖心回归深蓝净色，
-# 不再整湖被白雾淹没（temp/sea_wave3.png）。
+# 有效带宽自适应（⑤b0b）：渐变视觉宽度 = 水域半径（分量最大离岸跳数）× 比例，
+# 下限保证最小湖也有一圈浅水、上限 = SHORE_BAND_HOPS（大洋/内海封顶）。
+# 0.35（用户拍板）→ 半径 ≤4 跳的小湖只有贴岸 1~2 圈偏浅，湖心回归深海色，
+# 不再整湖被淹没在一个亮度上（temp/sea_wave3.png）。
 const LAKE_RING_RATIO := 0.35
 const MIN_LAKE_RING_HOPS := 1.5
 
@@ -280,7 +281,19 @@ const RIVER_MIN_WIDTH_PX := 1.6   # 屏幕最小宽度（只兜最细的支流�
 const RIVER_MAX_WIDTH_PX := 0.0
 const RIVER_DEPTH_BIAS := 0.004
 const RIVER_MAX_ARC_DEG := 2.5
-const RIVER_COLOR := Color(0.20, 0.48, 0.78, 1.0)
+# —— 水体配色（单一真源；来自参考图 temp/river10.png 逆向实测，见 docs/planet_water_plan.md）——
+# 核心结论：参考图里**河水与近岸海水是同一个色**（逐像素差 ≤3/255，就是噪声量级），深海
+# 只是把它整体压暗，河岸则是它向陆地色混 20%。所以河流与海之间根本不存在"两种材质"，
+# 入海口也就不需要任何过渡 —— 拼上去就是无缝的。之前 RIVER_COLOR（亮蓝）与 ocean_flat
+# （暗蓝）各自独立演化，才分叉出"河口撞白墙"的问题；现在两者都从 WATER_COLOR 派生。
+const WATER_COLOR := Color(0.2863, 0.3216, 0.3922, 1.0)   # #495264 河水 = 近岸海水
+const WATER_DEEP_RATIO := Vector3(0.658, 0.695, 0.730)     # 深海/浅水逐通道比 → #303949
+const WATER_BANK_MIX := 0.20                               # 河岸向陆地色混的比例 → #565860
+const WATER_LAND_REF := Color(0.5451, 0.4392, 0.3137, 1.0) # #8b7050 典型旱地（只用于推导河岸色）
+# 河岸带在河道总宽内的位置：水芯占 |e| ∈ [0, 0.74]，河岸 ∈ [0.74, 1]（两侧各 13%）。
+# 与参考图实测吻合（单侧岸宽/总宽 = 11.8%~14.3%，随河宽等比缩放）。窄河时由 shader 按
+# 屏幕像素宽度自适应地收缩水芯，细流可以整条都是河岸色（参考图里细流也看不出水芯）。
+const RIVER_BANK_INNER := 0.74
 # —— 河宽分级（§20.6 / §21 P2）：半宽由节点流量 Q 决定，宽度烘到几何里，shader 不再展开 ——
 # Q 沿下游单调不减（§7.3 不变量）→ 半宽也单调不减，不会出现「粗—细—粗」。
 # 映射在对数空间做：half = exp(lerp(ln MIN, ln MAX, t))，t 由 ln Q 在 [P5, P99] 上归一化。
@@ -493,7 +506,9 @@ func _build_river_layer() -> void:
 	_river_instance.mesh = mesh
 	_river_material = ShaderMaterial.new()
 	_river_material.shader = RIVER_SHADER
-	_river_material.set_shader_parameter("river_color", RIVER_COLOR)
+	_river_material.set_shader_parameter("river_color", WATER_COLOR)
+	_river_material.set_shader_parameter("river_bank_color", water_bank_color())
+	_river_material.set_shader_parameter("bank_inner", RIVER_BANK_INNER)
 	_river_material.set_shader_parameter("min_width_px", RIVER_MIN_WIDTH_PX)
 	_river_material.set_shader_parameter("max_width_px", RIVER_MAX_WIDTH_PX)
 	_river_material.set_shader_parameter("depth_bias", RIVER_DEPTH_BIAS)
@@ -1822,8 +1837,11 @@ func _on_generate_requested(params: Dictionary) -> void:
 	mat.set_shader_parameter("cell_uv", atlas["cell_uv"])
 	# gutter 尺寸：shader 从 UV2（格子原点）反推格号 → 判定水格（海面纯色化）
 	mat.set_shader_parameter("gutter_uv", atlas["gutter_uv"])
-	# 海面净色底 = Ocean 卡均色（水格不采色卡、不乘宏噪声；见 shader ocean_flat 注释）
-	mat.set_shader_parameter("ocean_flat", atlas["ocean_flat"])
+	# 海面：浅水色 = 河水色（同一常量），深海 = 浅水 × 暗化比。
+	# 水格不再采色卡也不带白雾带，岸边是一整片"沿岸线最浅 → 外海最深"的长渐变，
+	# 见 shader 的 ocean_flat / ocean_deep 注释。
+	mat.set_shader_parameter("ocean_flat", WATER_COLOR)
+	mat.set_shader_parameter("ocean_deep", water_deep_color())
 	_mesh_instance.material_override = mat
 	add_child(_mesh_instance)
 	# 大气光晕：紧跟星球上线（星球边缘那圈柔和的蓝白光晕，见 atmosphere.gdshader）
@@ -2034,7 +2052,7 @@ func _terrain_level(elev: float) -> TerrainLevel:
 # 最终色由 shader 里「生态贴图 ×（水格另有净色/近岸带处理）× 这里返回的调制器」合成：
 #   rgb = 明暗乘数（越高级的地形越暗，玩家肉眼能读出「哪里翻不过去」）
 #   a   = 往基岩色压的比例（shader 里向 ROCK_COLOR lerp；山区对半、不可逾越几乎纯岩）
-# 平原/水域 = 全白不动色；海洋贴片的海色由 shader 的 ocean_flat/近岸白噪带给出。
+# 平原/水域 = 全白不动色；海洋贴片的海色由 shader 的 ocean_flat/ocean_deep 给出。
 # ⚠️ 水贴片例外：a 会被 ⑤c 改载「近岸 shore」∈[0,1]（离岸距离场，逐角点插值）
 # ——陆地 a 是岩石量、水 a 是 shore，shader 用图集格号（v_is_water）区分，
 # 两义互不污染；水贴片恒为 FLAT（dark=1、rock=0），改载无冲突。
@@ -2469,7 +2487,7 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 	# 邻接不必另建搜索表：对偶贴片共享一条棱 ⇔ 共享两个角三角；而每个角三角恰有
 	# 3 个汇入贴片 → 建 [角三角 → 3 贴片] 平表（tri_tiles），BFS 逐角三角扫 3 邻居。
 	# 种子 = 已生成陆地贴片（biome≥2，海冰/冰盖之外都是岸线）；只在开放水域
-	# （海洋 0 / 未生成 BIOME_NONE）传播；海冰(1) 不传播 —— 冰缘不出白噪带。
+	# （海洋 0 / 未生成 BIOME_NONE）传播；海冰(1) 不传播 —— 冰缘不出浅水圈。
 	# 距离单位 = 贴片跳数（Goldberg 贴片尺寸高度均匀，跳数 ≈ 角距）。
 	var tri_tiles := PackedInt32Array()
 	tri_tiles.resize(tris.size() * 3)
@@ -2518,7 +2536,7 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 			await _slice_yield(91.1)
 
 	# ===== ⑤b0 小水域剔除（封闭小湖填成陆地，见 docs/planet_textures_plan.md §3⑥）=====
-	# 微型内陆湖整湖都落在近岸白噪带里 → 整片泛白像白斑（temp/sea_wave*.png），
+	# 微型内陆湖整湖都落在带宽内 → 整片偏亮像浅色斑（temp/sea_wave*.png），
 	# 按用户确认的阈值剔除：水贴片（海洋0/海冰1/未生成255）沿角三角邻接做连通域，
 	# 含未生成贴片的分量是真海/内海**永不剔除**；纯已生成且 ≤MIN_LAKE_TILES 的
 	# 封闭分量（含结冰小湖）抬海拔到海平面上 → 重判群系/地形，填成陆地。
@@ -2607,11 +2625,11 @@ func _build_goldberg_mesh_async(coverage: float, center: Vector3) -> ArrayMesh:
 			await _slice_yield(92.5)
 
 	# ===== ⑤b0b 逐水域分量的有效带宽 ring_w（带宽随水域大小自适应）=====
-	# 固定 4 跳带宽对大洋正合适，但对半径 2~4 跳的小湖会把整湖淹进白雾
+	# 固定带宽对大洋正合适，但对半径 2~4 跳的小湖会把整湖染成同一个浅色
 	# （temp/sea_wave3.png：湖心到不了深蓝，整湖读作白斑，反而没有海岸线感）。
 	# 视觉带宽应是水域半径的一个比例：ring_w = clamp(D_max × LAKE_RING_RATIO,
 	# MIN_LAKE_RING_HOPS, SHORE_BAND_HOPS)——大洋/内海 D_max 大 → 封顶 = 带宽，
-	# 观感与固定带宽完全一致；小湖按比例收窄 → 白雾只贴岸一圈，湖心 s=0 回归
+	# 观感与固定带宽完全一致；小湖按比例收窄 → 只有贴岸一圈偏浅，湖心 s=0 回归
 	# 深蓝净色（s=0 恒 0 的无缝不变量与假白环防护全部原样保住）。
 	# 连通域口径与 ⑤b0 剔除一致：水贴片（0/海冰1/未生成255）沿角三角邻接。
 	var ring_w := PackedFloat32Array()
@@ -2998,6 +3016,21 @@ func _rebuild_selection_ring() -> void:
 	_selection_ring.material_override = _selection_material
 	_selection_ring.mesh = ring_mesh
 	_selection_ring.visible = true
+
+
+# —— 水体配色派生（见 WATER_COLOR 注释）——
+# 深海 = 浅水 × 逐通道暗化比；河岸 = 浅水向陆地色线性混。两者都从 WATER_COLOR 出发，
+# 所以河 / 近岸海 / 深海 / 河岸永远同源，换配色时不会各自跑偏。
+static func water_deep_color() -> Color:
+	return Color(WATER_COLOR.r * WATER_DEEP_RATIO.x,
+			WATER_COLOR.g * WATER_DEEP_RATIO.y,
+			WATER_COLOR.b * WATER_DEEP_RATIO.z, 1.0)
+
+
+static func water_bank_color() -> Color:
+	# Color.lerp 是逐通道直接插值（不做 sRGB↔线性转换）——
+	# 与参考图的推导口径一致：mix(#495264, #8b7050, 0.20) = #565860。
+	return WATER_COLOR.lerp(WATER_LAND_REF, WATER_BANK_MIX)
 
 
 # 向量 p 在切平面（以 axis 为法线、e1 为 0° 参考方向）上的方位角

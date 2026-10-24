@@ -3,9 +3,10 @@
 > 参考图：`temp/river10.png`（RimWorld 原图截图，2244×1469，含陆地、河流、入海口、海洋）
 > 前序文档：`docs/planet_rivers_plan.md`（§20–§24 河宽分级 / 形状 / 岸线裁剪）、
 > `docs/planet_textures_plan.md`（§3⑥ 近岸白噪带）
-> 状态：**规划稿，未编码，待 review**
+> 状态：**已实施（2026-10-24，见 §11 实施记录）**
 > 关联文件：`planet.gd`、`planet_rivers.gdshader`、`planet_surface.gdshader`、
 > `tools/test_planet_rivers.gd`、`tools/test_planet_texture.gd`
+> 拍板结论：**① 做河岸（窄河可牺牲水芯）② `RIVER_HALF_MAX` 不动 ③ 深海严格对齐 #303949**
 
 ---
 
@@ -357,3 +358,106 @@ ALPHA  = river_color.a * v_alpha * coast * (1.0 - smoothstep(1.0 - aa, 1.0, e));
    （全宽 34% → 37% 贴片，仍在护栏内）？
 3. **深海色**：#303949（严格对齐参考图）还是保留现在的 #353f53（略亮）？
    建议前者——这样深海与浅水的暗化系数就是一个干净的 `(0.658, 0.695, 0.730)`。
+
+---
+
+## 11. 实施记录（2026-10-24 已落地）
+
+### 11.1 三条拍板结论
+
+| # | 结论 | 落地方式 |
+|---|---|---|
+| 1 | **做河岸**，且河流太窄时可以牺牲水芯 | `RIVER_BANK_INNER = 0.74`（两岸各 13%）；shader 按屏幕像素宽自适应：全宽 ≤2px 时 `inner→0`（整条都是河岸色），≥5px 恢复正常 |
+| 2 | 别的参数不动 | `RIVER_HALF_MAX` 保持 `0.00320`（全宽 34% L）。河岸含在总宽内，玩法护栏不变 |
+| 3 | 深海严格对齐 | `WATER_DEEP_RATIO = (0.658, 0.695, 0.730)`，派生 `#303949` |
+
+### 11.2 代码落点
+
+`planet.gd`：
+
+```gdscript
+const WATER_COLOR := Color(0.2863, 0.3216, 0.3922, 1.0)   # #495264 河水 = 近岸海水
+const WATER_DEEP_RATIO := Vector3(0.658, 0.695, 0.730)     # → #303949
+const WATER_BANK_MIX := 0.20                               # → #565860
+const WATER_LAND_REF := Color(0.5451, 0.4392, 0.3137, 1.0) # #8b7050（只用于推导）
+const RIVER_BANK_INNER := 0.74
+static func water_deep_color() -> Color          # WATER_COLOR × WATER_DEEP_RATIO
+static func water_bank_color() -> Color          # WATER_COLOR.lerp(WATER_LAND_REF, 0.20)
+```
+
+- `RIVER_COLOR` **删除**——河流材质改传 `WATER_COLOR`，与海面同源（这是本轮的核心：
+  只有存在两个独立的水色常量时，才会分叉出"两种材质"）。
+- 地表材质：`ocean_flat` = `WATER_COLOR`，新增 `ocean_deep` = `water_deep_color()`。
+- `SHORE_BAND_HOPS` 4.0 → **6.0**。
+
+`planet_surface.gdshader`（净减约 110 行）：
+
+- 删除 `fbm3` / `vnoise` / `hash13`（≈150 ALU/水面片元）与 7 个白雾旋钮
+  （`shore_lift` / `shore_cloud_freq` / `cloud_edge` / `cloud_contrast` /
+  `shore_macro` / `shore_strength` / `PALE_TINT`）。
+- 水格分支整段换成：
+
+```glsl
+float w = pow(clamp(v_tile_color.a, 0.0, 1.0), WATER_RAMP_EXP);  // 1=岸线, 0=深海
+vec3 water = mix(ocean_deep, ocean_flat, w);
+water *= vec3(1.0) + (macro - MACRO_MEAN) * ocean_macro;         // ±2% 弱斑驳
+ALBEDO = water;
+```
+
+- `ocean_macro` 语义从"深海是否带宏观噪声"（默认 0）改为"水面斑驳强度"（默认 **0.20**），
+  仍是现场可调旋钮，但不再"岸边单独加料"。
+- 判断条件从 `v_is_water > 0.5 && v_tile_color.a > 0.001` 简化为 `v_is_water > 0.5`——
+  深海（a=0）必须也走同一条公式，否则 `mix` 不执行、`ocean_deep` 永远用不上。
+
+`planet_rivers.gdshader`：
+
+```glsl
+float full_px = 2.0 / max(fwidth(e), 1e-5);                    // 全宽的屏幕像素数
+float inner = bank_inner * smoothstep(2.0, 5.0, full_px);      // 窄河收缩水芯
+float bank = smoothstep(inner - aa, inner + aa, edge);
+ALBEDO = mix(river_color.rgb, river_bank_color.rgb, bank);
+```
+
+- 只改 fragment：几何、顶点、属性、index、draw call 一个都没动。
+- 圆角接头与河口圆盘的 `UV.x` 本来就是「圆心 0.5 / 环 1.0」，所以 `e` 天然等于半径比例 →
+  河岸在这两种扇形上自动成为一圈边缘，不需要特殊处理。
+
+### 11.3 实测（seed 4242 / 湿-热，`water_trunk.png` 1600×900）
+
+| 检查项 | 目标 | 实测 |
+|---|---|---|
+| 河水像素 | #495264 | **#495264**（逐位） |
+| 河岸像素 | #565860 | **#565860**（逐位） |
+| 河岸厚度 | 总宽 12%–14%/侧 | **11%–12%/侧**（48px 河宽时 5–6px/侧） |
+| 水芯占比 | 74% | **71%–75%** |
+| 近岸海水 | #495264 | **#495264** |
+| 深海 | #303949 | **#303949** |
+| 岸边带最大抬升 | ≤30/255 | **(25, 25, 27)** |
+| 白雾 | 无 | 无（`fbm3` 已删） |
+| 入海口接缝 | 不可辨 | 两侧同值，放大 3 倍不可辨 |
+| mesh | 不变 | 8394 顶点 / 8094 三角形 / 1 surface |
+
+`test_planet_rivers` **11 项全 PASS**（新增第 7b 项：河 `#495264` / 岸 `#565860` 逐位断言），
+`test_planet_texture` 中 `ocean_flat` 断言改为 `WATER_COLOR ±1.5/255` 并新增 `ocean_deep`，
+其余 7 套回归全通过。
+
+### 11.4 踩坑
+
+1. **`v_is_water > 0.5 && a > 0.001` 这个短路会让深海永远用不上新色**：深海 `a=0`，
+   条件不成立就走 `tinted * macro`（色卡路径，水格色卡是 Ocean 均值）。必须去掉 `a` 判断。
+2. `ocean_flat` 的取值来源换了，但 `biome_atlas.gd` 仍在算 Ocean 卡均色——保留无害
+   （图集描述的一部分），但**不要**再拿它当海面色用，两者已经不是同一个东西。
+3. GDScript 里写测试断言时注释是 `#` 不是 `//`（改着改着容易串）。
+4. `get_shader_parameter()` 返回 `Variant`，`var x := ... if ... else ...` 推不出类型，
+   必须显式写 `var x: Color = ...`。
+
+### 11.5 仍未做 / 新观察
+
+- **河口楔形尖角**：`RIVER_MOUTH_FLARE = 1.15` 让河口比岸线略宽，裁剪后跨过岸线的那部分
+  变成一块楔形凸进海里（`temp/shots/trunk_gap.png` 放大可见）。颜色统一后它不再刺眼，
+  但仍是几何缺陷；下一轮可考虑 `RIVER_MOUTH_FLARE = 1.0`（河口与河道等宽，裁出来就是平齐切口）。
+- **汇合处河岸小圆环**（2026-10-24 新增，`temp/river11.png`）：河岸带是「图元 UV 区间」的实现，
+  到了汇合点圆盘上就变成一圈画在水体内部的环。根因、证伪路径与两个方案见
+  **`docs/planet_rivers_plan.md` §25**；推荐把河岸改成真正的几何内缩（同一份 mesh 画两遍）。
+- 正弦蜿蜒（弯曲系数 p50 仍 1.12）、岸带压暗、地形河谷（需动 `planet_surface.gdshader` 的陆地分支）未动。
+- 河岸色是固定 `#565860`，在雪原/沙漠上可能略"水土不服"（参考图也是固定色，先按固定做）。

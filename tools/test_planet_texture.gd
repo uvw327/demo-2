@@ -179,6 +179,8 @@ func _run() -> void:
 		print("FAIL: 顶点色调制器异常 @", bad_col, " = ", cols[bad_col])
 		_quit(1)
 		return
+	# 带宽 4 → 6 跳（docs/planet_water_plan.md §4.1）后带内顶点变多，实测占比
+	# 13.7%（27662/202016），原阈值 0.5 仍成立，无需放宽——深海依然回归最暗色。
 	var ok_band: bool = shore_verts > 0 and max_shore > 0.5 \
 			and float(shore_verts) / float(maxi(water_verts, 1)) < 0.5
 	if not ok_band:
@@ -300,12 +302,19 @@ func _run() -> void:
 		ok_mat = t0 is Texture2D and t1 is Texture2D and cv.x > 0.0 and cv.y > 0.0 \
 				and gv.x > 0.0 and gv.y > 0.0 \
 				and of.r > 0.0 and of.g > 0.0 and of.b > 0.0
-	# ocean_flat 应为 Ocean 卡 256² 的逐通道均值（±2/255 内）：手测 (59,70,92)/255
-	ok_mat = ok_mat and absf(of.r - 59.37 / 255.0) < 0.008 \
-			and absf(of.g - 70.50 / 255.0) < 0.008 \
-			and absf(of.b - 91.55 / 255.0) < 0.008
-	print(bin_if(ok_mat, "材质 uniform 装配齐全（atlas/macro/cell_uv=%s/gutter_uv=%s/ocean_flat=%s）" \
-			% [str(cv), str(gv), str(of)]))
+	# ocean_flat 必须是 WATER_COLOR（= 河水 = 浅水 #495264，(73,82,100)/255）：
+	# 与河流层同源是「入海口无缝」的前提，所以这里逐通道卡到 1/255。
+	# ocean_deep 必须是浅水 × (0.658,0.695,0.730) = #303949（参考图深海稳定值）。
+	var od = mat.get_shader_parameter("ocean_deep")
+	var deep: Color = od if od is Color else Color(0, 0, 0, 0)
+	ok_mat = ok_mat and absf(of.r - 73.0 / 255.0) < 1.5 / 255.0 \
+			and absf(of.g - 82.0 / 255.0) < 1.5 / 255.0 \
+			and absf(of.b - 100.0 / 255.0) < 1.5 / 255.0 \
+			and absf(deep.r - 48.0 / 255.0) < 1.5 / 255.0 \
+			and absf(deep.g - 57.0 / 255.0) < 1.5 / 255.0 \
+			and absf(deep.b - 73.0 / 255.0) < 1.5 / 255.0
+	print(bin_if(ok_mat, "材质 uniform 装配齐全（atlas/macro/cell_uv=%s/gutter_uv=%s/浅水=%s/深海=%s）" \
+			% [str(cv), str(gv), of.to_html(false), deep.to_html(false)]))
 	_quit(0 if (ok_grid and ok_mat) else 1)
 
 

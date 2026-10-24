@@ -357,22 +357,40 @@ func _run() -> void:
 		high_p = planet._hills_high_instance.material_override.render_priority
 	var river_p := -1
 	var ok_mat := false
+	var col := Color(0, 0, 0, 0)
+	var bank := Color(0, 0, 0, 0)
 	if planet._river_material != null:
 		river_p = planet._river_material.render_priority
 		var sh: Shader = planet._river_material.shader
 		var db: float = planet._river_material.get_shader_parameter("depth_bias")
 		var mw: float = planet._river_material.get_shader_parameter("min_width_px")
-		var col: Color = planet._river_material.get_shader_parameter("river_color")
+		var bi: float = planet._river_material.get_shader_parameter("bank_inner")
+		col = planet._river_material.get_shader_parameter("river_color")
+		bank = planet._river_material.get_shader_parameter("river_bank_color")
 		ok_mat = sh != null and sh.resource_path.ends_with("planet_rivers.gdshader") \
 				and is_equal_approx(db, PlanetScript.RIVER_DEPTH_BIAS) \
 				and is_equal_approx(mw, PlanetScript.RIVER_MIN_WIDTH_PX) \
-				and col.is_equal_approx(PlanetScript.RIVER_COLOR) \
+				and is_equal_approx(bi, PlanetScript.RIVER_BANK_INNER) \
 				and planet._river_instance.cast_shadow \
 						== GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	ok_mat = ok_mat and low_p == 0 and river_p == 1 and high_p == 2
 	print(bin_if(ok_mat, "图层顺序 低丘 %d → 河流 %d → 高山 %d，shader 参数一致"
 			% [low_p, river_p, high_p]))
 	_ok = _ok and ok_mat
+
+	# —— 7b) 水体配色：河水必须等于近岸海水（WATER_COLOR #495264），河岸 #565860 ——
+	# 这两条是「入海口天然无缝」的前提：河水与浅水同源同值，跨过去差值 ≤3/255。
+	# 河岸由 mix(河水, 陆地 #8b7050, 0.20) 派生，实测参考图 #56585f（差 1/255，容差 2.5）。
+	var ok_tint: bool = absf(col.r - 73.0 / 255.0) < 1.5 / 255.0 \
+			and absf(col.g - 82.0 / 255.0) < 1.5 / 255.0 \
+			and absf(col.b - 100.0 / 255.0) < 1.5 / 255.0 \
+			and col.is_equal_approx(PlanetScript.WATER_COLOR) \
+			and absf(bank.r - 86.0 / 255.0) < 2.5 / 255.0 \
+			and absf(bank.g - 88.0 / 255.0) < 2.5 / 255.0 \
+			and absf(bank.b - 96.0 / 255.0) < 2.5 / 255.0
+	print(bin_if(ok_tint, "水体配色：河 #%s（目标 #495264）岸 #%s（目标 #565860）"
+			% [col.to_html(false), bank.to_html(false)]))
+	_ok = _ok and ok_tint
 
 	# —— 8) 河宽分级：半宽单调、范围合法、干/支比明显；分支链覆盖每条河段一次 ——
 	var ok_width: bool = planet._river_half_width.size() == total

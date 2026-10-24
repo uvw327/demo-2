@@ -1,13 +1,17 @@
 // 星球河流层（宽度分级）：宽度已经烘进几何，shader 只负责
 //  ① 远视角最小屏幕宽度补偿（只对细支流生效，干流走真实几何宽度）
 //  ② 近景最大屏幕宽度封顶（避免贴脸时干流变成蓝色高速公路）
-//  ③ 边缘抗锯齿 + 源头端 alpha 渐隐
+//  ③ 河岸带（两岸各 13% 总宽，纯色；窄河时自动收缩水芯）+ 边缘抗锯齿 + 源头端 alpha 渐隐
 //  ④ 岸线裁剪（河口按最后一块陆地贴片的边线裁掉，见下方 clip_scale）
 //  ⑤ 视线深度偏移（零视差 decal）
 //
 // 几何：半径 1.0 的球面 ribbon，左右顶点各自按 miter 偏移（见 planet.gd）；
 //   NORMAL = 侧向单位向量，UV.x = 0/1（左/右），UV2.x = 烘焙半宽（世界单位），
-//   COLOR.r = alpha（源头端渐细渐隐）。
+//   COLOR.r = alpha（源头端渐细渐隐），COLOR.g = 到岸线的有符号距离编码。
+//
+// 配色（见 docs/planet_water_plan.md）：河水 = 近岸海水 = #495264，河岸 = #565860。
+//   两者都从 planet.gd 的 WATER_COLOR 派生，所以入海口两侧本来就是同一个值 ——
+//   不需要任何过渡（参考图 temp/river10.png 正是如此）。
 //
 // 像素换算：px_world = depth / focal_px。
 //   focal_px 由 GDScript 每帧写入（planet.gd 的 _update_river_camera_params），
@@ -31,7 +35,13 @@
 shader_type spatial;
 render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;
 
-uniform vec4 river_color : source_color = vec4(0.20, 0.48, 0.78, 1.0);
+uniform vec4 river_color : source_color = vec4(0.2863, 0.3216, 0.3922, 1.0);
+// 河岸色 = 河水向陆地色混 20%（planet.gd 的 water_bank_color()，#565860）。
+// 参考图实测：两岸各占河宽的 13%（随河宽等比缩放），纯色、无纹理。
+uniform vec4 river_bank_color : source_color = vec4(0.3373, 0.3451, 0.3765, 1.0);
+// 水芯边界（|e| 归一化坐标）：0.74 = 水芯占 74%，两岸各 13%。
+// 窄河时由 fragment 按屏幕像素宽度往下收（可收到 0 = 整条都是河岸色）。
+uniform float bank_inner = 0.74;
 // 屏幕最小宽度：只有「烘焙半宽 < 该值」的细支流会被加宽，
 // 干流在远视角仍保留真实宽度差，不会整条河网一样粗。
 uniform float min_width_px = 1.6;
@@ -108,7 +118,14 @@ void fragment() {
 	// 哨兵值 0 与真实值之间有跳变，会把整片区域的导数放大、把河道裁成半透明）。
 	float cw = max(length(fwidth(VERTEX)), 1e-6) * coast_softness_px;
 	float coast = 1.0 - smoothstep(-cw, cw, v_coast);
-	ALBEDO = river_color.rgb;
+	// —— 河岸带 ——
+	// 总宽最外侧 13%/侧 为河岸（参考图实测 11.8%~14.3%）。窄河时收缩水芯：
+	// 屏幕上全宽 ≤2px 时整条都是河岸色（细流本来就看不到水芯），≥5px 恢复正常比例。
+	// 用 UV 的屏幕导数反推全宽像素数（e 从 -1 到 1 覆盖全宽），与分辨率/距离无关。
+	float full_px = 2.0 / max(fwidth(e), 1e-5);
+	float inner = bank_inner * smoothstep(2.0, 5.0, full_px);
+	float bank = smoothstep(inner - aa, inner + aa, edge);
+	ALBEDO = mix(river_color.rgb, river_bank_color.rgb, bank);
 	ALPHA = river_color.a * v_alpha * coast
 			* (1.0 - smoothstep(1.0 - aa, 1.0, edge));
 }
