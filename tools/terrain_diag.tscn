@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://c5hglro25m253"]
+
+[ext_resource type="Script" path="res://tools/terrain_diag.gd" id="1_diag"]
+
+[node name="TerrainDiag" type="Node"]
+script = ExtResource("1_diag")

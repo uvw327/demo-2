@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://bt8t1bd7uer4w"]
+
+[ext_resource type="Script" path="res://tools/terrain_multi.gd" id="1_multi"]
+
+[node name="TerrainMulti" type="Node"]
+script = ExtResource("1_multi")
