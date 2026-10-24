@@ -196,7 +196,7 @@ func _run() -> void:
 	var actual_tris := 0
 	var expect_samples := 0
 	var expect_strips := 0
-	var join_seg: int = PlanetScript.RIVER_JOIN_SEG
+	var cap_seg: int = PlanetScript.RIVER_CAP_SEG
 	var joins := 0
 	var mouth_caps := 0
 	var extras := 0
@@ -250,10 +250,23 @@ func _run() -> void:
 				continue
 			expect_samples += nseg_sum + 1
 			expect_strips += 1
-		# 汇合点圆角接头：每个汇合点 = 1 个圆心 + SEG 个弧点、SEG 个三角形
+		# 汇合点：每个汇合点一个「角点扇形」补片（§31）。角点数由构建器登记在
+		# _river_fan_corners，这里做护栏校验（节点合法、数量有界），并把它计入
+		# 顶点/三角形期望 —— 登记与实际出格不一致会立刻暴露。
+		var fan_v := 0
+		var fan_t := 0
+		var join_set := {}
 		for vk in planet._river_junctions:
+			join_set[vk] = true
 			if planet._river_half_width[vk] > 0.0:
 				joins += 1
+		for jv in planet._river_fan_corners:
+			var cn: int = planet._river_fan_corners[jv]
+			if not join_set.has(jv) or cn < 3 or cn > 12:
+				ok_mesh = false
+				break
+			fan_v += cn + 1
+			fan_t += cn
 		# 河口端头：每条入海的链 1 个圆
 		for bi2 in planet._river_branch_n:
 			var s2: int = planet._river_branch_offsets[bi2]
@@ -261,10 +274,11 @@ func _run() -> void:
 			if c2 >= 2 \
 					and planet._inland_water[planet._river_branch_nodes[s2 + c2 - 1]] == 1:
 				mouth_caps += 1
-		extras = joins + mouth_caps
-		ok_mesh = ok_mesh and vn == expect_samples * 2 + extras * (join_seg + 1) \
+		extras = mouth_caps
+		ok_mesh = ok_mesh and vn == expect_samples * 2 + extras * (cap_seg + 1) \
+				+ fan_v \
 				and idx.size() == (expect_samples - expect_strips) * 6 \
-						+ extras * join_seg * 3
+						+ extras * cap_seg * 3 + fan_t * 3
 		if ok_mesh:
 			# UV2.x 上限：干流最粗 × 入海口喇叭口 × miter 伸出
 			var half_lo: float = PlanetScript.RIVER_HALF_MIN \
@@ -275,6 +289,8 @@ func _run() -> void:
 			# 岸线裁剪：河口尾巴必须有落在水域侧的顶点（COLOR.g > 0.5），
 			# 否则说明裁剪面没算出来 / 河道没跨过岸线，河口会露出圆头。
 			var coast_hi := 0.0
+			var ins_max := 0.0
+			var ins_plain := 0
 			for i in vn:
 				var p := verts[i]
 				if not p.is_finite() or absf(p.length() - 1.0) > 1e-5:
@@ -294,6 +310,18 @@ func _run() -> void:
 				if hw < half_lo or hw > half_hi:
 					ok_mesh = false
 					break
+				# UV2.y = 水芯的侧向内缩量 = δ/cos α（§29）。必须是 [δ, δ·miter_max]
+				# 之间的正数，且不能超过 hw（否则水芯会翻到河岸外面）。
+				var ins := uv2s[i].y
+				if ins < -1e-9 or ins > PlanetScript.RIVER_BANK_INSET \
+						* PlanetScript.RIVER_MITER_MAX_RATIO + 1e-9:
+					ok_mesh = false
+					break
+				# 细流尖端半宽可以小于 δ（水芯归零，见 shader 的 max(want-ins,0)），
+				# 所以不要求 ins ≤ hw；只要求它不是负的、不超 miter 上限。
+				ins_max = maxf(ins_max, ins)
+				if absf(ins - PlanetScript.RIVER_BANK_INSET) < 1e-9:
+					ins_plain += 1
 				# COLOR.r = 端头 alpha（源头渐隐允许 < 1）
 				if cols[i].r < 0.0 or cols[i].r > 1.0:
 					ok_mesh = false
@@ -305,15 +333,26 @@ func _run() -> void:
 				coast_hi = maxf(coast_hi, cols[i].g)
 			if ok_mesh and coast_hi <= 0.5:
 				ok_mesh = false
+			# 内缩量必须「有 miter 修正」：全是 δ 说明端面/拐角都退化成正截面，
+			# 汇合处的并集轮廓就不再对齐（§29 的关键前提）。
+			if ok_mesh and ins_max <= PlanetScript.RIVER_BANK_INSET * 1.001:
+				ok_mesh = false
+			if ok_mesh and ins_plain == 0:
+				ok_mesh = false
 			if ok_mesh:
 				for j in idx.size():
 					if idx[j] < 0 or idx[j] >= vn:
 						ok_mesh = false
 						break
-	print(bin_if(ok_mesh, "河流 mesh：%d 顶点 / %d 三角形（期望 %d / %d，%d 条链 + %d 汇合点 + %d 河口），"
-			% [vn, actual_tris, expect_samples * 2 + extras * (join_seg + 1),
-			(expect_samples - expect_strips) * 2 + extras * join_seg,
-			planet._river_branch_n, joins, mouth_caps])
+	var fan_v_sum := 0
+	var fan_t_sum := 0
+	for jv in planet._river_fan_corners:
+		fan_v_sum += int(planet._river_fan_corners[jv]) + 1
+		fan_t_sum += int(planet._river_fan_corners[jv])
+	print(bin_if(ok_mesh, "河流 mesh：%d 顶点 / %d 三角形（期望 %d / %d，%d 条链 + %d 河口 + %d 个汇合点角点扇形），"
+			% [vn, actual_tris, expect_samples * 2 + extras * (cap_seg + 1) + fan_v_sum,
+			(expect_samples - expect_strips) * 2 + extras * cap_seg + fan_t_sum,
+			planet._river_branch_n, mouth_caps, planet._river_fan_corners.size()])
 			+ "半径 1.0、单位法线、UV/UV2/COLOR 合法")
 	_ok = _ok and ok_mesh
 
@@ -379,7 +418,7 @@ func _run() -> void:
 				and planet._river_instance.mesh != null
 		var same_params := true
 		for key in ["min_width_px", "max_width_px", "depth_bias", "depth_mode",
-				"clip_scale", "bank_inner", "focal_px"]:
+				"clip_scale", "focal_px"]:
 			if not is_equal_approx(
 					float(planet._river_material.get_shader_parameter(key)),
 					float(planet._river_core_material.get_shader_parameter(key))):
@@ -390,8 +429,6 @@ func _run() -> void:
 				and col.is_equal_approx(PlanetScript.water_bank_color()) \
 				and core_col.is_equal_approx(PlanetScript.WATER_COLOR) \
 				and is_equal_approx(bank_ps, 0.0) and is_equal_approx(core_ps, 1.0) \
-				and is_equal_approx(float(planet._river_material.get_shader_parameter(
-						"bank_inner")), PlanetScript.RIVER_BANK_INNER) \
 				and shared_mesh and same_params \
 				and planet._river_instance.cast_shadow \
 						== GeometryInstance3D.SHADOW_CASTING_SETTING_OFF \

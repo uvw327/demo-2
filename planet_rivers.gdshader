@@ -1,17 +1,16 @@
-// 星球河流层：河岸与水芯由**几何**分层，而不是在 fragment 里按 UV 区间涂色。
+// 星球河流层：河岸与水芯由**几何**分层（docs §29「轮廓优先」）。
 //
-// 为什么这么改（见 docs/planet_rivers_plan.md §25–§26）：
-//   原来的做法是「河岸 = 图元自身 |UV.x*2-1| 落在 [inner, 1] 的那圈」。对单条
-//   ribbon 来说这恰好等于「到水体边界的距离」，所以一直是对的；但汇合点圆盘
-//   复用了同一个公式，而圆盘的半径（= 汇合处半宽）是**内切**于干流的——
-//   它大半都在水体内部，于是整个圆环被涂成河岸色，就是截图里那圈小圆环。
-//   正确判据是「到水体**并集**边界的距离」，那是 fragment 拿不到的信息。
+// 形状的真源只有一个：**水体并集轮廓**。
+//   河岸遍 = 轮廓本身（planet.gd 烘在 UV2.x 里）
+//   水芯遍 = 轮廓的**等距内缩** δ（烘在 UV2.y 里，含 miter 的 1/cos α 修正）
+// 两遍共用同一份 ArrayMesh，fragment 只做「涂色 + 边缘 AA + 岸线裁剪」。
 //
-//   于是把河岸做成真正的几何：同一条河流 = 并集的全宽填充（河岸色）
-//   + 并集的内缩（水色）。内缩不需要第二份顶点数据 —— 每个顶点相对中心线的
-//   偏移向量是现成的：NORMAL(侧向/径向) × (UV.x*2-1) × UV2.x。
-//   所以同一份 ArrayMesh 画两遍，只差 width_scale / base_color / render_priority。
-//   构造即正确：汇合、河口圆头、以后的正弦蜿蜒都自动成立。
+// 为什么必须是几何分层、且必须是等距内缩（§27 的实测，别再退回等比）：
+//   ① 河岸带要是「图元自身 UV 区间」派生的，汇合处并集的环就会被涂成河岸色；
+//   ② 内缩要是「各图元按自己半宽等比缩 0.74」，则
+//        ∪ 内缩(各图元) ≠ 内缩(∪ 图元)
+//      差集落在接缝上 → 干流把支流的河岸顶掉一段、带宽 2.3 倍跳变、锯齿。
+//   等距内缩（δ 是世界常量）在几何上就等于「并集轮廓内缩」，所以带宽处处相等。
 //
 // shader 仍负责：
 //  ① 远视角最小屏幕宽度补偿（只对细支流生效，干流走真实几何宽度）
@@ -20,9 +19,10 @@
 //  ④ 岸线裁剪（河口按最后一块陆地贴片的边线裁掉，见下方 coast）
 //  ⑤ 视线深度偏移（零视差 decal）
 //
-// 顶点语义（§26）：VERTEX = **中心线**球面点（圆盘是圆心），
-//   NORMAL = 切平面侧向单位向量（圆盘是径向），UV.x = 0/1（0.5 = 圆心 → 偏移 0），
-//   UV2.x = 偏移长度（世界单位，含 miter 放大），UV2.y = 弧长归一，
+// 顶点语义（§29）：VERTEX = **中心线**球面点（河口圆头是圆心），
+//   NORMAL = 切平面侧向单位向量（圆头是径向），UV.x = 0/1（0.5 = 圆心 → 偏移 0），
+//   UV2.x = 河岸偏移（世界单位，含 miter 放大），
+//   UV2.y = 水芯的**侧向内缩量** δ/cos α（α = 侧向与侧线法向的夹角），
 //   COLOR.r = alpha（源头端渐细渐隐），COLOR.g = 到岸线的有符号距离编码。
 //
 // 配色（见 docs/planet_water_plan.md）：河水 = 近岸海水 = #495264，河岸 = #565860。
@@ -53,12 +53,14 @@ render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;
 
 // 本遍的纯色：河岸遍传 water_bank_color()（#565860），水芯遍传 WATER_COLOR（#495264）。
 uniform vec4 base_color : source_color = vec4(0.2863, 0.3216, 0.3922, 1.0);
-// 水芯边界（相对全宽）：0.74 = 水芯占 74%，两岸各 13%（参考图实测 11.8%~14.3%）。
-// 只在 core_pass = 1 的那遍使用；窄河时按屏幕像素宽度往下收，可收到 0。
-uniform float bank_inner = 0.74;
-// 0 = 河岸遍（width_scale = 1，画并集全宽）；1 = 水芯遍（width_scale = inner）。
+// 0 = 河岸遍（画并集全宽）；1 = 水芯遍（画轮廓等距内缩 δ 后的形状）。
 // 两个材质只差这一个开关 + base_color + render_priority。
+// 内缩量不走 uniform：miter 顶点要按 1/cos α 修正，那是逐顶点的量（UV2.y）。
 uniform float core_pass = 0.0;
+// 「窄河让出水芯」的屏幕像素阈值：全宽 ≤ thin_lo_px 时整条画河岸色（细流本来
+// 就看不到水芯，参考图也是），≥ thin_hi_px 时恢复等距内缩。
+uniform float thin_lo_px = 2.0;
+uniform float thin_hi_px = 5.0;
 // 屏幕最小宽度：只有「烘焙半宽 < 该值」的细支流会被加宽，
 // 干流在远视角仍保留真实宽度差，不会整条河网一样粗。
 uniform float min_width_px = 1.6;
@@ -119,17 +121,17 @@ void vertex() {
 	// lateral：-1 左岸 / 0 中心（圆盘圆心）/ +1 右岸（圆盘环）。
 	float lateral = UV.x * 2.0 - 1.0;
 
-	// 窄河让出水芯：屏幕上全宽 ≤2px 时整条都是河岸色（细流本来就看不到水芯），
-	// ≥5px 时恢复 bank_inner 比例。用解析半宽算像素宽度，不再依赖 fwidth——
-	// 原来在 fragment 里靠 fwidth(UV.x) 反推，逐像素各算各的，会在远近过渡处
-	// 出现台阶；这里是逐顶点的物理量，插值后连续。
+	// 窄河让出水芯：屏幕上全宽 ≤2px 时整条都是河岸色，≥5px 时恢复等距内缩。
+	// 用解析半宽算像素宽度（逐顶点物理量，插值连续），不靠 fwidth。
 	float full_px = 2.0 * want / px_world;
-	float inner = bank_inner * smoothstep(2.0, 5.0, full_px);
+	float thin = smoothstep(thin_lo_px, thin_hi_px, full_px);
 
-	// 河岸遍画全宽，水芯遍按 inner 内缩。两者共用同一份顶点数据。
-	float ws = mix(1.0, inner, core_pass);
+	// 河岸遍 = want；水芯遍 = want 沿侧向内缩 UV2.y，再按 thin 收掉。
+	// 两者共用同一份顶点数据，所以两遍的边界严格同源（永远不会错位）。
+	float core = max(want - UV2.y, 0.0) * thin;
+	float mag = mix(want, core, core_pass);
 	// 球面展开：切平面线性偏移再投回球面（与构建期烘焙的口径完全一致）。
-	VERTEX = normalize(center + side * lateral * want * ws);
+	VERTEX = normalize(center + side * lateral * mag);
 
 	v_alpha = COLOR.r;
 	v_coast = (COLOR.g - 0.5) * (2.0 * clip_scale);
