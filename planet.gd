@@ -104,6 +104,37 @@ const MOUNT_ELEV := 0.48 # 高于它 → 山区
 const PEAK_ELEV := 0.62  # 高于它 → 不可逾越（数量很少，顶端尖峰）
 const C_ROCK := Color(0.45, 0.42, 0.39) # 山体基岩色：高级地形把群系色往这里压
 
+# —— 海拔整形：把钟形噪声压成"大片平原 + 少数尖峰" ——
+# 背景：Simplex/FBM 噪声输出是钟形分布（实测 σ≈0.27，均值≈0），而分级门限
+# （0.18/0.32/0.48/0.62）切在分布的密集上升段 → 一刀下去就把大片陆地判成
+# 丘陵/山区（实测陆地中丘+山占 48%）。抬门限（方案A）能压数字，但门限间距
+# 仍是等距的，"带子"宽度没变，形态依旧碎。
+# 这里改噪声本身的形态，且**锚在海平面上**：f(SEA)=SEA 且严格单调 → 海岸线
+# 逐点不变（陆地率/群系/内陆水零影响），这是"整形"与"改门限"的本质区别。
+#
+# 形态：幂变换 f(e) = SEA + sign(r)·|r|^p / A^(p-1)，r = e − SEA
+#   p>1 → 中低幅被压向海平面（平原成片），高幅相对突出（尖峰稀疏）。
+#   A   → 变形锚：|r|=A 处 f(r)=r。锚越大压缩越温和、门限在原始空间的等效
+#          位置越高（f⁻¹(T)=((T−SEA)·A^(p-1))^(1/p)），可用来微调"削丘陵"
+#          与"保山区"的取舍。
+#
+# A 的取值有明确的几何含义，不是随手试出来的：
+#   令 A = PEAK_ELEV − SEA_LEVEL = 0.67，则 f⁻¹(PEAK_ELEV) = PEAK_ELEV
+#   → **尖峰门槛在原始空间原地不动**，"不可逾越"（翻不过去的关卡要素）
+#     数量精确保留；而中低幅被压向海平面 → 丘陵/山区被削掉大半。
+#   实测（8 种子 × 8192 采样）：
+#     现状(p=1)          丘+山/陆 46.6%  山区 1161  不可逾 279
+#     p=2.0 / A=0.85     丘+山/陆 13.1%  山区  211  不可逾  66  ← 尖峰被腰斩
+#     p=2.0 / A=0.67     丘+山/陆 18.7%  山区  453  不可逾 279  ← 采用
+# 关键性质：f 严格单调 ⇒ `elev > T ⟺ raw > f⁻¹(T)`，所以"整形 + 固定门限"
+#   在数学上等价于"在原始空间移动切点"，且**各档占据的最终海拔区间不变**
+#   （小丘 0.18~0.32 / 大丘 0.32~0.48 / 山区 0.48~0.62 / 不可逾 0.62+）→
+#   吃海拔绝对值的参数（温度制冷 ELEV_COOL、山地增雨 RIVER_OROGRAPHIC）
+#   零漂移（实测已验证）。
+const ELEV_SHAPE_POW := 2.0  # 幂指数：1=不整形，>1 压平中低幅
+const ELEV_SHAPE_ANCHOR := 0.67 # 变形锚 A = PEAK_ELEV − SEA_LEVEL（尖峰门槛原地不动）
+const ELEV_SHAPE_SCALE := 0.67 # = ANCHOR^(POW-1)，预乘省掉逐贴片 pow
+
 # ---- 气候参数（想调 planetary 外观就改这里）----
 # ---- 气候参数（想调 planetary 外观就改这里）----
 const SEA_LEVEL := -0.05  # 海平面：海拔低于它的贴片是海洋# 温度场：temperature = cos(纬度) + 噪声扰动 − 海拔制冷，范围 0(极寒)..1(酷热)
@@ -186,6 +217,13 @@ var _cap_shore := false          # 是否启用收边（100% 档整球无边 →
 var _cap_center := Vector3.UP    # 球冠中心方向（同 _region_center）
 var _cap_cos_lerp0 := 1.0        # 收边带内边界：cos 角距低于它开始下压海拔
 var _cap_cos_kill := -1.0        # 收边带外边界：cos 角距低于它完全压到水下
+# —— 海拔整形的运行时覆盖（标定工具用；生产路径恒为 -1 → 走上面的常量）——
+# 设 >=0 时用它替代 ELEV_SHAPE_POW，<=1 表示关闭整形（退回未整形现状）。
+var _elev_shape_pow_override := -1.0
+# 变形锚 A 的运行时覆盖（标定工具用；生产路径恒为 -1 → 走常量）
+var _elev_shape_anchor_override := -1.0
+# 河流坡度归一化的运行时覆盖（标定工具用；生产路径恒为 -1 → 走常量）
+var _river_slope_norm_override := -1.0
 # 当前装配的星球模型：再次生成时先撤旧的，避免两颗星球叠在一起渲染
 var _mesh_instance: MeshInstance3D
 # 未生成区域查询用的拓扑缓存（方向→贴片）。全部指向单位球面。
@@ -365,7 +403,14 @@ const RIVER_PET_MAX := 0.65
 const RIVER_PET_EXP := 1.4
 const RIVER_SNOW_FADE_LO := 0.05
 const RIVER_SNOW_FADE_HI := 0.05
-const RIVER_SLOPE_NORM := 0.25
+# 坡度归一化基准：slope01 = clamp(max_drop / RIVER_SLOPE_NORM, 0, 1)。
+# 整形（见 ELEV_SHAPE_*）压缩了相邻贴片的落差 → 产流的坡度信号整体变弱，
+# 河网密度和"跨高山河段"都会缩水。实测（真实管线 cov=0.3 / seed=4242）：
+#   norm=0.25（未补偿）  河段 759  跨高山 12   ← 基线未整形时是 812 / 19
+#   norm=0.16            河段 863  跨高山 25   ← 采用（河段略高于基线，跨高山补回）
+#   norm=0.13            河段 886  跨高山 30
+#   norm=0.11            河段 946  跨高山 32（偏多，河网过密）
+const RIVER_SLOPE_NORM := 0.16
 const RIVER_RUNOFF_FLAT := 0.25
 const RIVER_RUNOFF_STEEP := 0.85
 const RIVER_FILL_EPS := 1e-6
@@ -662,7 +707,9 @@ func _compute_river_edges() -> void:
 				* pow(warm, RIVER_PET_EXP)
 		var snow := 1.0 - smoothstep(T_FREEZE - RIVER_SNOW_FADE_LO,
 				T_FREEZE + RIVER_SNOW_FADE_HI, temp)
-		var slope01 := clampf(max_drop / RIVER_SLOPE_NORM, 0.0, 1.0)
+		var slope_norm := RIVER_SLOPE_NORM if _river_slope_norm_override < 0.0 \
+				else _river_slope_norm_override
+		var slope01 := clampf(max_drop / slope_norm, 0.0, 1.0)
 		var r := maxf(0.0, p - pet) * (1.0 - snow) \
 				* lerpf(RIVER_RUNOFF_FLAT, RIVER_RUNOFF_STEEP, slope01)
 		injection[v] = clampf(r, 0.0, 1.0)
@@ -2160,6 +2207,27 @@ func _init_noise(seed_value: int) -> void:
 	_continent_noise.fractal_octaves = 4 # 多倍频 → 海岸线有多尺度的犬牙细节
 
 
+# —— 海拔整形：幂变换，把钟形噪声压成"平原 + 少数尖峰" ——
+# e' = SEA + sign(r)·|r|^p / A^(p-1)，r = e − SEA。
+# 锚定在海平面 → f(SEA)=SEA 且严格单调递增 → 海岸线逐点不变（陆地率、
+# 群系、内陆水完全不受影响）；p>1 压低中低幅、保留高幅 → 平原变大、
+# 尖峰相对更陡。门限数值仍定义在最终海拔空间，故各级海拔区间不变。
+func _shape_elev(e: float) -> float:
+	# —— 纯幂变换（方案B 主体）——
+	var p := ELEV_SHAPE_POW if _elev_shape_pow_override < 0.0 else _elev_shape_pow_override
+	if p <= 1.0:
+		return e
+	var r2 := e - SEA_LEVEL
+	# scale = A^(p-1)：p / A 固定时它也是固定的 → 缓存起来，避免逐贴片 pow。
+	# 标定工具改 p 或 A 时缓存失效，自动重算（生产路径两者恒定 → 只算一次）。
+	var a := ELEV_SHAPE_ANCHOR if _elev_shape_anchor_override < 0.0 \
+			else _elev_shape_anchor_override
+	var scale := ELEV_SHAPE_SCALE
+	if not (is_equal_approx(p, ELEV_SHAPE_POW) and is_equal_approx(a, ELEV_SHAPE_ANCHOR)):
+		scale = pow(a, p - 1.0)
+	return SEA_LEVEL + signf(r2) * pow(absf(r2), p) / scale
+
+
 # —— 气候模型：连续温度场取代“纬度硬切带” ——
 # temperature = cos(纬度) + 噪声扰动 − 海拔制冷 + 菜单温度档偏移
 # 同一个温度场海陆共用：海洋冷到阈值就是海冰，陆地冷到阈值就是冰原。
@@ -2169,7 +2237,8 @@ func _climate_fill(center: Vector3, out: Array) -> void:
 	# 地心纬度：贴片中心方向与赤道面的夹角，单位度
 	var lat := rad_to_deg(asin(clampf(center.y, -1.0, 1.0)))
 	var lat_factor := cos(deg_to_rad(lat))          # 纬度基底：赤道 1 → 极点 0（平滑）
-	var elev := _elev_noise.get_noise_3dv(center)   # 海拔（将来“山脉抬升”直接复用它）
+	# 海拔：噪声 → 幂变换整形（见 _shape_elev）。整形锚在海平面上，海岸线不变。
+	var elev := _shape_elev(_elev_noise.get_noise_3dv(center))
 	# 海岸收边（ConvertToIsland 思路）：球冠边缘带内把海拔往海平面下压，
 	# 保证交互区最外圈是海——陆地不会被“一刀切断”在区域边界上，
 	# 与区域外的未生成海面无缝相接（大陆架观感）。
@@ -2221,6 +2290,10 @@ func _biome_color(elev: float, temp: float, humid: float) -> Color:
 # 陆地从海平面往上爬，按阈值逐级抬升为丘陵→山区；极高的尖峰不可逾越。
 # 冰盖/苔原是“群系颜色”维度的事，它们能不能走、好不好建依然由海拔说了算
 # ——想让冻土更难通行，把 HILL1_ELEV 往下调一档即可，不需要新逻辑。
+#
+# 门限直接用上面的常量：整形把海拔分布的**形态**改了（平原大片、尖峰突出），
+# 门限仍在**最终海拔空间**（0.18/0.32/0.48/0.62）→ 每档占据的海拔区间不变，
+# 温度制冷/山地增雨等吃海拔绝对值的参数零漂移（实测已验证）。
 func _terrain_level(elev: float) -> TerrainLevel:
 	if elev < HILL1_ELEV:
 		return TerrainLevel.FLAT # 海面（海底平原）与沿海平地都是平原
