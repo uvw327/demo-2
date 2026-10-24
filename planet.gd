@@ -304,9 +304,21 @@ const RIVER_MITER_MAX_RATIO := 1.4    # miter 偏移上限（×半宽），尖�
 const RIVER_SMOOTH_ITERS := 2         # Chaikin 迭代次数（0 = 关闭）
 const RIVER_TIP_LEN_DEG := 3.0        # 源头渐细/渐隐的弧长（度）
 const RIVER_TIP_TAPER := 0.30         # 源头最末端的半宽比例
-const RIVER_MOUTH_PAST := 0.62        # 河口：沿(最后陆地片→水域片)方向取的比例，0.5=岸线
+# 河口：ribbon 沿(最后陆地片→水域片)方向一直画到 0.70（岸线在 0.5 处），也就是
+# **一定跨过岸线**；跨出去的那截不靠几何收口，而是由下面的「岸线裁剪」逐像素裁掉。
+# 为什么必须跨过去：六边形海岸是锯齿，河心与岸线的交点落在哪儿取决于河流的角度，
+# 靠摆一个端点或圆头去"刚好贴住"岸线永远会有缝或有凸出。
+const RIVER_MOUTH_PAST := 0.70        # 河口端点的位置（0.5 = 岸线；> 0.5 = 伸进水面）
 const RIVER_MOUTH_LEN_DEG := 0.6      # 河口喇叭口弧长（度）
 const RIVER_MOUTH_FLARE := 1.15       # 入海口半宽放大倍数（做过头会像码头）
+# —— 岸线裁剪（§24）——
+# 地表是「每片贴片一个多边形」，它的边就是 _tile_polys 里相邻两个角点之间的直弦。
+# 所以最后一块陆地贴片朝水的每条边，都唯一确定一个「过球心 + 该边」的平面，
+# 平面与球面的交线就是那条海岸线本身。把「到岸线的有符号距离」烘进 COLOR.g
+# （0.5 = 岸线，< 0.5 = 陆地侧，> 0.5 = 水域侧，0 = 深在陆地 = 哨兵），
+# fragment 里把水域侧裁掉 —— 河道正好在陆地的边线上收口，与海岸严丝合缝，
+# 而且不需要为裁剪新增任何三角形（对导出微信小游戏的性能最友好）。
+const RIVER_COAST_SCALE := 0.02        # COLOR.g 编码量程：±0.02 世界单位（≈±1.15°≈2 个贴片）
 # 汇合点圆角接头：半径 = 该点半宽（圆角 join 的定义），只补两条正截面之间的夹角。
 const RIVER_JOIN_SEG := 14            # 圆弧边数（14 边时弦高 < 2.5% 半径，看不出多边形）
 # 产流/汇流参数（一期初值；先看日志里的河段密度/Q，再按截图调）
@@ -486,6 +498,8 @@ func _build_river_layer() -> void:
 	_river_material.set_shader_parameter("max_width_px", RIVER_MAX_WIDTH_PX)
 	_river_material.set_shader_parameter("depth_bias", RIVER_DEPTH_BIAS)
 	_river_material.set_shader_parameter("depth_mode", 0)
+	# 岸线裁剪的编码量程必须与烘进 COLOR.g 的一致
+	_river_material.set_shader_parameter("clip_scale", RIVER_COAST_SCALE)
 	# 像素换算必须由 CPU 给：shader 里用 PROJECTION_MATRIX/VIEWPORT_SIZE
 	# 反推会算小一个数量级（实测），整条河网被封顶压成 1 像素。
 	_update_river_camera_params()
@@ -1312,6 +1326,60 @@ func _river_bisector(p: Vector3, d_in: Vector3, d_out: Vector3) -> Vector3:
 	return m.normalized()
 
 
+# 河口裁剪面：最后一块陆地贴片的**朝水边**，每条边给一个单位法线（指向水域）。
+# 平面过球心与该边的两个角点 —— 地表网格在这条边上画的就是这两点之间的直弦，
+# 所以按平面裁出来的边界与海岸线严格重合（弦与平面只差 ~1e-5 半径，亚像素）。
+# 点 x 在陆地上 ⇔ 对所有 n 都有 n·x ≤ 0（贴片是凸的，所以片内点全部满足）。
+func _river_mouth_clip_planes(land_v: int) -> PackedVector3Array:
+	var planes := PackedVector3Array()
+	if land_v < 0 or land_v >= _tile_polys.size():
+		return planes
+	var poly: PackedVector3Array = _tile_polys[land_v]
+	var n := poly.size()
+	if n < 3:
+		return planes
+	for k in n:
+		var a := poly[k]
+		var b := poly[(k + 1) % n]
+		var mid := a + b
+		if mid.length_squared() < 1e-12:
+			continue
+		mid = mid.normalized()
+		# 这条边对面是哪片贴片：边中点方向最贴近的那个邻居（六边形上唯一）
+		var best := -1
+		var best_dot := -2.0
+		for j in 6:
+			var u: int = _tile_neighbors[land_v * 6 + j]
+			if u < 0:
+				continue
+			var dd: float = _tile_centers[u].dot(mid)
+			if dd > best_dot:
+				best_dot = dd
+				best = u
+		if best < 0 or _inland_water[best] != 1:
+			continue # 对面也是陆地 → 这条边在陆地上，不是岸线
+		var pn := a.cross(b)
+		if pn.length_squared() < 1e-16:
+			continue
+		pn = pn.normalized()
+		if pn.dot(_tile_centers[best]) < 0.0:
+			pn = -pn # 法线朝水
+		planes.append(pn)
+	return planes
+
+
+# 到岸线的有符号距离，直接编码成 COLOR.g（见 RIVER_COAST_SCALE）。
+# 没有裁剪面（或深在陆地上）时返回 0.0 = 饱和的"陆地深处"，shader 里恒不裁。
+func _river_coast_code(planes: PackedVector3Array, p: Vector3) -> float:
+	if planes.is_empty():
+		return 0.0
+	var d := -RIVER_COAST_SCALE
+	for pn in planes:
+		# 多面临水（岬角）时取最靠水的那一面：任一面临水即已出陆地
+		d = maxf(d, pn.dot(p))
+	return clampf(0.5 + d / (2.0 * RIVER_COAST_SCALE), 0.0, 1.0)
+
+
 # 分支链 → 球面 ribbon。宽度、miter、源头渐细全部烘到顶点位置；
 # shader 只用 UV2.x（烘焙半宽）做远视角最小像素补偿，不再负责展开宽度。
 # 顶点布局：每采样点 2 个（左 UV.x=0 / 右 1），NORMAL=侧向单位向量，COLOR.r=alpha。
@@ -1326,6 +1394,7 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 	var quad_n := 0
 	var mouth_pts := PackedVector3Array()
 	var mouth_rad := PackedFloat32Array()
+	var mouth_planes: Array[PackedVector3Array] = []
 	for b in _river_branch_n:
 		var start: int = _river_branch_offsets[b]
 		var count: int = _river_branch_offsets[b + 1] - start
@@ -1345,12 +1414,16 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 		var mouth := _inland_water[tail_v] == 1
 		var ends_at_junction: bool = (not mouth) and _river_child_count[tail_v] >= 2
 		var is_dead_end: bool = (not mouth) and (not ends_at_junction)
+		# 河口：最后一块陆地贴片 + 它的岸线平面（只有河口链才有，别的链保持空）
+		var land_v: int = -1
+		var planes := PackedVector3Array()
 		if mouth:
-			# 河口：从「最后陆地片 → 水域片」的连线上取 0.62（海岸线在 0.5 处），
-			# 也就是**略微伸进水面**。六边形海岸是锯齿状的，取中点经常刚好卡在
-			# 陆地一侧 → 留下一条缝 + 那块"没入海"的半透明。伸进去一点必然跨过
-			# 岸线；alpha 全程保持 1，不再做淡出（淡出在岸带的白色雾面上就是
-			# 一坨不明所以的透明）。
+			land_v = _river_branch_nodes[start + count - 2]
+			planes = _river_mouth_clip_planes(land_v)
+			# ribbon 沿(陆地片→水域片)方向**一定跨过岸线**（0.70 > 0.5），跨出去
+			# 的那截由 shader 按岸线平面逐像素裁掉（见 _river_coast_code）。
+			# 这样做的好处：河心与岸线的交点在哪里、河流以什么角度撞岸，全都不
+			# 需要特殊处理——裁出来的边永远落在陆地边线上，不会有缝也不会有圆头。
 			pts[count - 1] = pts[count - 2].slerp(pts[count - 1],
 					RIVER_MOUTH_PAST).normalized()
 			halves[count - 1] = halves[count - 2]
@@ -1376,6 +1449,18 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 		var alphas := PackedFloat32Array()
 		alphas.resize(n)
 		alphas.fill(1.0)
+		# 岸线裁剪只作用在「河口尾巴」：Chaikin 后找离最后一块陆地贴片中心最近的
+		# 采样点，从它往后才可能越过岸线。上游一律给哨兵（= 不裁）——海岸是锯齿，
+		# 岸线平面往远处延伸会切进别的贴片，把同一条链上游贴着另一段海岸的部分误裁。
+		var tail_i := n
+		if mouth:
+			var best := INF
+			var p_land: Vector3 = _tile_centers[land_v]
+			for i in n:
+				var da := pts[i].angle_to(p_land)
+				if da < best:
+					best = da
+					tail_i = i
 
 		# —— 弧长参数：端头的渐细/渐隐按「离端点多远」而不是「第几个点」 ——
 		var cum := PackedFloat32Array()
@@ -1512,8 +1597,10 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 					side = (side - p * side.dot(p)).normalized()
 					off = lerpf(offs[i], offs[i + 1], t)
 					al = lerpf(alphas[i], alphas[i + 1], t)
-				verts.append((p - side * off).normalized())
-				verts.append((p + side * off).normalized())
+				var vl := (p - side * off).normalized()
+				var vr := (p + side * off).normalized()
+				verts.append(vl)
+				verts.append(vr)
 				normals.append(side)
 				normals.append(side)
 				var v_arc := (acc + arc[i] * t) / total_arc
@@ -1521,9 +1608,17 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 				uvs.append(Vector2(1.0, v_arc))
 				uv2s.append(Vector2(off, v_arc))
 				uv2s.append(Vector2(off, v_arc))
-				var c := Color(al, 0.0, 0.0, 1.0)
-				cols.append(c)
-				cols.append(c)
+				# COLOR.g = 到岸线的有符号距离（0.5 = 岸线，见 _river_coast_code）；
+				# 只有河口尾巴填真值，其余恒 0 = 深在陆地 → shader 不裁。
+				# 左右两侧各按**自己的位置**算，裁线才严格落在岸线平面上。
+				var cg0 := 0.0
+				var cg1 := 0.0
+				var pidx := i + (0 if k < nseg else 1)
+				if mouth and pidx >= tail_i:
+					cg0 = _river_coast_code(planes, vl)
+					cg1 = _river_coast_code(planes, vr)
+				cols.append(Color(al, cg0, 0.0, 1.0))
+				cols.append(Color(al, cg1, 0.0, 1.0))
 				first = false
 			acc += arc[i]
 		var emitted := (verts.size() - base) >> 1
@@ -1540,6 +1635,7 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 		if mouth:
 			mouth_pts.append(pts[count - 1])
 			mouth_rad.append(halves[count - 1])
+			mouth_planes.append(planes)
 
 	# —— 汇合点圆角接头（round join）——
 	# 每条链在汇合点处以「自己的正截面」结束，两个截面之间那个夹角由一段
@@ -1582,30 +1678,36 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 		join_n += 1
 
 	# —— 河口端头：半径 = 河口半宽的圆 ——
-	# 河道在岸线外侧一点点被截断，用同半径的圆收尾 → 断面不再是"被剪断的管子"，
-	# 而是一个圆润的河口；圆不会超出河道轮廓（半径就是半宽）。
+	# 圆头本身也带同一套岸线裁剪值 → 伸到水面上的那半圈会被裁掉，留在陆地上的
+	# 只有「河道与海岸线之间的两个圆角」，河口就是圆润地融进海岸，而不是一截
+	# 突兀的圆头浮在水面上（改造前的样子）。
+	var mouth_clipped := 0
 	for mi in mouth_pts.size():
 		var mp: Vector3 = mouth_pts[mi]
 		var mr: float = mouth_rad[mi]
 		if mr <= 0.0:
 			continue
+		var mpl: PackedVector3Array = mouth_planes[mi]
 		var mh := Vector3.UP if absf(mp.y) < 0.9 else Vector3.RIGHT
 		var me1: Vector3 = mp.cross(mh).normalized()
 		var me2: Vector3 = mp.cross(me1).normalized()
+		if _river_coast_code(mpl, mp) > 0.5:
+			mouth_clipped += 1 # 圆心已在水面一侧 → 这条河口确实会被裁到
 		var mci := verts.size()
 		verts.append(mp)
 		normals.append(me1)
 		uvs.append(Vector2(0.5, 0.0))
 		uv2s.append(Vector2(mr, 0.0))
-		cols.append(Color(1.0, 0.0, 0.0, 1.0))
+		cols.append(Color(1.0, _river_coast_code(mpl, mp), 0.0, 1.0))
 		for k in join_seg:
 			var ma := TAU * float(k) / float(join_seg)
 			var mrad: Vector3 = me1 * cos(ma) + me2 * sin(ma)
-			verts.append((mp + mrad * mr).normalized())
+			var mv := (mp + mrad * mr).normalized()
+			verts.append(mv)
 			normals.append(mrad)
 			uvs.append(Vector2(1.0, 0.0))
 			uv2s.append(Vector2(mr, 0.0))
-			cols.append(Color(1.0, 0.0, 0.0, 1.0))
+			cols.append(Color(1.0, _river_coast_code(mpl, mv), 0.0, 1.0))
 		for k in join_seg:
 			indices.append(mci)
 			indices.append(mci + 1 + k)
@@ -1626,10 +1728,11 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 	_river_render_stats["quads"] = quad_n
 	_river_render_stats["joins"] = join_n
 	_river_render_stats["mouths"] = mouth_pts.size()
+	_river_render_stats["mouth_clipped"] = mouth_clipped
 	print("河流 mesh：", sample_n, " 采样点 / ",
 			quad_n * 2 + (join_n + mouth_pts.size()) * join_seg,
 			" 三角形（", _river_branch_n, " 条链，", join_n, " 个汇合点圆角，",
-			mouth_pts.size(), " 个河口）")
+			mouth_pts.size(), " 个河口，", mouth_clipped, " 条按岸线裁剪）")
 	return mesh
 
 

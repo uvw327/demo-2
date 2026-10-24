@@ -272,6 +272,9 @@ func _run() -> void:
 			var half_hi: float = PlanetScript.RIVER_HALF_MAX \
 					* PlanetScript.RIVER_MOUTH_FLARE \
 					* PlanetScript.RIVER_MITER_MAX_RATIO + 1e-5
+			# 岸线裁剪：河口尾巴必须有落在水域侧的顶点（COLOR.g > 0.5），
+			# 否则说明裁剪面没算出来 / 河道没跨过岸线，河口会露出圆头。
+			var coast_hi := 0.0
 			for i in vn:
 				var p := verts[i]
 				if not p.is_finite() or absf(p.length() - 1.0) > 1e-5:
@@ -295,6 +298,13 @@ func _run() -> void:
 				if cols[i].r < 0.0 or cols[i].r > 1.0:
 					ok_mesh = false
 					break
+				# COLOR.g = 到岸线的有符号距离编码（0..1）
+				if cols[i].g < 0.0 or cols[i].g > 1.0:
+					ok_mesh = false
+					break
+				coast_hi = maxf(coast_hi, cols[i].g)
+			if ok_mesh and coast_hi <= 0.5:
+				ok_mesh = false
 			if ok_mesh:
 				for j in idx.size():
 					if idx[j] < 0 or idx[j] >= vn:
@@ -306,6 +316,35 @@ func _run() -> void:
 			planet._river_branch_n, joins, mouth_caps])
 			+ "半径 1.0、单位法线、UV/UV2/COLOR 合法")
 	_ok = _ok and ok_mesh
+
+	# —— 6b) 河口岸线裁剪：裁剪面存在，且「陆地片中心在陆地侧、端头在水域侧」——
+	# 只用几何收口（端点/圆头）永远贴不住锯齿状海岸；这里断言裁剪面已经烘好、
+	# 裁剪线确实落在河口尾巴里（既不整条链给哨兵，也不把整个河口都判到水里）。
+	var clip_bad := 0
+	var clip_n := 0
+	for bi3 in planet._river_branch_n:
+		var s3: int = planet._river_branch_offsets[bi3]
+		var c3: int = planet._river_branch_offsets[bi3 + 1] - s3
+		if c3 < 2:
+			continue
+		var tail3: int = planet._river_branch_nodes[s3 + c3 - 1]
+		if planet._inland_water[tail3] != 1:
+			continue
+		clip_n += 1
+		var land3: int = planet._river_branch_nodes[s3 + c3 - 2]
+		var pl3: PackedVector3Array = planet._river_mouth_clip_planes(land3)
+		var pc3: Vector3 = planet._tile_centers[land3]
+		var pw3: Vector3 = planet._tile_centers[tail3]
+		var end3: Vector3 = pc3.slerp(pw3, PlanetScript.RIVER_MOUTH_PAST).normalized()
+		if pl3.is_empty() \
+				or planet._river_coast_code(pl3, pc3) >= 0.5 \
+				or planet._river_coast_code(pl3, end3) <= 0.5:
+			clip_bad += 1
+	var ok_clip: bool = clip_n > 0 and clip_bad == 0 and clip_n == mouth_caps
+	print(bin_if(ok_clip,
+			"河口岸线裁剪：%d 条河口全部有朝水边平面，陆地片中心在陆地侧、端头在水域侧"
+			% clip_n))
+	_ok = _ok and ok_clip
 
 	# —— 7) 图层顺序与 shader 参数：低丘 0 → 河流 1 → 高山 2 ——
 	var low_p := -1
