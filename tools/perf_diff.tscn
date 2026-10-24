@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://bperfdiff0001"]
+
+[ext_resource type="Script" path="res://tools/perf_diff.gd" id="1_diff"]
+
+[node name="PerfDiff" type="Node"]
+script = ExtResource("1_diff")
