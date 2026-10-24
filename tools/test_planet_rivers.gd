@@ -346,7 +346,12 @@ func _run() -> void:
 			% clip_n))
 	_ok = _ok and ok_clip
 
-	# —— 7) 图层顺序与 shader 参数：低丘 0 → 河流 1 → 高山 2 ——
+	# —— 7) 图层顺序与两遍绘制（§26）：低丘 0 → 河岸 1 → 水芯 2 → 高山 3 ——
+	# 河岸带由**几何**分层（同一份 mesh 画两遍），所以这里必须逐项钉住：
+	#   ① 两遍共用**同一个** ArrayMesh —— 顶点/索引只上传一次（性能承诺）；
+	#   ② 除 core_pass / base_color / render_priority 外，其余参数完全一致 ——
+	#      否则水芯会与河岸错位；
+	#   ③ 河岸遍 = 河岸色 #565860（core_pass 0），水芯遍 = 水色 #495264（core_pass 1）。
 	var low_p := -1
 	var high_p := -1
 	if planet._hills_low_instance != null \
@@ -355,41 +360,61 @@ func _run() -> void:
 	if planet._hills_high_instance != null \
 			and planet._hills_high_instance.material_override != null:
 		high_p = planet._hills_high_instance.material_override.render_priority
-	var river_p := -1
+	var bank_p := -1
+	var core_p := -1
 	var ok_mat := false
 	var col := Color(0, 0, 0, 0)
-	var bank := Color(0, 0, 0, 0)
-	if planet._river_material != null:
-		river_p = planet._river_material.render_priority
+	var core_col := Color(0, 0, 0, 0)
+	if planet._river_material != null and planet._river_core_material != null \
+			and planet._river_instance != null and planet._river_core_instance != null:
+		bank_p = planet._river_material.render_priority
+		core_p = planet._river_core_material.render_priority
 		var sh: Shader = planet._river_material.shader
-		var db: float = planet._river_material.get_shader_parameter("depth_bias")
-		var mw: float = planet._river_material.get_shader_parameter("min_width_px")
-		var bi: float = planet._river_material.get_shader_parameter("bank_inner")
-		col = planet._river_material.get_shader_parameter("river_color")
-		bank = planet._river_material.get_shader_parameter("river_bank_color")
+		col = planet._river_material.get_shader_parameter("base_color")
+		core_col = planet._river_core_material.get_shader_parameter("base_color")
+		var bank_ps: float = planet._river_material.get_shader_parameter("core_pass")
+		var core_ps: float = planet._river_core_material.get_shader_parameter("core_pass")
+		var shared_mesh: bool = planet._river_instance.mesh \
+				== planet._river_core_instance.mesh \
+				and planet._river_instance.mesh != null
+		var same_params := true
+		for key in ["min_width_px", "max_width_px", "depth_bias", "depth_mode",
+				"clip_scale", "bank_inner", "focal_px"]:
+			if not is_equal_approx(
+					float(planet._river_material.get_shader_parameter(key)),
+					float(planet._river_core_material.get_shader_parameter(key))):
+				same_params = false
+				print("  两遍参数不一致：", key)
 		ok_mat = sh != null and sh.resource_path.ends_with("planet_rivers.gdshader") \
-				and is_equal_approx(db, PlanetScript.RIVER_DEPTH_BIAS) \
-				and is_equal_approx(mw, PlanetScript.RIVER_MIN_WIDTH_PX) \
-				and is_equal_approx(bi, PlanetScript.RIVER_BANK_INNER) \
+				and planet._river_core_material.shader == sh \
+				and col.is_equal_approx(PlanetScript.water_bank_color()) \
+				and core_col.is_equal_approx(PlanetScript.WATER_COLOR) \
+				and is_equal_approx(bank_ps, 0.0) and is_equal_approx(core_ps, 1.0) \
+				and is_equal_approx(float(planet._river_material.get_shader_parameter(
+						"bank_inner")), PlanetScript.RIVER_BANK_INNER) \
+				and shared_mesh and same_params \
 				and planet._river_instance.cast_shadow \
+						== GeometryInstance3D.SHADOW_CASTING_SETTING_OFF \
+				and planet._river_core_instance.cast_shadow \
 						== GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	ok_mat = ok_mat and low_p == 0 and river_p == 1 and high_p == 2
-	print(bin_if(ok_mat, "图层顺序 低丘 %d → 河流 %d → 高山 %d，shader 参数一致"
-			% [low_p, river_p, high_p]))
+	ok_mat = ok_mat and low_p == 0 and bank_p == 1 and core_p == 2 and high_p == 3
+	print(bin_if(ok_mat,
+			"图层顺序 低丘 %d → 河岸 %d → 水芯 %d → 高山 %d；两遍共用同一 mesh、参数一致，岸 %s / 水 %s"
+			% [low_p, bank_p, core_p, high_p, col.to_html(false), core_col.to_html(false)]))
 	_ok = _ok and ok_mat
 
-	# —— 7b) 水体配色：河水必须等于近岸海水（WATER_COLOR #495264），河岸 #565860 ——
+	# —— 7b) 水体配色：水芯遍 = WATER_COLOR #495264，河岸遍 = #565860 ——
 	# 这两条是「入海口天然无缝」的前提：河水与浅水同源同值，跨过去差值 ≤3/255。
 	# 河岸由 mix(河水, 陆地 #8b7050, 0.20) 派生，实测参考图 #56585f（差 1/255，容差 2.5）。
-	var ok_tint: bool = absf(col.r - 73.0 / 255.0) < 1.5 / 255.0 \
-			and absf(col.g - 82.0 / 255.0) < 1.5 / 255.0 \
-			and absf(col.b - 100.0 / 255.0) < 1.5 / 255.0 \
-			and col.is_equal_approx(PlanetScript.WATER_COLOR) \
-			and absf(bank.r - 86.0 / 255.0) < 2.5 / 255.0 \
-			and absf(bank.g - 88.0 / 255.0) < 2.5 / 255.0 \
-			and absf(bank.b - 96.0 / 255.0) < 2.5 / 255.0
-	print(bin_if(ok_tint, "水体配色：河 #%s（目标 #495264）岸 #%s（目标 #565860）"
-			% [col.to_html(false), bank.to_html(false)]))
+	var ok_tint: bool = absf(core_col.r - 73.0 / 255.0) < 1.5 / 255.0 \
+			and absf(core_col.g - 82.0 / 255.0) < 1.5 / 255.0 \
+			and absf(core_col.b - 100.0 / 255.0) < 1.5 / 255.0 \
+			and core_col.is_equal_approx(PlanetScript.WATER_COLOR) \
+			and absf(col.r - 86.0 / 255.0) < 2.5 / 255.0 \
+			and absf(col.g - 88.0 / 255.0) < 2.5 / 255.0 \
+			and absf(col.b - 96.0 / 255.0) < 2.5 / 255.0
+	print(bin_if(ok_tint, "水体配色：水芯 #%s（目标 #495264）河岸 #%s（目标 #565860）"
+			% [core_col.to_html(false), col.to_html(false)]))
 	_ok = _ok and ok_tint
 
 	# —— 8) 河宽分级：半宽单调、范围合法、干/支比明显；分支链覆盖每条河段一次 ——

@@ -1,12 +1,28 @@
-// 星球河流层（宽度分级）：宽度已经烘进几何，shader 只负责
+// 星球河流层：河岸与水芯由**几何**分层，而不是在 fragment 里按 UV 区间涂色。
+//
+// 为什么这么改（见 docs/planet_rivers_plan.md §25–§26）：
+//   原来的做法是「河岸 = 图元自身 |UV.x*2-1| 落在 [inner, 1] 的那圈」。对单条
+//   ribbon 来说这恰好等于「到水体边界的距离」，所以一直是对的；但汇合点圆盘
+//   复用了同一个公式，而圆盘的半径（= 汇合处半宽）是**内切**于干流的——
+//   它大半都在水体内部，于是整个圆环被涂成河岸色，就是截图里那圈小圆环。
+//   正确判据是「到水体**并集**边界的距离」，那是 fragment 拿不到的信息。
+//
+//   于是把河岸做成真正的几何：同一条河流 = 并集的全宽填充（河岸色）
+//   + 并集的内缩（水色）。内缩不需要第二份顶点数据 —— 每个顶点相对中心线的
+//   偏移向量是现成的：NORMAL(侧向/径向) × (UV.x*2-1) × UV2.x。
+//   所以同一份 ArrayMesh 画两遍，只差 width_scale / base_color / render_priority。
+//   构造即正确：汇合、河口圆头、以后的正弦蜿蜒都自动成立。
+//
+// shader 仍负责：
 //  ① 远视角最小屏幕宽度补偿（只对细支流生效，干流走真实几何宽度）
 //  ② 近景最大屏幕宽度封顶（避免贴脸时干流变成蓝色高速公路）
-//  ③ 河岸带（两岸各 13% 总宽，纯色；窄河时自动收缩水芯）+ 边缘抗锯齿 + 源头端 alpha 渐隐
-//  ④ 岸线裁剪（河口按最后一块陆地贴片的边线裁掉，见下方 clip_scale）
+//  ③ 「窄河让出水芯」（全宽 ≤2px 时整条画河岸色）+ 边缘抗锯齿 + 源头端 alpha 渐隐
+//  ④ 岸线裁剪（河口按最后一块陆地贴片的边线裁掉，见下方 coast）
 //  ⑤ 视线深度偏移（零视差 decal）
 //
-// 几何：半径 1.0 的球面 ribbon，左右顶点各自按 miter 偏移（见 planet.gd）；
-//   NORMAL = 侧向单位向量，UV.x = 0/1（左/右），UV2.x = 烘焙半宽（世界单位），
+// 顶点语义（§26）：VERTEX = **中心线**球面点（圆盘是圆心），
+//   NORMAL = 切平面侧向单位向量（圆盘是径向），UV.x = 0/1（0.5 = 圆心 → 偏移 0），
+//   UV2.x = 偏移长度（世界单位，含 miter 放大），UV2.y = 弧长归一，
 //   COLOR.r = alpha（源头端渐细渐隐），COLOR.g = 到岸线的有符号距离编码。
 //
 // 配色（见 docs/planet_water_plan.md）：河水 = 近岸海水 = #495264，河岸 = #565860。
@@ -26,7 +42,7 @@
 // 同款手法见 selection_ring.gdshader（depth_bias=0.006）。
 //
 // 图层顺序（由 planet.gd 的 render_priority 钉死）：
-//   地表(不透明) → 低丘 0 → 河流 1 → 高山 2 → 太阳 10 → 大气 20
+//   地表(不透明) → 低丘 0 → 河岸 1 → 水芯 2 → 高山 3 → 太阳 10 → 大气 20
 // 选中环最终应在河流之上（priority 5），但一期暂不改；当前它仍是默认 0，
 // 局部会被河流盖住（已与需求方确认，后续再处理）。
 //
@@ -35,13 +51,14 @@
 shader_type spatial;
 render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;
 
-uniform vec4 river_color : source_color = vec4(0.2863, 0.3216, 0.3922, 1.0);
-// 河岸色 = 河水向陆地色混 20%（planet.gd 的 water_bank_color()，#565860）。
-// 参考图实测：两岸各占河宽的 13%（随河宽等比缩放），纯色、无纹理。
-uniform vec4 river_bank_color : source_color = vec4(0.3373, 0.3451, 0.3765, 1.0);
-// 水芯边界（|e| 归一化坐标）：0.74 = 水芯占 74%，两岸各 13%。
-// 窄河时由 fragment 按屏幕像素宽度往下收（可收到 0 = 整条都是河岸色）。
+// 本遍的纯色：河岸遍传 water_bank_color()（#565860），水芯遍传 WATER_COLOR（#495264）。
+uniform vec4 base_color : source_color = vec4(0.2863, 0.3216, 0.3922, 1.0);
+// 水芯边界（相对全宽）：0.74 = 水芯占 74%，两岸各 13%（参考图实测 11.8%~14.3%）。
+// 只在 core_pass = 1 的那遍使用；窄河时按屏幕像素宽度往下收，可收到 0。
 uniform float bank_inner = 0.74;
+// 0 = 河岸遍（width_scale = 1，画并集全宽）；1 = 水芯遍（width_scale = inner）。
+// 两个材质只差这一个开关 + base_color + render_priority。
+uniform float core_pass = 0.0;
 // 屏幕最小宽度：只有「烘焙半宽 < 该值」的细支流会被加宽，
 // 干流在远视角仍保留真实宽度差，不会整条河网一样粗。
 uniform float min_width_px = 1.6;
@@ -74,9 +91,11 @@ varying float v_coast;
 
 void vertex() {
 	vec3 side = normalize(NORMAL);
+	// 中心线点（圆盘 = 圆心）。偏移全部在这里重新展开。
+	vec3 center = VERTEX;
 
 	// 屏幕宽度上下限：几何已按 Q 烘焙好宽度，这里只做差额补偿。
-	vec4 view_pos = MODELVIEW_MATRIX * vec4(VERTEX, 1.0);
+	vec4 view_pos = MODELVIEW_MATRIX * vec4(center, 1.0);
 	float depth = max(-view_pos.z, 1e-4);
 	float px_world = depth / max(focal_px, 1.0);
 
@@ -96,7 +115,21 @@ void vertex() {
 			want = knee + over * (1.0 - exp(-(want - knee) / over));
 		}
 	}
-	VERTEX += side * (UV.x * 2.0 - 1.0) * (want - UV2.x);
+
+	// lateral：-1 左岸 / 0 中心（圆盘圆心）/ +1 右岸（圆盘环）。
+	float lateral = UV.x * 2.0 - 1.0;
+
+	// 窄河让出水芯：屏幕上全宽 ≤2px 时整条都是河岸色（细流本来就看不到水芯），
+	// ≥5px 时恢复 bank_inner 比例。用解析半宽算像素宽度，不再依赖 fwidth——
+	// 原来在 fragment 里靠 fwidth(UV.x) 反推，逐像素各算各的，会在远近过渡处
+	// 出现台阶；这里是逐顶点的物理量，插值后连续。
+	float full_px = 2.0 * want / px_world;
+	float inner = bank_inner * smoothstep(2.0, 5.0, full_px);
+
+	// 河岸遍画全宽，水芯遍按 inner 内缩。两者共用同一份顶点数据。
+	float ws = mix(1.0, inner, core_pass);
+	// 球面展开：切平面线性偏移再投回球面（与构建期烘焙的口径完全一致）。
+	VERTEX = normalize(center + side * lateral * want * ws);
 
 	v_alpha = COLOR.r;
 	v_coast = (COLOR.g - 0.5) * (2.0 * clip_scale);
@@ -111,6 +144,7 @@ void vertex() {
 }
 
 void fragment() {
+	// 边缘抗锯齿：几何边界就在 |e| = 1 处（水芯遍也是——UV 不缩放，位置缩放）。
 	float e = UV.x * 2.0 - 1.0;
 	float edge = abs(e);
 	float aa = max(fwidth(e), 1e-5) * edge_softness_px;
@@ -118,14 +152,7 @@ void fragment() {
 	// 哨兵值 0 与真实值之间有跳变，会把整片区域的导数放大、把河道裁成半透明）。
 	float cw = max(length(fwidth(VERTEX)), 1e-6) * coast_softness_px;
 	float coast = 1.0 - smoothstep(-cw, cw, v_coast);
-	// —— 河岸带 ——
-	// 总宽最外侧 13%/侧 为河岸（参考图实测 11.8%~14.3%）。窄河时收缩水芯：
-	// 屏幕上全宽 ≤2px 时整条都是河岸色（细流本来就看不到水芯），≥5px 恢复正常比例。
-	// 用 UV 的屏幕导数反推全宽像素数（e 从 -1 到 1 覆盖全宽），与分辨率/距离无关。
-	float full_px = 2.0 / max(fwidth(e), 1e-5);
-	float inner = bank_inner * smoothstep(2.0, 5.0, full_px);
-	float bank = smoothstep(inner - aa, inner + aa, edge);
-	ALBEDO = mix(river_color.rgb, river_bank_color.rgb, bank);
-	ALPHA = river_color.a * v_alpha * coast
+	ALBEDO = base_color.rgb;
+	ALPHA = base_color.a * v_alpha * coast
 			* (1.0 - smoothstep(1.0 - aa, 1.0, edge));
 }

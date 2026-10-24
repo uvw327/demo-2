@@ -217,8 +217,14 @@ var _river_edge_count := 0
 var _river_parent := PackedInt32Array()
 var _river_flow := PackedFloat32Array()
 var _river_filled := PackedFloat32Array()
+# 河流层画两遍，共用同一份 ArrayMesh（§26）：
+#   _river_instance = 河岸遍（并集全宽，priority 1），也是 mesh 的持有者；
+#   _river_core_instance = 水芯遍（按 RIVER_BANK_INNER 内缩，priority 2）。
+# 顶点/索引/显存只存一份，差别只有 width_scale 与颜色。
 var _river_instance: MeshInstance3D = null
 var _river_material: ShaderMaterial = null
+var _river_core_instance: MeshInstance3D = null
+var _river_core_material: ShaderMaterial = null
 var _river_stats: Dictionary = {}
 # —— 渲染派生数据（§20）：河宽分级 + 分支链 ——
 var _river_half_width := PackedFloat32Array()   # 每贴片半宽，0 = 非河网
@@ -332,7 +338,7 @@ const RIVER_MOUTH_FLARE := 1.15       # 入海口半宽放大倍数（做过头�
 # fragment 里把水域侧裁掉 —— 河道正好在陆地的边线上收口，与海岸严丝合缝，
 # 而且不需要为裁剪新增任何三角形（对导出微信小游戏的性能最友好）。
 const RIVER_COAST_SCALE := 0.02        # COLOR.g 编码量程：±0.02 世界单位（≈±1.15°≈2 个贴片）
-# 汇合点圆角接头：半径 = 该点半宽（圆角 join 的定义），只补两条正截面之间的夹角。
+# 汇合点圆角接头：半径 = 该点半宽（圆角 join 的定义），只补两条端面之间的夹角。
 const RIVER_JOIN_SEG := 14            # 圆弧边数（14 边时弦高 < 2.5% 半径，看不出多边形）
 # 产流/汇流参数（一期初值；先看日志里的河段密度/Q，再按截图调）
 const RIVER_OROGRAPHIC := 0.8
@@ -381,7 +387,7 @@ func _build_hills_meshes(world_seed: int) -> Dictionary:
 	# averageTileSize 同语义，quad 边长与球面抖动都以它为尺
 	var avg_tile := 4.0 / sqrt(float(total))
 	# 低丘 / 高山各一组数组：一次 RNG 遍历分别追加，保持同种子逐位一致。
-	# 河流层要插在两者之间（低丘 0 → 河流 1 → 高山 2），所以不能合成一个 mesh。
+	# 河流层要插在两者之间（低丘 0 → 河岸 1 → 水芯 2 → 高山 3），所以不能合成一个 mesh。
 	var low_verts := PackedVector3Array()
 	var low_uvs := PackedVector2Array()
 	var low_indices := PackedInt32Array()
@@ -493,6 +499,27 @@ func _make_hills_instance(mesh: ArrayMesh, priority: int) -> MeshInstance3D:
 
 # ===== 河流层（第 3 期一期）=====
 # 数据 → 水文 → ribbon。全部同步执行（40k 贴片量级，先保证可见；后续再按需分帧）。
+
+# 河流层的两个材质只差三样：core_pass（宽度缩放）、base_color、render_priority。
+# 其余参数（像素换算、裁剪量程、深度偏移、宽度上下限）必须两遍完全一致，
+# 否则水芯会与河岸错位 —— 所以集中在这里装配，不散落在调用处。
+func _make_river_material(core: bool, priority: int) -> ShaderMaterial:
+	var mat := ShaderMaterial.new()
+	mat.shader = RIVER_SHADER
+	mat.set_shader_parameter("base_color", WATER_COLOR if core else water_bank_color())
+	mat.set_shader_parameter("core_pass", 1.0 if core else 0.0)
+	mat.set_shader_parameter("bank_inner", RIVER_BANK_INNER)
+	mat.set_shader_parameter("min_width_px", RIVER_MIN_WIDTH_PX)
+	mat.set_shader_parameter("max_width_px", RIVER_MAX_WIDTH_PX)
+	mat.set_shader_parameter("depth_bias", RIVER_DEPTH_BIAS)
+	mat.set_shader_parameter("depth_mode", 0)
+	# 岸线裁剪的编码量程必须与烘进 COLOR.g 的一致
+	mat.set_shader_parameter("clip_scale", RIVER_COAST_SCALE)
+	# 低丘 0 → 河岸 1 → 水芯 2 → 高山 3：河岸压住低丘、水芯盖住河岸，
+	# 但两者都被高山压住（高山是分水岭，河道通常绕开）。
+	mat.render_priority = priority
+	return mat
+
 func _build_river_layer() -> void:
 	var t0 := Time.get_ticks_msec()
 	_compute_river_edges()
@@ -502,30 +529,29 @@ func _build_river_layer() -> void:
 	var mesh := _build_river_mesh_from_branches()
 	if mesh == null:
 		return
+	# —— 两遍：河岸遍（全宽）→ 水芯遍（内缩）——
+	# 共用同一个 ArrayMesh（顶点缓冲只上传一次）；差别只有
+	# width_scale（core_pass）、颜色、render_priority。见 §26。
+	_river_material = _make_river_material(false, 1)
 	_river_instance = MeshInstance3D.new()
 	_river_instance.mesh = mesh
-	_river_material = ShaderMaterial.new()
-	_river_material.shader = RIVER_SHADER
-	_river_material.set_shader_parameter("river_color", WATER_COLOR)
-	_river_material.set_shader_parameter("river_bank_color", water_bank_color())
-	_river_material.set_shader_parameter("bank_inner", RIVER_BANK_INNER)
-	_river_material.set_shader_parameter("min_width_px", RIVER_MIN_WIDTH_PX)
-	_river_material.set_shader_parameter("max_width_px", RIVER_MAX_WIDTH_PX)
-	_river_material.set_shader_parameter("depth_bias", RIVER_DEPTH_BIAS)
-	_river_material.set_shader_parameter("depth_mode", 0)
-	# 岸线裁剪的编码量程必须与烘进 COLOR.g 的一致
-	_river_material.set_shader_parameter("clip_scale", RIVER_COAST_SCALE)
+	_river_instance.material_override = _river_material
+	_river_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(_river_instance)
+
+	_river_core_material = _make_river_material(true, 2)
+	_river_core_instance = MeshInstance3D.new()
+	_river_core_instance.mesh = mesh
+	_river_core_instance.material_override = _river_core_material
+	_river_core_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(_river_core_instance)
+
 	# 像素换算必须由 CPU 给：shader 里用 PROJECTION_MATRIX/VIEWPORT_SIZE
 	# 反推会算小一个数量级（实测），整条河网被封顶压成 1 像素。
 	_update_river_camera_params()
-	# 低丘 0 → 河流 1 → 高山 2：河流压住低丘，但被高山压住
-	_river_material.render_priority = 1
-	_river_instance.material_override = _river_material
-	_river_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	# 宽度烘进几何后不再是零面积三角形，AABB 直接用 mesh 的真实包围盒
-	add_child(_river_instance)
 	print("河流层：", _river_edge_count, " 条河段 / ", _river_branch_n, " 条分支链，mesh ",
-			mesh.get_surface_count(), " surface，构建 ", Time.get_ticks_msec() - t0, " ms")
+			mesh.get_surface_count(), " surface × 2 遍（河岸 + 水芯），构建 ",
+			Time.get_ticks_msec() - t0, " ms")
 	print("河宽：%.4f–%.4f（p50 %.4f，p90 %.4f），幂律 b=%.2f，顶到上限 %.1f%%"
 			% [_river_render_stats.get("half_min", 0.0),
 			_river_render_stats.get("half_max", 0.0),
@@ -564,7 +590,10 @@ func _update_river_camera_params() -> void:
 	var focal := 0.5 * vp_h / tan(deg_to_rad(cam.fov * 0.5))
 	if focal <= 0.0:
 		return
+	# 两遍必须用同一个焦距：否则水芯与河岸的宽度补偿不一致，边缘会错位。
 	_river_material.set_shader_parameter("focal_px", focal)
+	if _river_core_material != null:
+		_river_core_material.set_shader_parameter("focal_px", focal)
 
 
 # 产流 → priority-flood → 汇流 → 阈值 → _river_edges（扁平 from/to 对）
@@ -811,7 +840,7 @@ func _compute_river_edges() -> void:
 	var density := 0.0
 	if land_n > 0:
 		density = float(_river_edge_count) / float(land_n)
-	# 跨高山河段数：高山是分水岭，河网通常绕开；>0 时由 priority 2 压住。
+	# 跨高山河段数：高山是分水岭，河网通常绕开；>0 时由 priority 3 压住。
 	var high_edges := 0
 	for e in _river_edge_count:
 		var ha: int = _terrain[_river_edges[e * 2]]
@@ -1395,9 +1424,16 @@ func _river_coast_code(planes: PackedVector3Array, p: Vector3) -> float:
 	return clampf(0.5 + d / (2.0 * RIVER_COAST_SCALE), 0.0, 1.0)
 
 
-# 分支链 → 球面 ribbon。宽度、miter、源头渐细全部烘到顶点位置；
-# shader 只用 UV2.x（烘焙半宽）做远视角最小像素补偿，不再负责展开宽度。
-# 顶点布局：每采样点 2 个（左 UV.x=0 / 右 1），NORMAL=侧向单位向量，COLOR.r=alpha。
+# 分支链 → 球面 ribbon。
+#
+# **顶点存的是中心线点，不是轮廓点**（§26）：偏移量完整地表达在
+#   NORMAL（切平面侧向单位向量，圆盘是径向）+ UV.x（lateral -1..1）+ UV2.x（偏移长度）
+# 里，shader 用 `normalize(center + side * lateral * want * width_scale)` 展开。
+# 这样同一份 mesh 可以按不同的 width_scale 画任意多遍 —— 河岸遍（1.0）与水芯遍
+# （RIVER_BANK_INNER）共用一次构建、一份顶点缓冲，而河岸带由**几何**给出，
+# 不再依赖「图元自身的 UV 区间」（那正是汇合处圆环的根因，见 docs §25）。
+# 顶点布局：每采样点 2 个（左 UV.x=0 / 右 1）。
+# COLOR.r = alpha（源头渐隐），COLOR.g = 到岸线的有符号距离编码。
 func _build_river_mesh_from_branches() -> ArrayMesh:
 	var verts := PackedVector3Array()
 	var normals := PackedVector3Array()
@@ -1553,10 +1589,17 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 					d_out = _river_dir(p, _tile_centers[dn])
 			var m := Vector3.ZERO
 			var at_end := (i == 0 or i == count - 1)
-			if at_end:
-				# 链的两端用**自己的切向**，不做 miter 拉伸：端面就是本河道的一个
-				# 正截面（离轴正好 ±半宽）。转角由汇合点的圆角接头去接，
-				# 端面本身绝不能斜切——斜切会在干流边上啃掉一个角，那就是缺口。
+			# 端头落在汇合点时是否走 miter（斜切到与相邻河道边线相交）：
+			# 走 miter → 两条入射带的外边线直接相交，并集轮廓没有楔形缺口，
+			# 也就不需要再用圆盘去"填"（圆盘半径 = 汇合后半宽，比细支流粗，
+			# 会把支流的河岸带顶出去，见 §26）。源头/河口/断头仍用正截面：
+			# 那里没有相邻河道可接，斜切只会把端头削尖。
+			var miter_end := at_end and d_in != Vector3.ZERO and d_out != Vector3.ZERO \
+					and (i == 0 and _river_child_count[head_v] >= 2 \
+					or (i == count - 1 and not mouth \
+					and _river_child_count[tail_v] >= 2))
+			if at_end and not miter_end:
+				# 正截面：端面就是本河道自己的一个截面（离轴正好 ±半宽）
 				m = d_out if i == 0 else d_in
 				if m == Vector3.ZERO:
 					m = d_in if d_in != Vector3.ZERO else d_out
@@ -1569,7 +1612,7 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 				var helper := Vector3.UP if absf(p.y) < 0.9 else Vector3.RIGHT
 				side = p.cross(helper)
 			sides[i] = side.normalized()
-			if at_end:
+			if at_end and not miter_end:
 				offs[i] = halves[i]
 			else:
 				# 内点 miter：把 ±半宽 推到两条边线的交点上，拐角外沿才不会被切角。
@@ -1612,10 +1655,11 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 					side = (side - p * side.dot(p)).normalized()
 					off = lerpf(offs[i], offs[i + 1], t)
 					al = lerpf(alphas[i], alphas[i + 1], t)
-				var vl := (p - side * off).normalized()
-				var vr := (p + side * off).normalized()
-				verts.append(vl)
-				verts.append(vr)
+				# VERTEX 存中心线点 p（不是 p±side*off）：偏移量由 shader 用
+				# NORMAL(侧向) × (UV.x*2-1) × UV2.x 重新展开，见 §26。
+				# 左右两个顶点的位置因此相同，但 NORMAL/UV 不同 —— 这是展开所必需的。
+				verts.append(p)
+				verts.append(p)
 				normals.append(side)
 				normals.append(side)
 				var v_arc := (acc + arc[i] * t) / total_arc
@@ -1630,8 +1674,10 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 				var cg1 := 0.0
 				var pidx := i + (0 if k < nseg else 1)
 				if mouth and pidx >= tail_i:
-					cg0 = _river_coast_code(planes, vl)
-					cg1 = _river_coast_code(planes, vr)
+					# 岸线距离必须按**偏移后的真实位置**算（裁线才严格落在岸线平面上），
+					# 所以这里临时还原出两侧轮廓点——但它们不进 verts。
+					cg0 = _river_coast_code(planes, (p - side * off).normalized())
+					cg1 = _river_coast_code(planes, (p + side * off).normalized())
 				cols.append(Color(al, cg0, 0.0, 1.0))
 				cols.append(Color(al, cg1, 0.0, 1.0))
 				first = false
@@ -1679,7 +1725,10 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 		for k in join_seg:
 			var a := TAU * float(k) / float(join_seg)
 			var rad: Vector3 = e1 * cos(a) + e2 * sin(a)
-			verts.append((pc + rad * jr).normalized())
+			# 环点也存圆心 pc：径向偏移由 NORMAL(rad) × UV.x(=1) × UV2.x(jr) 展开。
+			# 于是同一份 mesh 用 width_scale 缩放时，圆弧整体等比内缩 ——
+			# 这正是「并集的内缩 = 各图元内缩后的并集」所要求的（§25.4）。
+			verts.append(pc)
 			normals.append(rad)
 			# UV.x = 1 → shader 里 (UV.x*2-1) = +1，与径向 NORMAL 同向，
 			# 远看的屏幕最小宽度补偿才会把圆盘补大而不是缩没。
@@ -1717,8 +1766,9 @@ func _build_river_mesh_from_branches() -> ArrayMesh:
 		for k in join_seg:
 			var ma := TAU * float(k) / float(join_seg)
 			var mrad: Vector3 = me1 * cos(ma) + me2 * sin(ma)
+			# 同汇合点圆盘：顶点存圆心 mp，径向偏移交给 shader 展开
 			var mv := (mp + mrad * mr).normalized()
-			verts.append(mv)
+			verts.append(mp)
 			normals.append(mrad)
 			uvs.append(Vector2(1.0, 0.0))
 			uv2s.append(Vector2(mr, 0.0))
@@ -1846,7 +1896,8 @@ func _on_generate_requested(params: Dictionary) -> void:
 	add_child(_mesh_instance)
 	# 大气光晕：紧跟星球上线（星球边缘那圈柔和的蓝白光晕，见 atmosphere.gdshader）
 	_build_atmosphere()
-	# 丘陵/山脉贴片层（第 2 期）：按 TerrainLevel 拆低丘/高山，priority 0 / 2。
+	# 丘陵/山脉贴片层（第 2 期）：按 TerrainLevel 拆低丘/高山，priority 0 / 3。
+	# §26 起河流占两档（河岸 1 / 水芯 2），高山因此从 2 顺延到 3。
 	# 旧层与旧星球同步退场（同 _mesh_instance 的二次生成语义）。
 	if _hills_low_instance != null:
 		_hills_low_instance.queue_free()
@@ -1861,15 +1912,19 @@ func _on_generate_requested(params: Dictionary) -> void:
 		_hills_low_instance = _make_hills_instance(low_mesh, 0)
 		add_child(_hills_low_instance)
 	if high_mesh != null:
-		_hills_high_instance = _make_hills_instance(high_mesh, 2)
+		_hills_high_instance = _make_hills_instance(high_mesh, 3)
 		add_child(_hills_high_instance)
 
-	# 河流层（第 3 期一期）：priority 1 插在低丘/高山之间。
+	# 河流层（第 3 期一期）：priority 1（河岸）/ 2（水芯）插在低丘/高山之间。
 	# 二次生成先撤旧河，再按新地形重建。
 	if _river_instance != null:
 		_river_instance.queue_free()
 		_river_instance = null
 		_river_material = null
+	if _river_core_instance != null:
+		_river_core_instance.queue_free()
+		_river_core_instance = null
+		_river_core_material = null
 	_build_river_layer()
 
 	# 生成完把画面交给玩家：镜头对准区域（球冠）中心——大陆正对着玩家，
