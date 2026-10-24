@@ -1,4 +1,4 @@
-[gd_scene load_steps=2 format=3 uid="uid://bperfidle0001"]
+[gd_scene format=3 uid="uid://bperfidle0001"]
 
 [ext_resource type="Script" path="res://tools/perf_idle.gd" id="1_idle"]
 
